@@ -108,6 +108,8 @@ configs/   - 配置文件
 
 ### 可靠性变更检查清单
 
+- **发现先落 Issue**：新增审计发现先登记 Issue（含基准提交、触发路径、证据等级与验收条件），再补失败回归和修复；区分 Source / Test / Live，修复提交和验证结果回填 Issue，增量交付到当前实施 PR，不能让发现仅保留在会话或临时环境中。
+
 - **输入生命周期**：覆盖重复 ID、payload 冲突、active gate、Worker 投递失败、lease 过期与晚到 `done` 收敛；不能把 `unknown` 当作可安全重投。
 - **会话删除**：验证本地状态变更与 cleanup task 原子入队；远端清理失败只能重试，不能复活或阻塞已删除会话。
 - **事件顺序**：所有转发路径使用 per-session Seq；替换 Worker Conn 或 `/reset` 时旧 forwarder 不得处理新连接事件或触发 crash recovery。
@@ -201,3 +203,7 @@ Slack（send-message / upload-file / bookmark / react 等）与 Cron（create / 
 - PostgreSQL 支持已实现（`db.driver: "postgres"`），SQLite 仍为默认
 - ACP 适配器已实现（JSON-RPC 2.0 over stdio）
 - Windows 自更新不支持（exe 运行时被锁，使用 `scripts/install.ps1` 替代）
+
+### 本批独立Issue文档
+
+用户授权先以 `docs/issues/2026-09-runtime-audit/D*.md` 保存Issue，再修复；该目录是本批发现真相源。每份记录基准、Source/Test/Live、复现、验收、修复提交和PR。用户已确认此批十项独立问题统一通过PR #986增量交付；逐项保留修复和验证记录，不再要求十个PR，不将原已完成问题重复计数。

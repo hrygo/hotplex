@@ -18,7 +18,11 @@ type Conn struct {
 	userID    string
 	sessionID string
 	stdin     *os.File
+	// stateMu protects sessionID and stdin pointer snapshots, never pipe I/O.
+	// Pointer mutation holds mu then stateMu; readers using mu alone remain safe.
+	stateMu   sync.RWMutex
 	recvCh    chan *events.Envelope
+	recvGate  EventGate
 	log       *slog.Logger
 	mu        sync.Mutex
 	closed    bool
@@ -66,18 +70,16 @@ func (c *Conn) Recv() <-chan *events.Envelope {
 }
 
 func (c *Conn) TrySend(env *events.Envelope) bool {
-	select {
-	case c.recvCh <- env:
-		return true
-	default:
-		return false
-	}
+	return c.recvGate.TrySend(c.recvCh, env)
 }
 
 // Inject enqueues a synthetic event for in-place reset signaling.
 // Blocks up to 2s waiting for channel space; logs a warning if dropped.
 func (c *Conn) Inject(env *events.Envelope) {
-	InjectWithTimeout(c.recvCh, env, c.log, c.sessionID)
+	if !c.recvGate.SendTimeout(c.recvCh, env, 2*time.Second) {
+		c.log.Warn("base: inject failed, channel closed or full",
+			"session_id", c.SessionID(), "event_type", env.Event.Type)
+	}
 }
 
 // InjectWithTimeout sends env into ch with a 2s timeout.
@@ -137,10 +139,13 @@ func (c *Conn) StdinLocked() (*os.File, *sync.Mutex) {
 // (see base.WriteWithCtx): acquiring the lock at the call site would risk
 // releasing it via defer while the write goroutine is still in flight.
 //
-// The returned file is safe to read for nil-checking; concurrent Close may
-// set it to nil, so callers that need a stable snapshot should use StdinLocked
-// under the lock instead.
+// The pointer snapshot uses a separate, short-lived state lock. It must not
+// wait behind an orphaned pipe write holding mu before WriteWithCtx can apply
+// the caller's cancellation budget. CloseInput may subsequently close the file;
+// callers must still hold the returned write mutex while writing.
 func (c *Conn) StdinUnlocked() (*os.File, *sync.Mutex) {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
 	return c.stdin, &c.mu
 }
 
@@ -165,10 +170,12 @@ func (c *Conn) SetLastInputLocked(content string) {
 func (c *Conn) CloseInput() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.stdin != nil {
-		err := c.stdin.Close()
-		c.stdin = nil
-		return err
+	c.stateMu.Lock()
+	stdin := c.stdin
+	c.stdin = nil
+	c.stateMu.Unlock()
+	if stdin != nil {
+		return stdin.Close()
 	}
 	return nil
 }
@@ -183,7 +190,7 @@ func (c *Conn) Close() error {
 	}
 	c.closed = true
 
-	close(c.recvCh)
+	c.recvGate.Close(c.recvCh)
 
 	if c.stdin != nil {
 		_ = c.stdin.Close()
@@ -199,13 +206,15 @@ func (c *Conn) UserID() string {
 
 // SessionID returns the session identifier.
 func (c *Conn) SessionID() string {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
 	return c.sessionID
 }
 
 // SetSessionID updates the session identifier (for opencodeserver's session ID extraction).
 func (c *Conn) SetSessionID(id string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	c.sessionID = id
 }
 

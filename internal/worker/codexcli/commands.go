@@ -25,13 +25,13 @@ func (sc *ServerCommander) SendControlRequest(ctx context.Context, subtype strin
 	case "get_context_usage":
 		return sc.manager.LastContextUsage(sc.threadID), nil
 	case "mcp_status":
-		resp, err := sc.manager.ListMCPServerStatus()
+		resp, err := sc.manager.ListMCPServerStatusContext(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("codexcli: mcp_status: %w", err)
 		}
 		return map[string]any{"status": resp}, nil
 	case "mcp_refresh":
-		if err := sc.manager.RefreshMCPServer(); err != nil {
+		if err := sc.manager.RefreshMCPServerContext(ctx); err != nil {
 			return nil, fmt.Errorf("codexcli: mcp_refresh: %w", err)
 		}
 		return map[string]any{"status": "ok"}, nil
@@ -40,7 +40,7 @@ func (sc *ServerCommander) SendControlRequest(ctx context.Context, subtype strin
 		if name == "" {
 			return nil, fmt.Errorf("codexcli: mcp_oauth: missing server_name")
 		}
-		resp, err := sc.manager.MCPServerOAuthLogin(name)
+		resp, err := sc.manager.MCPServerOAuthLoginContext(ctx, name)
 		if err != nil {
 			return nil, fmt.Errorf("codexcli: mcp_oauth: %w", err)
 		}
@@ -51,7 +51,7 @@ func (sc *ServerCommander) SendControlRequest(ctx context.Context, subtype strin
 }
 
 func (sc *ServerCommander) Compact(ctx context.Context, _ map[string]any) error {
-	_, err := sc.manager.CompactThread(sc.threadID)
+	_, err := sc.manager.CompactThreadContext(ctx, sc.threadID)
 	if err != nil {
 		return fmt.Errorf("codexcli: compact: %w", err)
 	}

@@ -695,13 +695,7 @@ func TestAppServerWorker_StopThenTerminatePreservesSiblingWrapper(t *testing.T) 
 
 	mgr := NewCodexAppServerManager(slog.Default(), config.CodexCLIConfig{IdleDrainPeriod: time.Hour})
 	var output strings.Builder
-	mgr.stdin = struct {
-		io.Writer
-		io.Closer
-	}{
-		Writer: &output,
-		Closer: io.NopCloser(nil),
-	}
+	mgr.stdin = documentedAckWriter{target: &output, manager: mgr}
 	mgr.mu.Lock()
 	mgr.refs = 2
 	mgr.state = stateRunning
@@ -713,20 +707,22 @@ func TestAppServerWorker_StopThenTerminatePreservesSiblingWrapper(t *testing.T) 
 	connA := &appConn{userID: "user-1", sessionID: "session-a", recvCh: recvA, manager: mgr}
 	connB := &appConn{userID: "user-1", sessionID: "session-b", recvCh: recvB, manager: mgr}
 	workerA := &AppServerWorker{
-		BaseWorker: base.NewBaseWorker(slog.Default(), nil),
-		manager:    mgr,
-		threadID:   "thread-a",
-		turnID:     "turn-a",
-		doneCh:     make(chan struct{}),
-		conn:       connA,
+		managerRefHeld: true, // fixture simulates a successful Acquire
+		BaseWorker:     base.NewBaseWorker(slog.Default(), nil),
+		manager:        mgr,
+		threadID:       "thread-a",
+		turnID:         "turn-a",
+		doneCh:         make(chan struct{}),
+		conn:           connA,
 	}
 	workerB := &AppServerWorker{
-		BaseWorker: base.NewBaseWorker(slog.Default(), nil),
-		manager:    mgr,
-		threadID:   "thread-b",
-		turnID:     "turn-b",
-		doneCh:     make(chan struct{}),
-		conn:       connB,
+		managerRefHeld: true, // fixture simulates a successful Acquire
+		BaseWorker:     base.NewBaseWorker(slog.Default(), nil),
+		manager:        mgr,
+		threadID:       "thread-b",
+		turnID:         "turn-b",
+		doneCh:         make(chan struct{}),
+		conn:           connB,
 	}
 
 	require.NoError(t, workerA.StopCurrentTurn(context.Background()))
@@ -2030,7 +2026,7 @@ func TestClearWithActiveTurn(t *testing.T) {
 	t.Parallel()
 
 	// Clear with a turnID should attempt InterruptTurn before ResetContext.
-	// InterruptTurn's Notify needs a stdin writer. Provide a fake pipe.
+	// The native interrupt requires a request ACK; keep a real fake pipe.
 	mgr := NewCodexAppServerManager(slog.Default(), config.CodexCLIConfig{
 		IdleDrainPeriod: time.Minute,
 	})
@@ -2043,7 +2039,13 @@ func TestClearWithActiveTurn(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = io.Copy(io.Discard, r)
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			var frame JSONRPCRequest
+			if json.Unmarshal(scanner.Bytes(), &frame) == nil && frame.ID != 0 {
+				mgr.dispatchResponse(&JSONRPCResponse{ID: frame.ID, Result: json.RawMessage(`{}`)})
+			}
+		}
 	}()
 	t.Cleanup(func() { _ = w.Close(); <-done })
 

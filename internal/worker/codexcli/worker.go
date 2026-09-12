@@ -103,20 +103,21 @@ const (
 type AppServerWorker struct {
 	*base.BaseWorker
 
-	manager   *CodexAppServerManager
-	threadID  string
-	turnID    string
-	userID    string
-	crashSub  <-chan struct{}
-	doneCh    chan struct{}
-	mu        sync.Mutex
-	recvCh    chan *events.Envelope
-	commands  *ServerCommander
-	closed    bool
-	released  bool
-	state     appState
-	sessionID string
-	conn      *appConn
+	manager        *CodexAppServerManager
+	threadID       string
+	turnID         string
+	userID         string
+	crashSub       <-chan struct{}
+	doneCh         chan struct{}
+	mu             sync.Mutex
+	recvCh         chan *events.Envelope
+	commands       *ServerCommander
+	closed         bool
+	released       bool
+	managerRefHeld bool
+	state          appState
+	sessionID      string
+	conn           *appConn
 
 	// origSession preserves the SessionInfo from the most recent Start()
 	// call so that ResetContext can re-establish a fresh thread after cleanup.
@@ -140,6 +141,7 @@ type appConn struct {
 	userID     string
 	sessionID  string
 	recvCh     chan *events.Envelope
+	recvGate   *base.EventGate
 	mu         sync.Mutex
 	closed     bool
 	manager    *CodexAppServerManager
@@ -188,22 +190,24 @@ func (c *appConn) setTextReplay(content string) {
 	c.mu.Unlock()
 }
 func (c *appConn) Recv() <-chan *events.Envelope { return c.recvCh }
-func (c *appConn) TrySend(env *events.Envelope) bool {
-	select {
-	case c.recvCh <- env:
-		return true
-	default:
-		return false
+func (c *appConn) eventGate() *base.EventGate {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Standalone connections own their channel. Managed connections are
+	// constructed with their subscription's gate before being published.
+	if c.recvGate == nil {
+		c.recvGate = &base.EventGate{}
 	}
+	return c.recvGate
+}
+func (c *appConn) TrySend(env *events.Envelope) bool {
+	return c.eventGate().TrySend(c.recvCh, env)
 }
 func (c *appConn) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil
-	}
 	c.closed = true
-	close(c.recvCh)
+	c.mu.Unlock()
+	c.eventGate().Close(c.recvCh)
 	return nil
 }
 func (c *appConn) UserID() string    { return c.userID }
@@ -254,10 +258,11 @@ func (w *AppServerWorker) Start(ctx context.Context, session worker.SessionInfo)
 	}
 	w.mu.Lock()
 	w.crashSub = crashCh
+	w.managerRefHeld = true
 	w.mu.Unlock()
 
-	if err := w.startNewThread(session, "start"); err != nil {
-		w.manager.Release()
+	if err := w.startNewThread(ctx, session, "start"); err != nil {
+		w.releaseManagerReference()
 		return err
 	}
 	w.mu.Lock()
@@ -369,6 +374,18 @@ func (w *AppServerWorker) startTurn(ctx context.Context, input []TurnInputItem) 
 
 	resp, err := w.manager.Call(ctx, "turn/start", params)
 	if err != nil {
+		var notStarted *writeNotStartedError
+		if errors.As(err, &notStarted) {
+			return fmt.Errorf("codexcli: turn/start: %w", err)
+		}
+		var responseErr *responseWaitError
+		if errors.As(err, &responseErr) {
+			return &worker.WorkerError{
+				Kind:    worker.ErrKindTimeout,
+				Message: fmt.Sprintf("codexcli: turn/start: %v", err),
+				Cause:   err,
+			}
+		}
 		// A stalled stdin write (singleton writeMu held by orphan goroutine)
 		// wedges ALL codex sessions. Classify as Unavailable so the gateway
 		// kills the app-server process and unblocks the goroutine (EPIPE).
@@ -387,15 +404,21 @@ func (w *AppServerWorker) startTurn(ctx context.Context, input []TurnInputItem) 
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	if err := json.Unmarshal(resp, &tr); err != nil {
-		w.Log.Debug("codexcli: turn/start response parse error", "err", err)
-	} else if tr.Turn.ID == "" {
-		w.Log.Debug("codexcli: turn/start response missing turn.id")
-	} else {
+	if err := json.Unmarshal(resp, &tr); err != nil || strings.TrimSpace(tr.Turn.ID) == "" {
 		w.mu.Lock()
-		w.turnID = tr.Turn.ID
+		w.turnID = ""
 		w.mu.Unlock()
+		// The request was written: malformed acknowledgement is not proof it
+		// did not execute. Preserve the gateway's unknown-result fence.
+		return &worker.WorkerError{
+			Kind:    worker.ErrKindTimeout,
+			Message: "codexcli: turn/start returned an invalid native turn identity",
+			Cause:   errInvalidLifecycleAck,
+		}
 	}
+	w.mu.Lock()
+	w.turnID = tr.Turn.ID
+	w.mu.Unlock()
 
 	// A new primary turn began here: the turn/start RPC succeeded, so the new
 	// turn is running. Clear the user-stop marker AFTER the successful send —
@@ -465,7 +488,7 @@ func (w *AppServerWorker) resetLifecycleState() {
 
 // startNewThread starts a fresh thread on the manager and wires up worker
 // state. errPrefix is used in error messages for caller identification.
-func (w *AppServerWorker) startNewThread(session worker.SessionInfo, errPrefix string) error {
+func (w *AppServerWorker) startNewThread(ctx context.Context, session worker.SessionInfo, errPrefix string) error {
 	if w.manager != nil && !w.manager.IsRunning() {
 		w.mu.Lock()
 		w.closeAndMarkDone()
@@ -492,7 +515,7 @@ func (w *AppServerWorker) startNewThread(session worker.SessionInfo, errPrefix s
 		return fmt.Errorf("codexcli: %s: capture permission ceiling: %w", errPrefix, err)
 	}
 
-	resp, err := w.manager.Call(context.Background(), "thread/start", params)
+	resp, err := w.manager.Call(ctx, "thread/start", params)
 	if err != nil {
 		w.mu.Lock()
 		w.closeAndMarkDone()
@@ -501,11 +524,11 @@ func (w *AppServerWorker) startNewThread(session worker.SessionInfo, errPrefix s
 	}
 
 	var result ThreadStartResult
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := json.Unmarshal(resp, &result); err != nil || strings.TrimSpace(result.Thread.ID) == "" {
 		w.mu.Lock()
 		w.closeAndMarkDone()
 		w.mu.Unlock()
-		return fmt.Errorf("codexcli: %s parse thread/start: %w", errPrefix, err)
+		return fmt.Errorf("codexcli: %s invalid thread/start acknowledgement: %w", errPrefix, errInvalidLifecycleAck)
 	}
 
 	w.mu.Lock()
@@ -514,13 +537,15 @@ func (w *AppServerWorker) startNewThread(session worker.SessionInfo, errPrefix s
 	w.sessionID = session.SessionID
 	w.userID = session.UserID
 	w.origSession = session
-	w.recvCh = w.manager.Subscribe(result.Thread.ID, session.SessionID)
+	sub := w.manager.subscribe(result.Thread.ID, session.SessionID)
+	w.recvCh = sub.ch
 	w.commands = NewServerCommander(w.manager, result.Thread.ID)
 	w.manager.SetCurrentModel(result.Thread.ID, cfg.Model)
 	w.conn = &appConn{
 		userID:    session.UserID,
 		sessionID: session.SessionID,
 		recvCh:    w.recvCh,
+		recvGate:  &sub.gate,
 		manager:   w.manager,
 	}
 	w.StartTime = time.Now()
@@ -628,7 +653,7 @@ func (w *AppServerWorker) Resume(ctx context.Context, session worker.SessionInfo
 
 	w.cleanupOldThread(ctx)
 	w.resetLifecycleState()
-	if err := w.startNewThread(session, "resume"); err != nil {
+	if err := w.startNewThread(ctx, session, "resume"); err != nil {
 		return err
 	}
 	w.mu.Lock()
@@ -656,9 +681,9 @@ func (w *AppServerWorker) StopCurrentTurn(ctx context.Context) error {
 	}
 	w.MarkStopped()
 	if err := w.manager.InterruptTurn(ctx, tid, turnID); err != nil {
-		// The interrupt never took effect — the turn is still running and the
-		// gateway rolls back its stop fence. Unmark so the turn's completion
-		// is not misread as a user-stop (crash fallback preserved correctly).
+		// No successful interrupt acknowledgement was observed. Roll back the
+		// local stop marker with the gateway fence; a transport timeout can
+		// still be an unknown remote outcome, not permission for blind replay.
 		w.ClearStopped()
 		return err
 	}
@@ -685,7 +710,7 @@ func (w *AppServerWorker) InjectMidTurn(ctx context.Context, content string, met
 	if tid == "" || turnID == "" {
 		return fmt.Errorf("codexcli: no active turn to steer")
 	}
-	_, err := w.manager.SteerTurn(tid, turnID, content)
+	_, err := w.manager.SteerTurnContext(ctx, tid, turnID, content)
 	return err
 }
 
@@ -728,13 +753,26 @@ func (w *AppServerWorker) Wait() (int, error) {
 	}
 }
 
+// releaseManagerReference separates resource ownership from connection state.
+// A reset error may close the connection without releasing its acquired slot.
+func (w *AppServerWorker) releaseManagerReference() {
+	w.mu.Lock()
+	held, mgr := w.managerRefHeld, w.manager
+	w.managerRefHeld = false
+	w.mu.Unlock()
+	if held && mgr != nil {
+		mgr.Release()
+	}
+}
+
 func (w *AppServerWorker) release(ctx context.Context) error {
 	w.mu.Lock()
-	if w.released || w.closed {
+	if w.released {
 		w.mu.Unlock()
 		return nil
 	}
 	w.released = true
+	wasClosed := w.closed
 	w.closed = true
 	doneCh := w.doneCh
 	tid := w.threadID
@@ -742,7 +780,7 @@ func (w *AppServerWorker) release(ctx context.Context) error {
 	mgr := w.manager
 	w.mu.Unlock()
 
-	if doneCh != nil {
+	if doneCh != nil && !wasClosed {
 		// Close but do NOT nil: Wait() relies on receiving from a closed
 		// channel (returns immediately). closeAndMarkDone() additionally
 		// nils for error-path reuse via resetLifecycleState().
@@ -761,8 +799,8 @@ func (w *AppServerWorker) release(ctx context.Context) error {
 		if conn != nil {
 			_ = conn.Close()
 		}
-		mgr.Release()
 	}
+	w.releaseManagerReference()
 	return unsubscribeErr
 }
 
@@ -786,7 +824,7 @@ func (w *AppServerWorker) ResetContext(ctx context.Context) (worker.ResetResult,
 		return worker.ResetResult{ConnReplaced: true}, nil
 	}
 	origSess.ConversationHistory = nil // /reset clears context, do not re-inject old history
-	if err := w.startNewThread(origSess, "reset"); err != nil {
+	if err := w.startNewThread(ctx, origSess, "reset"); err != nil {
 		return worker.ResetResult{}, err
 	}
 	return worker.ResetResult{ConnReplaced: true}, nil
@@ -853,7 +891,7 @@ func (w *AppServerWorker) Compact(ctx context.Context, args map[string]any) erro
 	if tid == "" {
 		return fmt.Errorf("codexcli: no active thread")
 	}
-	_, err := w.manager.CompactThread(tid)
+	_, err := w.manager.CompactThreadContext(ctx, tid)
 	if err != nil {
 		return fmt.Errorf("codexcli: compact: %w", err)
 	}
@@ -893,7 +931,7 @@ func (w *AppServerWorker) Rewind(ctx context.Context, targetID string) error {
 			numTurns = uint32(n)
 		}
 	}
-	_, err := w.manager.RollbackThread(tid, numTurns)
+	_, err := w.manager.RollbackThreadContext(ctx, tid, numTurns)
 	if err != nil {
 		return fmt.Errorf("codexcli: rewind: %w", err)
 	}

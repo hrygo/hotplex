@@ -17,6 +17,7 @@ type Dedup struct {
 	ttl        time.Duration
 	done       chan struct{}
 	closeOnce  sync.Once
+	startOnce  sync.Once
 }
 
 type dedupEntry struct {
@@ -50,14 +51,21 @@ func NewDedup(maxEntries int, ttl time.Duration) *Dedup {
 		order:      make([]dedupOrderEntry, 0, maxEntries),
 		maxEntries: maxEntries,
 		ttl:        ttl,
+		done:       make(chan struct{}),
 	}
 }
 
 // StartCleanup launches a background goroutine that periodically sweeps expired entries.
 // Call Close to stop the goroutine. The sweep interval is ttl/2.
 func (d *Dedup) StartCleanup() {
-	d.done = make(chan struct{})
-	go d.cleanupLoop()
+	d.startOnce.Do(func() {
+		select {
+		case <-d.done:
+			return
+		default:
+			go d.cleanupLoop()
+		}
+	})
 }
 
 // TryRecord records an id and returns true if it was not previously seen.
@@ -73,8 +81,13 @@ func (d *Dedup) TryRecordWithHandle(id string) (*DedupHandle, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if _, seen := d.entries[id]; seen {
-		return nil, false
+	now := time.Now()
+	if entry, seen := d.entries[id]; seen {
+		if now.Before(entry.recordedAt.Add(d.ttl)) {
+			return nil, false
+		}
+		delete(d.entries, id)
+		d.removeOrderEntryLocked(id, entry.handle)
 	}
 
 	for len(d.entries) >= d.maxEntries && len(d.order) > 0 {
@@ -87,7 +100,7 @@ func (d *Dedup) TryRecordWithHandle(id string) (*DedupHandle, bool) {
 
 	d.nextHandle++
 	handle := d.nextHandle
-	d.entries[id] = dedupEntry{recordedAt: time.Now(), handle: handle}
+	d.entries[id] = dedupEntry{recordedAt: now, handle: handle}
 	d.order = append(d.order, dedupOrderEntry{id: id, handle: handle})
 	return &DedupHandle{id: id, handle: handle}, true
 }
@@ -158,7 +171,9 @@ func (d *Dedup) Close() {
 }
 
 func (d *Dedup) cleanupLoop() {
-	ticker := time.NewTicker(d.ttl / 2)
+	// Positive TTLs smaller than 2ns must not produce a zero ticker period.
+	interval := max(d.ttl/2, time.Nanosecond)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {

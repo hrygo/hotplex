@@ -111,6 +111,8 @@ HotPlex separates the place where a user talks from the agent that performs the 
 
 ![HotPlex Architecture](docs/assets/architecture.svg)
 
+See the [worker and channel reliability audit](docs/architecture/worker-channel-reliability-audit-20260912.md) for lifecycle ownership, cancellation semantics, regression evidence, and explicit integration limits.
+
 ## 🔌 Integrations
 
 ### Meet users where they work
@@ -185,3 +187,5 @@ Do not open a public issue for a suspected vulnerability. Follow the private rep
 ## 📜 License
 
 HotPlex is distributed under the [Apache License 2.0](LICENSE).
+
+[Worker / 消息渠道独立缺陷台账](docs/issues/2026-09-runtime-audit/README.md)

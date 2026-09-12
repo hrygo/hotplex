@@ -61,7 +61,7 @@ func NewBaseWorker(log *slog.Logger, cfg *config.Config) *BaseWorker {
 }
 
 // withProcResult executes fn with a snapshot of w.Proc. If Proc is nil,
-// returns (zero, errNil). On success, Proc is nil'd under the mutex.
+// returns (zero, errNil). On success, Proc is cleared only if it is still the snapshot.
 // This eliminates the repeated lock-snapshot-nil-clear pattern.
 func withProcResult[T any](w *BaseWorker, fn func(*proc.Manager) (T, error), zero T, errNil error) (T, error) {
 	w.Mu.Lock()
@@ -78,7 +78,11 @@ func withProcResult[T any](w *BaseWorker, fn func(*proc.Manager) (T, error), zer
 	}
 
 	w.Mu.Lock()
-	w.Proc = nil
+	// A reset may have installed a replacement while fn waited for the old
+	// process. Only the operation that still owns Proc may clear it.
+	if w.Proc == p {
+		w.Proc = nil
+	}
 	w.Mu.Unlock()
 
 	return result, nil

@@ -21,6 +21,7 @@ type acpConn struct {
 	sessionID string
 	log       *slog.Logger
 	recvCh    chan *events.Envelope
+	recvGate  base.EventGate
 	mu        sync.Mutex
 	closed    bool
 	lastInput atomic.Pointer[string] // cached for InputRecoverer crash recovery
@@ -54,8 +55,7 @@ func (c *acpConn) Recv() <-chan *events.Envelope {
 // TrySend enqueues an envelope from readLoop (backpressure-aware).
 // Critical events (state/done/error/permission_request/question_request/elicitation_request)
 // block until sent; droppable events (message.delta/raw) are silently discarded when full.
-// All channel sends are protected by recover() to prevent send-on-closed-channel panics
-// during the shutdown race between TrySend and Close.
+// EventGate synchronizes channel sends with Close, including blocked senders.
 func (c *acpConn) TrySend(env *events.Envelope) bool {
 	if isDroppable(env.Event.Type) {
 		return c.trySendNonBlocking(env)
@@ -81,37 +81,15 @@ func isDroppable(kind events.Kind) bool {
 	return kind == events.MessageDelta || kind == events.Reasoning || kind == events.Raw
 }
 
-// trySendNonBlocking attempts a non-blocking send with panic recovery.
-// Returns false if the channel is full, closed, or a panic was recovered.
-func (c *acpConn) trySendNonBlocking(env *events.Envelope) (sent bool) {
-	defer func() { _ = recover() }()
-	select {
-	case c.recvCh <- env:
-		return true
-	default:
-		return false
-	}
+// trySendNonBlocking returns false if the channel is full or closing.
+func (c *acpConn) trySendNonBlocking(env *events.Envelope) bool {
+	return c.recvGate.TrySend(c.recvCh, env)
 }
 
-// safeSend performs a blocking send on recvCh with panic recovery and timeout.
-// This protects against the TOCTOU race where Close() shuts down recvCh
-// between the closed-flag check and the actual send.
-// A 5s timeout prevents readLoop deadlock when forwardEvents is slow.
-func (c *acpConn) safeSend(env *events.Envelope) (sent bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			c.log.Warn("acp conn: send on closed channel, event dropped",
-				"session_id", c.sessionID, "event_type", env.Event.Type)
-		}
-	}()
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-	select {
-	case c.recvCh <- env:
-		return true
-	case <-timer.C:
-		return false
-	}
+// safeSend keeps the critical-event budget, but Close wakes blocked sends before
+// closing recvCh. No send/close race is hidden behind panic recovery.
+func (c *acpConn) safeSend(env *events.Envelope) bool {
+	return c.recvGate.SendTimeout(c.recvCh, env, 5*time.Second)
 }
 
 // Close shuts down the receive channel.
@@ -122,7 +100,7 @@ func (c *acpConn) Close() error {
 		return nil
 	}
 	c.closed = true
-	close(c.recvCh)
+	c.recvGate.Close(c.recvCh)
 	return nil
 }
 
@@ -140,5 +118,8 @@ func (c *acpConn) UserID() string    { return c.userID }
 func (c *acpConn) SessionID() string { return c.sessionID }
 
 func (c *acpConn) Inject(env *events.Envelope) {
-	base.InjectWithTimeout(c.recvCh, env, c.log, c.sessionID)
+	if !c.recvGate.SendTimeout(c.recvCh, env, 2*time.Second) && c.log != nil {
+		c.log.Warn("acp conn: inject failed, channel closed or full",
+			"session_id", c.sessionID, "event_type", env.Event.Type)
+	}
 }
