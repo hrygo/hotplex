@@ -79,6 +79,8 @@ type CodexAppServerManager struct {
 
 	// pending maps JSON-RPC request IDs to response channels.
 	pending sync.Map // map[int64]chan *JSONRPCResponse
+	rpcMu   sync.Mutex
+	rpcRun  *rpcGeneration
 
 	// serverReqIDs maps interaction requestID → raw JSON-RPC frame ID for server-initiated
 	// requests, so the worker can respond via RespondServerRequest.
@@ -267,6 +269,12 @@ func (m *CodexAppServerManager) Unsubscribe(threadID string) {
 // Call sends a JSON-RPC request to the app-server process and waits for a response.
 // The params argument is marshaled as JSON. If nil, no params field is sent.
 func (m *CodexAppServerManager) Call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	generation := m.currentRPCGeneration()
+	select {
+	case <-generation.done:
+		return nil, fmt.Errorf("codex-app-server: response stream closed before request: %w", io.ErrUnexpectedEOF)
+	default:
+	}
 	id := m.nextReqID.Add(1)
 
 	req := JSONRPCRequest{
@@ -305,6 +313,18 @@ func (m *CodexAppServerManager) Call(ctx context.Context, method string, params 
 				method, resp.Error.Message, resp.Error.Code)
 		}
 		return resp.Result, nil
+	case <-generation.done:
+		// A response already accepted before EOF wins over stream termination.
+		select {
+		case resp := <-respCh:
+			if resp.Error != nil {
+				return nil, fmt.Errorf("codex-app-server: %s: %s (code %d)", method, resp.Error.Message, resp.Error.Code)
+			}
+			return resp.Result, nil
+		default:
+			// The frame was written. Do not imply that retrying is safe.
+			return nil, fmt.Errorf("codex-app-server: %s: response stream ended; execution outcome unknown: %w", method, io.ErrUnexpectedEOF)
+		}
 	case <-ctx.Done():
 		return nil, &responseWaitError{cause: fmt.Errorf("codex-app-server: %s: %w", method, ctx.Err())}
 	case <-timer.C:
@@ -337,6 +357,7 @@ func (m *CodexAppServerManager) Shutdown(ctx context.Context) {
 	defer m.mu.Unlock()
 
 	m.state = stateStopped
+	m.currentRPCGeneration().finish()
 
 	if m.idleTimer != nil {
 		m.idleTimer.Stop()
@@ -393,6 +414,7 @@ func (m *CodexAppServerManager) IsRunning() bool {
 
 func (m *CodexAppServerManager) startProcessLocked(ctx context.Context) error {
 	m.state = stateStarting
+	generation := m.beginRPCGeneration()
 	m.subsClosed.Store(false)
 	m.log.Info("codex-app-server: starting codex app-server process")
 
@@ -428,7 +450,7 @@ func (m *CodexAppServerManager) startProcessLocked(ctx context.Context) error {
 
 	bgCtx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
-	go m.readNotifications(bgCtx, stdout)
+	go m.readNotificationsForGeneration(bgCtx, stdout, generation)
 	go m.monitorProcess()
 
 	if err := m.handshake(ctx); err != nil {
@@ -561,6 +583,11 @@ func (m *CodexAppServerManager) writeNotification(ctx context.Context, notif *JS
 // pending response channels or subscriber notification channels.
 // reader is passed in to avoid acquiring m.mu at startup (caller holds it).
 func (m *CodexAppServerManager) readNotifications(ctx context.Context, reader io.Reader) {
+	m.readNotificationsForGeneration(ctx, reader, m.currentRPCGeneration())
+}
+
+func (m *CodexAppServerManager) readNotificationsForGeneration(ctx context.Context, reader io.Reader, generation *rpcGeneration) {
+	defer generation.finish()
 	defer func() {
 		if r := recover(); r != nil {
 			m.log.Error("codex-app-server: readNotifications panic",
