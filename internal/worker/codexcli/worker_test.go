@@ -968,11 +968,15 @@ func TestAppConnSendRecvClose(t *testing.T) {
 
 	cfg := config.CodexCLIConfig{IdleDrainPeriod: time.Minute}
 	mgr := NewCodexAppServerManager(slog.Default(), cfg)
-	ch := make(chan *events.Envelope, 5)
+	sub := &codexSubscription{ch: make(chan *events.Envelope, 5)}
+	mgr.subscribers["fixture-thread"] = sub
+	mgr.subSessions["fixture-thread"] = "sess-1"
+	ch := sub.ch
 	conn := &appConn{
 		userID:    "user-1",
 		sessionID: "sess-1",
 		recvCh:    ch,
+		recvGate:  &sub.gate,
 		manager:   mgr,
 	}
 
@@ -998,16 +1002,21 @@ func TestAppConnTrySendFull(t *testing.T) {
 
 	cfg := config.CodexCLIConfig{IdleDrainPeriod: time.Minute}
 	mgr := NewCodexAppServerManager(slog.Default(), cfg)
-	ch := make(chan *events.Envelope, 1)
+	sub := &codexSubscription{ch: make(chan *events.Envelope, 1)}
+	mgr.subscribers["fixture-thread"] = sub
+	mgr.subSessions["fixture-thread"] = "sess-1"
+	ch := sub.ch
 	conn := &appConn{
 		userID:    "user-1",
 		sessionID: "sess-1",
 		recvCh:    ch,
+		recvGate:  &sub.gate,
 		manager:   mgr,
 	}
 
-	// Fill channel
-	conn.TrySend(events.NewEnvelope("id-1", "sess-1", 1, events.Done, events.DoneData{}))
+	// Prove admission before checking saturation.
+	require.True(t, conn.TrySend(events.NewEnvelope("id-1", "sess-1", 1, events.Done, events.DoneData{})))
+	t.Cleanup(func() { _ = conn.Close() })
 	// Next send should fail
 	require.False(t, conn.TrySend(events.NewEnvelope("id-2", "sess-1", 2, events.Done, events.DoneData{})))
 }
