@@ -29,7 +29,8 @@ jobs:
           assert digest=='1eabfd75485a7f2a38636edbe732d2fe56c0c6fb740711722a021bc5ce8a1bf9',digest
           temp=Path(os.environ['RUNNER_TEMP'])
           (temp/'runtime-patchset.json').write_bytes(raw)
-          (temp/'publish-runtime-series.py').write_bytes(Path('scripts/audit/publish-runtime-series.py').read_bytes())
+          for name in ('publish-runtime-series.py','polish-runtime-series.py'):
+              (temp/name).write_bytes(Path('scripts/audit',name).read_bytes())
           (temp/'runtime-series-evidence').mkdir(exist_ok=True)
           (temp/'runtime-series-evidence/PATCHSET_SHA256').write_text(digest+'\n')
           print('Patch transport SHA-256 verified:',digest)
@@ -55,9 +56,10 @@ jobs:
           go version > "$RUNNER_TEMP/runtime-series-evidence/GO_VERSION"
           git rev-parse HEAD:scripts/git-hooks/pre-commit > "$RUNNER_TEMP/runtime-series-evidence/PRE_COMMIT_BLOB"
           git rev-parse HEAD:scripts/git-hooks/pre-push > "$RUNNER_TEMP/runtime-series-evidence/PRE_PUSH_BLOB"
+          cp "$RUNNER_TEMP/polish-runtime-series.py" "$RUNNER_TEMP/runtime-series-evidence/normalization.py"
           test ! -e .github/workflows/audit-987-runtime-series.yml
       - name: Verify each root cause, commit each fix, and run full publication gates
-        run: python "$RUNNER_TEMP/publish-runtime-series.py"
+        run: python "$RUNNER_TEMP/polish-runtime-series.py"
       - name: Preserve review evidence even on failure
         if: always()
         run: |
