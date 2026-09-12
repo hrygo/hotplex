@@ -1,0 +1,170 @@
+name: Codex audit finalization
+
+on:
+  push:
+    branches: [codex/source-audit-bootstrap-20260912]
+    paths: [.github/workflows/codex-audit-finalize.yml]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: codex-audit-finalization
+  cancel-in-progress: true
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 29a23f02fa2874b9e856f2c0c1529f537f5f4ba4
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: hotplex-hardening-evidence-5
+          run-id: 34682960209
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/hotplex-audit/
+      - name: Validate passing test evidence and apply the exact reviewed patch
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'hotplex-audit'
+          assert (root / 'base.txt').read_text().strip() == '29a23f02fa2874b9e856f2c0c1529f537f5f4ba4'
+          summary = json.loads((root / 'summary.json').read_text())
+          for name in ('green', 'broad', 'client'):
+              assert summary[name]['pass'] and not summary[name]['fail'], name
+              print(name, {k: len(v) for k, v in summary[name].items()})
+          assert not summary['green']['skip']
+          assert len(summary['green']['pass']) == 125
+          assert len(summary['broad']['pass']) == 4726
+          assert len(summary['client']['pass']) == 27
+          assert summary['red']['fail'] and summary['review-red']['fail']
+          assert '12 combinations, 96 core scenarios, 0 skipped, 0 failed' in (root / 'contract-matrix.log').read_text()
+          PY
+          git apply --check "$RUNNER_TEMP/hotplex-audit/hardening.patch"
+          git apply "$RUNNER_TEMP/hotplex-audit/hardening.patch"
+          test ! -e .github/workflows/codex-source-audit.yml
+          test ! -e .github/workflows/codex-audit-finalize.yml
+          git checkout -b codex/worker-channel-hardening-20260912
+          git add -N internal docs/architecture/worker-channel-reliability-audit-20260912.md
+          make hooks
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+      - name: Install the pinned linter and formatter
+        uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.4
+          install-only: true
+      - name: Fix import grouping without changing production code
+        run: |
+          set -euo pipefail
+          linter="$HOME/golangci-lint-2.11.4-linux-amd64/golangci-lint"
+          test -x "$linter"
+          echo "$(dirname "$linter")" >> "$GITHUB_PATH"
+          git diff --name-only -- '*.go' | grep -v '_test.go$' | xargs sha256sum > "$RUNNER_TEMP/hotplex-audit/production-before-format.sha256"
+          git diff --name-only -- '*.go' | xargs "$linter" fmt
+          sha256sum -c "$RUNNER_TEMP/hotplex-audit/production-before-format.sha256"
+          git diff --check
+      - name: Run all configured linters
+        run: |
+          set -euo pipefail
+          golangci-lint run --timeout=10m 2>&1 | tee "$RUNNER_TEMP/hotplex-audit/final-lint.log"
+      - name: Verify the formatted regression suite again
+        run: |
+          set -euo pipefail
+          go test -json -race -count=5 -shuffle=on -timeout=3m -run '^(TestAudit|TestEventGate)' \
+            ./internal/worker/base ./internal/worker/acp ./internal/worker/opencodeserver \
+            ./internal/worker/codexcli ./internal/messaging ./internal/messaging/feishu ./internal/gateway \
+            > "$RUNNER_TEMP/hotplex-audit/final-green.jsonl" 2>&1
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP']) / 'hotplex-audit/final-green.jsonl'
+          records = [json.loads(line) for line in path.read_text().splitlines() if line.startswith('{')]
+          counts = {a: sum(r.get('Action') == a and bool(r.get('Test')) for r in records) for a in ('pass','fail','skip')}
+          print('Formatted regressions:', counts)
+          assert counts == {'pass':125, 'fail':0, 'skip':0}, counts
+          PY
+      - name: Document final validation and build the documentation
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          path = Path('docs/architecture/worker-channel-reliability-audit-20260912.md')
+          url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          with path.open('a') as f:
+              f.write(f'\n## 发布验证补充\n\n上文关联运行已完成红绿回归、相关测试集、契约矩阵与 Go SDK 验证；该运行最后因 7 个新测试文件的 goimports 分组格式失败，没有发布代码。后续 [发布验证运行]({url}) 只修正导入分组，逐个校验生产 Go 文件 SHA-256 不变，并重新通过全部配置的 lint 和 5 轮回归（125 条通过，0 失败，0 跳过）。最终提交和推送继续使用仓库 hooks，最终状态以该运行日志为准。\n')
+          PY
+          go run ./cmd/build-docs > "$RUNNER_TEMP/hotplex-audit/docs-build.log" 2>&1
+          git diff --check
+      - name: Check the installed pre-commit hook and repair only a proven package-path defect
+        run: |
+          set -euo pipefail
+          git add -- README.md README_zh.md docs/architecture/worker-channel-reliability-audit-20260912.md internal
+          set +e
+          .git/hooks/pre-commit > "$RUNNER_TEMP/hotplex-audit/hook-before.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/hotplex-audit/hook-before.log"
+          if [ "$status" -ne 0 ]; then
+            # A relative Go package path must start with ./; do not suppress or
+            # bypass a lint failure. Only fix this specific, demonstrated hook bug.
+            if ! grep -Eq 'is not in std|no go files to analyze|cannot find package' "$RUNNER_TEMP/hotplex-audit/hook-before.log"; then
+              exit "$status"
+            fi
+            python - <<'PY'
+            from pathlib import Path
+            path = Path('scripts/git-hooks/pre-commit')
+            text = path.read_text()
+            old = 'echo "$MAIN_FILES" | xargs dirname | sort -u | xargs golangci-lint run'
+            new = 'echo "$MAIN_FILES" | xargs dirname | sort -u | sed \'s|^|./|\' | xargs golangci-lint run'
+            assert text.count(old) == 1
+            path.write_text(text.replace(old, new))
+            report = Path('docs/architecture/worker-channel-reliability-audit-20260912.md')
+            with report.open('a') as f:
+                f.write('\n发布时还复现了原 pre-commit hook 的包路径缺陷：将 `internal/...` 直接交给 golangci-lint 会被当作 import path 而不是当前模块的目录。仅补上 `./` 前缀，保留原有 staged-package 范围和所有检查，不降低规则、不绕过 hook。修复前失败日志与修复后通过日志一并保存。\n')
+            PY
+            make hooks
+            git add -- scripts/git-hooks/pre-commit docs/architecture/worker-channel-reliability-audit-20260912.md
+            .git/hooks/pre-commit > "$RUNNER_TEMP/hotplex-audit/hook-after.log" 2>&1
+            cat "$RUNNER_TEMP/hotplex-audit/hook-after.log"
+            go run ./cmd/build-docs >> "$RUNNER_TEMP/hotplex-audit/docs-build.log" 2>&1
+          fi
+      - name: Commit and push with all repository hooks enabled
+        run: |
+          set -euo pipefail
+          branch=codex/worker-channel-hardening-20260912
+          test "$(git branch --show-current)" = "$branch"
+          test "$(git ls-remote origin refs/heads/codex/source-audit-bootstrap-20260912 | cut -f1)" = "$GITHUB_SHA"
+          git config user.name 'HotPlex Audit'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(runtime): harden worker lifecycle and channel delivery contracts' > "$RUNNER_TEMP/hotplex-audit/commit.log" 2>&1
+          cat "$RUNNER_TEMP/hotplex-audit/commit.log"
+          git push origin "HEAD:refs/heads/$branch" > "$RUNNER_TEMP/hotplex-audit/publish.log" 2>&1
+          tail -100 "$RUNNER_TEMP/hotplex-audit/publish.log"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/hotplex-audit/product-commit.txt"
+          git status --short
+      - name: Preserve complete final evidence even on failure
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/hotplex-audit"
+          git diff --binary 29a23f02fa2874b9e856f2c0c1529f537f5f4ba4 > "$RUNNER_TEMP/hotplex-audit/final-hardening.patch"
+          git diff --stat 29a23f02fa2874b9e856f2c0c1529f537f5f4ba4 > "$RUNNER_TEMP/hotplex-audit/final-diff-stat.txt"
+          for name in final-lint.log hook-before.log hook-after.log commit.log publish.log; do
+            echo "### $name"
+            tail -100 "$RUNNER_TEMP/hotplex-audit/$name" 2>/dev/null || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hotplex-final-hardening-${{ github.run_number }}
+          path: ${{ runner.temp }}/hotplex-audit/
+          retention-days: 7
