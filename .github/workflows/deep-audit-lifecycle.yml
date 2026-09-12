@@ -1,0 +1,48 @@
+name: Deep-audit Codex lifecycle
+on:
+  push:
+    branches: [chore/988-997-deep-audit]
+    paths: [.github/workflows/deep-audit-lifecycle.yml]
+permissions:
+  contents: write
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        issue: [988, 989, 990, 991, 994]
+    env:
+      AUDIT_ISSUE: ${{ matrix.issue }}
+      GORACE: history_size=5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Preserve audit source outside product checkout
+        run: |
+          mkdir -p "$RUNNER_TEMP/audit-tools" "$RUNNER_TEMP/evidence"
+          cp scripts/deep-audit/*.py "$RUNNER_TEMP/audit-tools/"
+      - uses: actions/checkout@v6
+        with:
+          ref: 68b9f7f0cd11e2dbf603971c4a987fa2de682fb0
+          fetch-depth: 1
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+      - uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.4
+          install-only: true
+      - name: Reproduce defects, apply repairs and enforce original quality gates
+        run: |
+          export PATH="$HOME/golangci-lint-2.11.4-linux-amd64:$PATH"
+          python "$RUNNER_TEMP/audit-tools/runner.py"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deep-lifecycle-${{ matrix.issue }}-${{ github.run_number }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14
