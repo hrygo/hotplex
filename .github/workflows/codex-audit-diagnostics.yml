@@ -1,0 +1,42 @@
+name: Codex audit diagnostics
+on:
+  push:
+    branches: [codex/source-audit-bootstrap-20260912]
+    paths: [.github/workflows/codex-audit-diagnostics.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hotplex-hardening-evidence-3
+          run-id: 34682479878
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: evidence
+      - name: Print failed tests and their full diagnostic context
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          for name in ('red', 'green', 'broad'):
+              records = []
+              for line in Path('evidence', name + '.jsonl').read_text().splitlines():
+                  try: records.append(json.loads(line))
+                  except json.JSONDecodeError: print('NON-JSON', line)
+              failed = {(r.get('Package'), r.get('Test')) for r in records if r.get('Action') == 'fail' and r.get('Test')}
+              print('\n###', name, 'FAILED TESTS', sorted(failed))
+              print('COUNTS', {action: sum(r.get('Action') == action and bool(r.get('Test')) for r in records) for action in ('pass','fail','skip')})
+              if name == 'broad':
+                  for package, test in sorted(failed):
+                      print('\nFAILED', package, test)
+                      for r in records:
+                          if r.get('Package') == package and r.get('Test') == test and r.get('Output'):
+                              print(r['Output'], end='')
+                  for r in records:
+                      if r.get('Action') == 'fail' and not r.get('Test'): print('PACKAGE FAILED', r)
+                      if not r.get('Test') and r.get('Output') and any(p in r['Output'] for p in ('panic:', 'WARNING: DATA RACE', 'build failed')): print(r['Output'])
+          PY
