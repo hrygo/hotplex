@@ -125,16 +125,16 @@ type Envelope struct {
 // Clone returns a copy of the Envelope safe for concurrent use.
 // The copy has independent value-type fields (Version, Timestamp, etc.)
 // so EncodeJSON's in-place mutations on the original do not affect the copy.
-// map[string]any Event.Data is recursively deep-copied so that nested
-// mutable reference types (maps, slices) are never shared.
+// Exported payload data, including typed structs, maps, slices and pointers,
+// is recursively copied without a JSON round-trip. Cyclic reference graphs
+// are supported. Opaque unexported state, functions and channels are not wire
+// payload data and must be treated as immutable by their owners.
 func Clone(env *Envelope) *Envelope {
 	if env == nil {
 		return &Envelope{}
 	}
 	c := *env
-	if m, ok := env.Event.Data.(map[string]any); ok && m != nil {
-		c.Event.Data = deepCopyMap(m)
-	}
+	c.Event.Data = deepCopyValue(env.Event.Data)
 	if env.Metadata != nil {
 		c.Metadata = deepCopyMap(env.Metadata)
 	}
@@ -144,26 +144,26 @@ func Clone(env *Envelope) *Envelope {
 // deepCopyMap returns a fully independent copy of a map[string]any,
 // recursively copying nested maps and slices.
 func deepCopyMap(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = deepCopyValue(v)
+	if src == nil {
+		return nil
 	}
-	return dst
+	copied, ok := deepCopyValue(src).(map[string]any)
+	if !ok {
+		panic("events: clone changed map payload type")
+	}
+	return copied
 }
 
-// deepCopyValue returns an independent copy of v for reference types.
+// deepCopyValue preserves concrete Go payload types and mutable exported data.
+// Functions, channels and opaque unexported state are not wire payloads and
+// retain their original identity; callers must treat those values as immutable.
 func deepCopyValue(v any) any {
-	switch cv := v.(type) {
-	case map[string]any:
-		return deepCopyMap(cv)
-	case []any:
-		dst := make([]any, len(cv))
-		for i, elem := range cv {
-			dst[i] = deepCopyValue(elem)
-		}
-		return dst
-	default:
+	switch v.(type) {
+	case nil, string, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64,
+		float32, float64, MessageDeltaData, MessageEndData, StateData, ErrorData, InputAckData:
 		return v
+	default:
+		return clonePayloadGraph(v)
 	}
 }
 
