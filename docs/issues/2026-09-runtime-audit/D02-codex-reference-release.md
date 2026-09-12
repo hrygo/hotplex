@@ -9,8 +9,8 @@ description: "根因、触发路径、修复与验收证据。"
 - 优先级：P1
 - 基准：`68b9f7f0cd11e2dbf603971c4a987fa2de682fb0`
 - 来源：Issue #987 / A04
-- 状态：已登记，待修复
-- 证据：Source；本批运行证据尚未生成
+- 状态：修复及回归已完成，发布状态见运行结果
+- 证据：Test；原实现失败、修复后通过；未执行Live联调
 - 实施PR：待创建
 - 位置：`internal/worker/codexcli/worker.go`
 
@@ -29,3 +29,15 @@ reset建线程失败先设置closed，release以released||closed提前返回；�
 ## 证据记录
 
 失败回归、通过回归、相关测试、提交与PR按实际结果回填。源码推断不等于Test，fake不等于Live；禁止用编译失败冒充复现，不合并main。
+
+## 本批修复与验证
+
+对应 GitHub Issue #990；实现基准 `fb53e8be5ee8171ccb11e6eefe9fc6625abb98e3`。独立验证运行：https://github.com/hrygo/hotplex/actions/runs/34692685711。
+
+| 范围 | 通过 | 失败 | 跳过 |
+| --- | ---: | ---: | ---: |
+| red | 2 | 1 | 0 |
+| green | 15 | 0 | 0 |
+| related | 338 | 0 | 4 |
+
+计数包含重复轮次和父子用例。相关跳过项见同一提交的架构验证报告。完整lint、原始hooks和发布尚由后续步骤确认；不因文档存在就宣称远端已交付。

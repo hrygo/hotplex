@@ -103,20 +103,21 @@ const (
 type AppServerWorker struct {
 	*base.BaseWorker
 
-	manager   *CodexAppServerManager
-	threadID  string
-	turnID    string
-	userID    string
-	crashSub  <-chan struct{}
-	doneCh    chan struct{}
-	mu        sync.Mutex
-	recvCh    chan *events.Envelope
-	commands  *ServerCommander
-	closed    bool
-	released  bool
-	state     appState
-	sessionID string
-	conn      *appConn
+	manager        *CodexAppServerManager
+	threadID       string
+	turnID         string
+	userID         string
+	crashSub       <-chan struct{}
+	doneCh         chan struct{}
+	mu             sync.Mutex
+	recvCh         chan *events.Envelope
+	commands       *ServerCommander
+	closed         bool
+	released       bool
+	managerRefHeld bool
+	state          appState
+	sessionID      string
+	conn           *appConn
 
 	// origSession preserves the SessionInfo from the most recent Start()
 	// call so that ResetContext can re-establish a fresh thread after cleanup.
@@ -253,11 +254,17 @@ func (w *AppServerWorker) Start(ctx context.Context, session worker.SessionInfo)
 		return fmt.Errorf("codexcli: acquire: %w", err)
 	}
 	w.mu.Lock()
+	if w.released || w.closed {
+		w.mu.Unlock()
+		w.manager.Release()
+		return fmt.Errorf("codexcli: worker closed while acquiring manager")
+	}
 	w.crashSub = crashCh
+	w.managerRefHeld = true
 	w.mu.Unlock()
 
 	if err := w.startNewThread(ctx, session, "start"); err != nil {
-		w.manager.Release()
+		w.releaseManagerReference()
 		return err
 	}
 	w.mu.Lock()
@@ -740,39 +747,42 @@ func (w *AppServerWorker) Wait() (int, error) {
 	}
 }
 
+// releaseManagerReference tracks the lease independently of connection state.
+func (w *AppServerWorker) releaseManagerReference() {
+	w.mu.Lock()
+	held, mgr := w.managerRefHeld, w.manager
+	w.managerRefHeld = false
+	w.mu.Unlock()
+	if held && mgr != nil {
+		mgr.Release()
+	}
+}
+
 func (w *AppServerWorker) release(ctx context.Context) error {
 	w.mu.Lock()
-	if w.released || w.closed {
+	if w.released {
 		w.mu.Unlock()
 		return nil
 	}
 	w.released = true
+	wasClosed := w.closed
 	w.closed = true
-	doneCh := w.doneCh
-	tid := w.threadID
-	conn := w.conn
-	mgr := w.manager
+	doneCh, tid, conn, mgr := w.doneCh, w.threadID, w.conn, w.manager
+	held := w.managerRefHeld
+	w.managerRefHeld = false
 	w.mu.Unlock()
-
-	if doneCh != nil {
-		// Close but do NOT nil: Wait() relies on receiving from a closed
-		// channel (returns immediately). closeAndMarkDone() additionally
-		// nils for error-path reuse via resetLifecycleState().
+	if !wasClosed && doneCh != nil {
 		close(doneCh)
 	}
-
 	var unsubscribeErr error
 	if mgr != nil && tid != "" {
-		unsubscribeErr = mgr.Notify(ctx, "thread/unsubscribe", ThreadUnsubscribeParams{
-			ThreadID: tid,
-		})
+		unsubscribeErr = mgr.Notify(ctx, "thread/unsubscribe", ThreadUnsubscribeParams{ThreadID: tid})
 		mgr.Unsubscribe(tid)
-		// Close recvCh so forwardEvents exits its range loop.
-		// Must happen after Unsubscribe (removes from dispatch map) to
-		// avoid racing with in-flight dispatchNotification sends.
-		if conn != nil {
-			_ = conn.Close()
-		}
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if held && mgr != nil {
 		mgr.Release()
 	}
 	return unsubscribeErr
