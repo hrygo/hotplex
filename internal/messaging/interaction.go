@@ -202,6 +202,7 @@ func (m *InteractionManager) Complete(requestID string) (*PendingInteraction, bo
 	pi, ok := m.pending[requestID]
 	if ok {
 		delete(m.pending, requestID)
+		close(pi.cancelCh)
 	}
 	return pi, ok
 }
@@ -233,6 +234,7 @@ func (m *InteractionManager) CompleteClaimed(requestID string) (*PendingInteract
 		return nil, false
 	}
 	delete(m.pending, requestID)
+	close(pi.cancelCh)
 	return pi, true
 }
 
@@ -310,13 +312,19 @@ func (m *InteractionManager) watchTimeout(pi *PendingInteraction) {
 	// Claim before auto-denying. A card click may already be submitting the
 	// response; in that case it owns the resolution and the timeout must not
 	// race it with a stale denial.
-	claimed, ok := m.Claim(pi.ID)
-	if !ok {
+	m.mu.Lock()
+	claimed, ok := m.pending[pi.ID]
+	if !ok || claimed != pi || claimed.resolving {
+		m.mu.Unlock()
 		return
 	}
-	if _, ok := m.CompleteClaimed(pi.ID); !ok {
-		return
-	}
+	// The timer owns this exact registration, not every future reuse of ID.
+	// Claim and remove atomically so CancelAll/re-register cannot replace it
+	// between two ID-only operations.
+	claimed.resolving = true
+	delete(m.pending, pi.ID)
+	close(pi.cancelCh)
+	m.mu.Unlock()
 
 	m.log.Info("interaction: timeout, auto-denying",
 		"request_id", pi.ID,
