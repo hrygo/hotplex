@@ -211,9 +211,10 @@ func (a *Adapter) Close(ctx context.Context) error {
 		}
 	}
 
-	// Close chat queue to drain all worker goroutines.
+	// Preserve the caller's deadline while draining accepted chat tasks.
+	var queueErr error
 	if a.chatQueue != nil {
-		a.chatQueue.Close()
+		queueErr = a.chatQueue.CloseContext(ctx)
 	}
 
 	// Drain conn pool — ConnPool manages its own lock, no deadlock with FeishuConn.Close().
@@ -232,7 +233,7 @@ func (a *Adapter) Close(ctx context.Context) error {
 		_ = conn.Close()
 	}
 
-	return nil
+	return queueErr
 }
 
 func controlFeedbackMessageCN(action events.ControlAction) string {

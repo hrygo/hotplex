@@ -26,11 +26,15 @@ var ErrChatQueueClosed = errors.New("feishu: chat queue closed")
 // through a buffered channel, eliminating race conditions that existed in the
 // previous goroutine-chaining approach.
 type ChatQueue struct {
-	log     *slog.Logger
-	mu      sync.Mutex
-	workers map[string]*chatWorker
-	closed  bool
-	wg      sync.WaitGroup // track worker goroutines for graceful shutdown
+	log       *slog.Logger
+	mu        sync.Mutex
+	workers   map[string]*chatWorker
+	closed    bool
+	wg        sync.WaitGroup
+	lifecycle context.Context
+	cancel    context.CancelFunc
+	closeDone chan struct{}
+	closeWait sync.Once
 }
 
 type chatWorker struct {
@@ -40,7 +44,9 @@ type chatWorker struct {
 }
 
 func NewChatQueue(log *slog.Logger) *ChatQueue {
+	lifecycle, cancel := context.WithCancel(context.Background())
 	return &ChatQueue{
+		lifecycle: lifecycle, cancel: cancel, closeDone: make(chan struct{}),
 		log:     log,
 		workers: make(map[string]*chatWorker),
 	}
@@ -121,7 +127,13 @@ func (q *ChatQueue) runWorker(chatID string, w *chatWorker) {
 // runTask contains failures to one accepted task. Recovering only in
 // runWorker would retire the worker and strand the rest of its accepted queue.
 func (q *ChatQueue) runTask(chatID string, w *chatWorker, task func(context.Context) error) {
-	ctx, cancel := context.WithTimeout(context.Background(), chatTaskTimeout)
+	if q.lifecycle.Err() != nil {
+		if q.log != nil {
+			q.log.Warn("feishu: queued task discarded after shutdown deadline", "chat_id", chatID)
+		}
+		return
+	}
+	ctx, cancel := context.WithTimeout(q.lifecycle, chatTaskTimeout)
 	w.mu.Lock()
 	w.cancel = cancel
 	w.mu.Unlock()
@@ -190,14 +202,40 @@ func (q *ChatQueue) Abort(chatID string) {
 // Close shuts down all worker goroutines by closing their task channels.
 // It waits for all in-flight tasks to complete.
 func (q *ChatQueue) Close() {
+	_ = q.CloseContext(context.Background())
+}
+
+// CloseContext drains within the caller budget, then cancels active tasks and
+// prevents queued tasks from starting. Uncooperative tasks may outlive the call;
+// one queue-owned waiter is retained, never a new waiter per caller.
+func (q *ChatQueue) CloseContext(ctx context.Context) error {
 	q.mu.Lock()
+	if q.closeDone == nil {
+		q.closeDone = make(chan struct{})
+	}
+	if q.cancel == nil {
+		q.lifecycle, q.cancel = context.WithCancel(context.Background())
+	}
 	if !q.closed {
 		q.closed = true
 		for _, w := range q.workers {
 			close(w.tasks)
 		}
 	}
+	done := q.closeDone
+	cancel := q.cancel
+	q.closeWait.Do(func() { go func() { q.wg.Wait(); cancel(); close(done) }() })
 	q.mu.Unlock()
-
-	q.wg.Wait() // wait for all workers to finish
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		cancel()
+		return ctx.Err()
+	}
 }
