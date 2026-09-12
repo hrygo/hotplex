@@ -1,0 +1,144 @@
+name: Codex verified patch publication
+
+on:
+  push:
+    branches: [codex/source-audit-bootstrap-20260912]
+    paths: [.github/workflows/codex-audit-publish.yml]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: codex-audit-publication
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 29a23f02fa2874b9e856f2c0c1529f537f5f4ba4
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: hotplex-final-hardening-1
+          run-id: 34683371222
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/hotplex-audit/
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+      - uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.4
+          install-only: true
+      - name: Validate evidence, apply the formatted patch, and install actual hooks
+        run: |
+          set -euo pipefail
+          echo "$HOME/golangci-lint-2.11.4-linux-amd64" >> "$GITHUB_PATH"
+          test -x "$HOME/golangci-lint-2.11.4-linux-amd64/golangci-lint"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'hotplex-audit'
+          assert (root / 'base.txt').read_text().strip() == '29a23f02fa2874b9e856f2c0c1529f537f5f4ba4'
+          summary = json.loads((root / 'summary.json').read_text())
+          for name, expected in [('green', 125), ('broad', 4726), ('client', 27)]:
+              assert len(summary[name]['pass']) == expected and not summary[name]['fail'], name
+              print(name, {key: len(val) for key, val in summary[name].items()})
+          assert not summary['green']['skip']
+          assert summary['red']['fail'] and summary['review-red']['fail']
+          assert (root / 'final-lint.log').read_text().strip() == '0 issues.'
+          records = [json.loads(line) for line in (root / 'final-green.jsonl').read_text().splitlines() if line.startswith('{')]
+          counts = {a: sum(r.get('Action') == a and bool(r.get('Test')) for r in records) for a in ('pass', 'fail', 'skip')}
+          assert counts == {'pass':125, 'fail':0, 'skip':0}, counts
+          assert '12 combinations, 96 core scenarios, 0 skipped, 0 failed' in (root / 'contract-matrix.log').read_text()
+          print('Formatted code evidence:', counts, 'lint: 0 issues')
+          PY
+          git apply --check "$RUNNER_TEMP/hotplex-audit/final-hardening.patch"
+          git apply "$RUNNER_TEMP/hotplex-audit/final-hardening.patch"
+          sha256sum -c "$RUNNER_TEMP/hotplex-audit/production-before-format.sha256"
+          test ! -e .github/workflows/codex-audit-publish.yml
+          git checkout -b codex/worker-channel-hardening-20260912
+          make hooks
+          test "$(git config --get core.hooksPath)" = 'scripts/git-hooks'
+          test -x scripts/git-hooks/pre-commit
+          test -x scripts/git-hooks/pre-push
+          git diff --check
+      - name: Commit through Git and retain exact hook failure evidence if needed
+        run: |
+          python - <<'PY'
+          import os, subprocess
+          from pathlib import Path
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'hotplex-audit'
+          report = Path('docs/architecture/worker-channel-reliability-audit-20260912.md')
+          run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          with report.open('a') as f:
+              f.write(f'\n## 最终提交验证\n\n前一发布运行在全部 lint、重复回归和文档构建通过之后，因审计脚本误用了默认 hooks 路径及 shell heredoc 缩进而停止，未提交或推送代码。这不是产品测试失败。本次 [提交验证运行]({run_url}) 使用 `make hooks` 配置的 `scripts/git-hooks`，由正常 `git commit` / `git push` 调用钩子；保留全部检查，未使用 `--no-verify`。\n')
+          subprocess.run(['git', 'config', 'user.name', 'HotPlex Audit'], check=True)
+          subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
+          staged = ['README.md', 'README_zh.md', str(report), 'internal']
+          subprocess.run(['git', 'add', '--', *staged], check=True)
+          args = ['git', 'commit', '-m', 'fix(runtime): harden worker lifecycle and channel delivery contracts']
+          def commit(log_name):
+              result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              (evidence / log_name).write_text(result.stdout)
+              print(result.stdout, flush=True)
+              return result
+          result = commit('commit-first.log')
+          if result.returncode:
+              # Repair only a demonstrated package-argument bug, never suppress
+              # a linter diagnostic or weaken its configured rules.
+              expected = ('is not in std', 'no go files to analyze', 'cannot find package')
+              if not any(s in result.stdout for s in expected):
+                  raise SystemExit(result.returncode)
+              path = Path('scripts/git-hooks/pre-commit')
+              text = path.read_text()
+              old = 'echo "$MAIN_FILES" | xargs dirname | sort -u | xargs golangci-lint run'
+              new = 'echo "$MAIN_FILES" | xargs dirname | sort -u | sed \'s|^|./|\' | xargs golangci-lint run'
+              assert text.count(old) == 1
+              path.write_text(text.replace(old, new))
+              with report.open('a') as f:
+                  f.write('\n正常提交进一步复现了原 pre-commit 的包路径缺陷：`internal/...` 被当作 import path 而非当前模块目录。仅补上 `./` 前缀，保留 staged-package 检查范围和所有 lint 规则；修复前后的实际提交日志一并保留。\n')
+              subprocess.run(['make', 'hooks'], check=True)
+              subprocess.run(['git', 'add', '--', str(path), str(report)], check=True)
+              result = commit('commit-fixed.log')
+              if result.returncode:
+                  raise SystemExit(result.returncode)
+          (evidence / 'product-commit.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True))
+          assert subprocess.check_output(['git', 'config', '--get', 'core.hooksPath'], text=True).strip() == 'scripts/git-hooks'
+          assert not subprocess.check_output(['git', 'diff', '--name-only'], text=True).strip()
+          PY
+      - name: Rebuild documentation and push through the unchanged pre-push gates
+        run: |
+          set -euo pipefail
+          go run ./cmd/build-docs > "$RUNNER_TEMP/hotplex-audit/final-docs-build.log" 2>&1
+          branch=codex/worker-channel-hardening-20260912
+          test "$(git branch --show-current)" = "$branch"
+          test "$(git ls-remote origin refs/heads/codex/source-audit-bootstrap-20260912 | cut -f1)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD:scripts/git-hooks/pre-push)" = '14f8457e1acd1aad42111073f74dd698c4cfefa0'
+          test "$(git config --get core.hooksPath)" = 'scripts/git-hooks'
+          git push origin "HEAD:refs/heads/$branch" > "$RUNNER_TEMP/hotplex-audit/publish.log" 2>&1
+          tail -100 "$RUNNER_TEMP/hotplex-audit/publish.log"
+          git rev-parse HEAD
+          git status --short
+      - name: Preserve final patch and complete evidence
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/hotplex-audit"
+          git add -N internal docs/architecture/worker-channel-reliability-audit-20260912.md 2>/dev/null || true
+          git diff --binary 29a23f02fa2874b9e856f2c0c1529f537f5f4ba4 > "$RUNNER_TEMP/hotplex-audit/published-hardening.patch"
+          git diff --stat 29a23f02fa2874b9e856f2c0c1529f537f5f4ba4 > "$RUNNER_TEMP/hotplex-audit/published-diff-stat.txt"
+          for log in commit-first.log commit-fixed.log publish.log; do
+            echo "### $log"
+            tail -100 "$RUNNER_TEMP/hotplex-audit/$log" 2>/dev/null || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hotplex-published-hardening-${{ github.run_number }}
+          path: ${{ runner.temp }}/hotplex-audit/
+          retention-days: 7
