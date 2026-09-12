@@ -13,9 +13,9 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 2
       matrix:
-        issue: [988, 1002, 1004]
+        issue: [988, 1002]
     env:
       AUDIT_ISSUE: ${{ matrix.issue }}
       GORACE: history_size=5
