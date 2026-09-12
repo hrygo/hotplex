@@ -1,0 +1,212 @@
+name: Ten-issue deep reliability audit
+
+on:
+  push:
+    branches: [chore/988-997-deep-audit]
+    paths: [.github/workflows/deep-audit-ten.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  verify-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        issue: [992, 995, 996, 997]
+    env:
+      AUDIT_ISSUE: ${{ matrix.issue }}
+      AUDIT_BASE: 68b9f7f0cd11e2dbf603971c4a987fa2de682fb0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Preserve exact bootstrap scripts outside product source
+        run: |
+          mkdir -p "$RUNNER_TEMP/audit-tools" "$RUNNER_TEMP/evidence"
+          cp scripts/deep-audit/*.py "$RUNNER_TEMP/audit-tools/"
+      - uses: actions/checkout@v6
+        with:
+          ref: 68b9f7f0cd11e2dbf603971c4a987fa2de682fb0
+          fetch-depth: 1
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+      - uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.4
+          install-only: true
+      - name: Install original hooks and regression tests
+        run: |
+          set -euo pipefail
+          echo "$HOME/golangci-lint-2.11.4-linux-amd64" >> "$GITHUB_PATH"
+          case "$AUDIT_ISSUE" in
+            988|989|990|991|994) packages='./internal/worker/codexcli ./internal/worker/base' ;;
+            992) packages='./internal/worker/opencodeserver ./internal/worker/base' ;;
+            993) packages='./internal/messaging/feishu' ;;
+            995|997) packages='./internal/gateway' ;;
+            996) packages='./pkg/events ./pkg/aep' ;;
+            *) exit 2 ;;
+          esac
+          echo "AUDIT_PACKAGES=$packages" >> "$GITHUB_ENV"
+          make hooks
+          test "$(git config --get core.hooksPath)" = 'scripts/git-hooks'
+          git rev-parse HEAD > "$RUNNER_TEMP/evidence/base.txt"
+          go version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          python "$RUNNER_TEMP/audit-tools/case_$AUDIT_ISSUE.py" tests
+          git add -N internal pkg
+          git diff --name-only -- '*.go' | xargs gofmt -w
+      - name: Prove regressions fail on the original implementation
+        run: |
+          set +e
+          go test -json -race -count=1 -shuffle=on -timeout=3m -run "^TestDeepAudit$AUDIT_ISSUE" $AUDIT_PACKAGES > "$RUNNER_TEMP/evidence/red.jsonl" 2>&1
+          echo "$?" > "$RUNNER_TEMP/evidence/red-exit.txt"
+          if [ "$AUDIT_ISSUE" = 996 ]; then
+            go test -run '^$' -bench BenchmarkDeepAudit996CloneDelta -benchmem -count=3 ./pkg/events > "$RUNNER_TEMP/evidence/benchmark-before.txt" 2>&1
+          fi
+          exit 0
+      - name: Apply exact-source repairs and repository formatting
+        run: |
+          set -euo pipefail
+          python "$RUNNER_TEMP/audit-tools/case_$AUDIT_ISSUE.py" fixes
+          git add -N internal pkg
+          git diff --name-only -- '*.go' | xargs golangci-lint fmt
+          git diff --check
+      - name: Repeat repaired regressions with the race detector
+        run: |
+          set -euo pipefail
+          go test -json -race -count=5 -shuffle=on -timeout=3m -run "^TestDeepAudit$AUDIT_ISSUE" $AUDIT_PACKAGES > "$RUNNER_TEMP/evidence/green.jsonl" 2>&1
+          if [ "$AUDIT_ISSUE" = 996 ]; then
+            go test -run '^$' -bench BenchmarkDeepAudit996CloneDelta -benchmem -count=3 ./pkg/events > "$RUNNER_TEMP/evidence/benchmark-after.txt" 2>&1
+            (cd client && go test -short -race -count=1 ./...) > "$RUNNER_TEMP/evidence/client.txt" 2>&1
+          fi
+      - name: Verify existing related suites and all twelve contract combinations
+        run: |
+          set -euo pipefail
+          GORACE=history_size=5 go test -json -short -race -count=1 -shuffle=on -timeout=10m $AUDIT_PACKAGES > "$RUNNER_TEMP/evidence/related.jsonl" 2>&1
+          make test-contract-matrix > "$RUNNER_TEMP/evidence/contracts.txt" 2>&1
+      - name: Validate per-test red evidence and persist truthful results
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])/'evidence'
+          issue=os.environ['AUDIT_ISSUE']
+          summary={}
+          for name in ('red','green','related'):
+              events=[]
+              for line in (root/(name+'.jsonl')).read_text().splitlines():
+                  try: events.append(json.loads(line))
+                  except json.JSONDecodeError: pass
+              summary[name]={a:[{'package':r['Package'],'test':r['Test']} for r in events if r.get('Action')==a and r.get('Test')] for a in ('pass','fail','skip')}
+          assert summary['red']['fail'], 'no per-test baseline failure; build failures are not reproductions'
+          assert summary['green']['pass'] and not summary['green']['fail'] and not summary['green']['skip']
+          assert summary['related']['pass'] and not summary['related']['fail']
+          assert '12 combinations, 96 core scenarios, 0 skipped, 0 failed' in (root/'contracts.txt').read_text()
+          (root/'summary.json').write_text(json.dumps(summary,indent=2))
+          titles={'988':'Codex 订阅通道所有权','989':'Codex 传输快照代际','990':'Codex 重置失败引用释放','991':'Codex 进程回收代际','992':'OpenCode reset 失败关闭','993':'飞书整体关闭期限','994':'Codex 未完成 RPC 收尾','995':'平台终态回执一次性完成','996':'事件可变载荷深复制','997':'流式合并消息身份保真'}
+          url=f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          rows='\n'.join(f"| {n} | {len(g['pass'])} | {len(g['fail'])} | {len(g['skip'])} |" for n,g in summary.items())
+          failed='\n'.join(f"- `{r['test']}`" for r in summary['red']['fail'])
+          skipped='\n'.join(f"- `{r['package']}` / `{r['test']}`" for r in summary['related']['skip']) or '无。'
+          files=subprocess.check_output(['git','diff','--name-only'],text=True).strip()
+          text=f'''---
+          title: "Issue #{issue}：{titles[issue]}"
+          weight: 66
+          description: "独立根因、回归证据和交付边界。"
+          ---
+
+          # {titles[issue]}
+
+          根因、触发路径与验收约束见 [Issue #{issue}](https://github.com/hrygo/hotplex/issues/{issue})。本变更以 PR #986 的 `{os.environ['AUDIT_BASE']}` 为基准，只处理本 Issue，不把其他并行分支的修复计入本次交付。
+
+          ## 实际验证
+
+          [隔离 Actions 运行]({url}) 使用 `{(root/'toolchain.txt').read_text().strip()}`。先加入最终回归验证原实现失败，再应用产品修复，使用 race detector 和随机顺序重复五轮。
+
+          | 范围 | 通过 | 失败 | 跳过 |
+          | --- | ---: | ---: | ---: |
+          {rows}
+
+          red 为预期失败。计数包含父子测试与重复轮次，不等于独立 bug 数量。既有三渠道四 Worker 契约矩阵：12 个组合、96 个核心场景，0 失败、0 跳过。它是确定性外部协议 fake，不是生产平台或收费模型联调。
+
+          ### 原实现失败用例
+
+          {failed}
+
+          ### 相关测试实际跳过
+
+          {skipped}
+
+          ## 变更文件
+
+          ```text
+          {files}
+          ```
+
+          ## 交付边界
+
+          不变更 AEP wire schema、权限默认值或生产数据；没有部署或合并 main。完整 lint、文档构建和原始 git commit / git push hooks 是后续发布门禁，最终发布状态以本运行与 PR 提交记录为准，不能仅以本文件存在推断已推送。独立 PR 依赖尚未合并的 #986；共同修改文件的兄弟 PR 合并后需重新核验冲突与集成测试。
+          '''
+          import textwrap
+          path=Path(f'docs/architecture/worker-channel-issue-{issue}.md')
+          # Leading indentation is stripped per line; preserve Go/log strings verbatim above.
+          path.write_text('\n'.join(line[10:] if line.startswith('          ') else line for line in text.splitlines())+'\n')
+          print({n:{a:len(v) for a,v in g.items()} for n,g in summary.items()})
+          PY
+      - name: Run full lint and documentation build
+        run: |
+          set -euo pipefail
+          golangci-lint run --timeout=10m > "$RUNNER_TEMP/evidence/lint.txt" 2>&1
+          go run ./cmd/build-docs > "$RUNNER_TEMP/evidence/docs.txt" 2>&1
+          git diff --check
+      - name: Commit and push only this issue through original hooks
+        run: |
+          set -euo pipefail
+          test ! -e scripts/deep-audit/common.py
+          test "$(git ls-remote origin refs/heads/fix/985-worker-channel-hardening | cut -f1)" = "$AUDIT_BASE"
+          branch="fix/$AUDIT_ISSUE-deep-reliability"
+          test -z "$(git ls-remote origin refs/heads/$branch)"
+          git checkout -b "$branch"
+          git config user.name 'HotPlex Audit'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- internal pkg "docs/architecture/worker-channel-issue-$AUDIT_ISSUE.md"
+          git commit -m "fix(runtime): resolve deep reliability issue #$AUDIT_ISSUE" -m "Refs #$AUDIT_ISSUE; depends on PR #986." > "$RUNNER_TEMP/evidence/commit.txt" 2>&1
+          git push origin "HEAD:refs/heads/$branch" > "$RUNNER_TEMP/evidence/push.txt" 2>&1
+          git rev-parse HEAD | tee "$RUNNER_TEMP/evidence/product-commit.txt"
+          git diff --exit-code
+      - name: Preserve inspectable evidence even on failure
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git add -N internal pkg 2>/dev/null || true
+          git diff --binary "$AUDIT_BASE" > "$RUNNER_TEMP/evidence/product.patch"
+          git diff --stat "$AUDIT_BASE" > "$RUNNER_TEMP/evidence/stat.txt"
+          python - <<'PY'
+          import json,os
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])/'evidence'
+          for name in ('green','related'):
+              p=root/(name+'.jsonl')
+              if not p.exists():continue
+              records=[]
+              for line in p.read_text().splitlines():
+                  try:records.append(json.loads(line))
+                  except json.JSONDecodeError:print(line)
+              failed={(r.get('Package'),r.get('Test')) for r in records if r.get('Action')=='fail'}
+              print(name,'failed',sorted(failed,key=str))
+              for r in records:
+                  if r.get('Output') and (r.get('Package'),r.get('Test')) in failed:print(r['Output'],end='')
+          for name in ('lint.txt','commit.txt','push.txt','stat.txt'):
+              p=root/name
+              if p.exists():print('\n###',name,'\n','\n'.join(p.read_text().splitlines()[-80:]))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deep-audit-${{ matrix.issue }}-${{ github.run_number }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14
