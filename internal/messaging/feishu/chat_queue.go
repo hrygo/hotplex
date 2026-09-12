@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,11 +27,15 @@ var ErrChatQueueClosed = errors.New("feishu: chat queue closed")
 // through a buffered channel, eliminating race conditions that existed in the
 // previous goroutine-chaining approach.
 type ChatQueue struct {
-	log     *slog.Logger
-	mu      sync.Mutex
-	workers map[string]*chatWorker
-	closed  bool
-	wg      sync.WaitGroup // track worker goroutines for graceful shutdown
+	log       *slog.Logger
+	mu        sync.Mutex
+	workers   map[string]*chatWorker
+	closed    bool
+	wg        sync.WaitGroup // track worker goroutines for graceful shutdown
+	stopCtx   context.Context
+	stop      context.CancelFunc
+	done      chan struct{}
+	discarded atomic.Int64
 }
 
 type chatWorker struct {
@@ -40,7 +45,9 @@ type chatWorker struct {
 }
 
 func NewChatQueue(log *slog.Logger) *ChatQueue {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &ChatQueue{
+		stopCtx: ctx, stop: cancel, done: make(chan struct{}),
 		log:     log,
 		workers: make(map[string]*chatWorker),
 	}
@@ -121,7 +128,14 @@ func (q *ChatQueue) runWorker(chatID string, w *chatWorker) {
 // runTask contains failures to one accepted task. Recovering only in
 // runWorker would retire the worker and strand the rest of its accepted queue.
 func (q *ChatQueue) runTask(chatID string, w *chatWorker, task func(context.Context) error) {
-	ctx, cancel := context.WithTimeout(context.Background(), chatTaskTimeout)
+	if q.stopCtx.Err() != nil {
+		q.discarded.Add(1)
+		if q.log != nil {
+			q.log.Warn("feishu: queued task cancelled during shutdown", "chat_id", chatID)
+		}
+		return
+	}
+	ctx, cancel := context.WithTimeout(q.stopCtx, chatTaskTimeout)
 	w.mu.Lock()
 	w.cancel = cancel
 	w.mu.Unlock()
@@ -190,14 +204,35 @@ func (q *ChatQueue) Abort(chatID string) {
 // Close shuts down all worker goroutines by closing their task channels.
 // It waits for all in-flight tasks to complete.
 func (q *ChatQueue) Close() {
+	_ = q.CloseContext(context.Background())
+}
+
+// CloseContext gracefully drains until ctx expires. All callers share one
+// convergence waiter. Once the budget expires, active tasks receive cancellation
+// and queued tasks are discarded without invoking their external side effects.
+// A task ignoring cancellation may outlive this call; it cannot block the caller.
+func (q *ChatQueue) CloseContext(ctx context.Context) error {
 	q.mu.Lock()
 	if !q.closed {
 		q.closed = true
 		for _, w := range q.workers {
 			close(w.tasks)
 		}
+		go func() { q.wg.Wait(); q.stop(); close(q.done) }()
 	}
 	q.mu.Unlock()
-
-	q.wg.Wait() // wait for all workers to finish
+	if err := ctx.Err(); err != nil {
+		q.stop()
+		return err
+	}
+	select {
+	case <-q.done:
+		return nil
+	case <-ctx.Done():
+		q.stop()
+		return ctx.Err()
+	}
 }
+
+// DiscardedTasks reports accepted tasks not executed due to forced shutdown.
+func (q *ChatQueue) DiscardedTasks() int64 { return q.discarded.Load() }

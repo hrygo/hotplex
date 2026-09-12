@@ -187,3 +187,5 @@ HotPlex 还会把中文优先的文档门户直接嵌入二进制；网关启动
 ## 📜 开源协议
 
 HotPlex 基于 [Apache License 2.0](LICENSE) 发布。
+
+[Worker / 消息渠道独立缺陷台账](docs/issues/2026-09-runtime-audit/README.md)

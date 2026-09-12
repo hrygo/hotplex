@@ -187,3 +187,5 @@ Do not open a public issue for a suspected vulnerability. Follow the private rep
 ## 📜 License
 
 HotPlex is distributed under the [Apache License 2.0](LICENSE).
+
+[Worker / 消息渠道独立缺陷台账](docs/issues/2026-09-runtime-audit/README.md)

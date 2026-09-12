@@ -30,6 +30,7 @@ const (
 	stateStarting                     // process launching, waiting for handshake
 	stateRunning                      // process serving JSON-RPC requests
 	stateStopped                      // gateway shutdown
+	stateRetiring                     // idle kill claimed; Acquire must not lease this process
 )
 
 const (
@@ -68,14 +69,17 @@ type CodexAppServerManager struct {
 	log *slog.Logger
 	cfg config.CodexCLIConfig
 
-	mu            sync.Mutex
-	proc          *proc.Manager
-	stdin         io.WriteCloser
-	stdout        io.Reader
-	refs          int
-	state         managerState
-	crashCh       chan struct{} // closed when process exits unexpectedly
-	crashExitCode int           // OS exit code set before crashCh is closed
+	mu               sync.Mutex
+	proc             *proc.Manager
+	stdin            io.WriteCloser
+	transportMu      sync.RWMutex
+	transportVersion uint64
+	transportDone    chan struct{}
+	stdout           io.Reader
+	refs             int
+	state            managerState
+	crashCh          chan struct{} // closed when process exits unexpectedly
+	crashExitCode    int           // OS exit code set before crashCh is closed
 
 	// pending maps JSON-RPC request IDs to response channels.
 	pending sync.Map // map[int64]chan *JSONRPCResponse
@@ -98,7 +102,7 @@ type CodexAppServerManager struct {
 
 	// subMu protects subscribers for thread event routing.
 	subMu       sync.Mutex
-	subscribers map[string]chan *events.Envelope
+	subscribers map[string]*codexSubscription
 	subSessions map[string]string // threadID → sessionID mapping for envelope population
 	subsClosed  atomic.Bool       // set when subscribers have been closed (prevents double-close)
 
@@ -123,7 +127,7 @@ func NewCodexAppServerManager(log *slog.Logger, cfg config.CodexCLIConfig) *Code
 		log:         log.With("component", "codex-app-server"),
 		cfg:         cfg,
 		crashCh:     make(chan struct{}),
-		subscribers: make(map[string]chan *events.Envelope),
+		subscribers: make(map[string]*codexSubscription),
 		subSessions: make(map[string]string),
 		converters:  make(map[string]*Mapper),
 	}
@@ -234,6 +238,10 @@ func (m *CodexAppServerManager) Release() {
 
 // Subscribe returns a channel that receives AEP events for the given thread ID.
 func (m *CodexAppServerManager) Subscribe(threadID, sessionID string) chan *events.Envelope {
+	return m.subscribe(threadID, sessionID).ch
+}
+
+func (m *CodexAppServerManager) subscribe(threadID, sessionID string) *codexSubscription {
 	m.subMu.Lock()
 	defer m.subMu.Unlock()
 
@@ -241,7 +249,7 @@ func (m *CodexAppServerManager) Subscribe(threadID, sessionID string) chan *even
 		return ch
 	}
 
-	ch := make(chan *events.Envelope, 256)
+	ch := &codexSubscription{ch: make(chan *events.Envelope, 256)}
 	m.subscribers[threadID] = ch
 	m.subSessions[threadID] = sessionID
 	m.log.Debug("codex-app-server: subscribed", "thread_id", threadID, "session_id", sessionID)
@@ -287,7 +295,8 @@ func (m *CodexAppServerManager) Call(ctx context.Context, method string, params 
 	m.pending.Store(id, respCh)
 	defer m.pending.Delete(id)
 
-	if err := m.writeRequest(ctx, &req); err != nil {
+	transport := m.snapshotTransport()
+	if err := m.writeFrameOn(ctx, &req, transport); err != nil {
 		return nil, fmt.Errorf("codex-app-server: write request: %w", err)
 	}
 
@@ -300,11 +309,16 @@ func (m *CodexAppServerManager) Call(ctx context.Context, method string, params 
 
 	select {
 	case resp := <-respCh:
-		if resp.Error != nil {
-			return nil, fmt.Errorf("codex-app-server: %s: %s (code %d)",
-				method, resp.Error.Message, resp.Error.Code)
+		return decodeCallResponse(method, resp)
+	case <-transport.done:
+		// EOF may follow a valid buffered response. Prefer that accepted reply
+		// rather than turning an acknowledged result into an unknown outcome.
+		select {
+		case resp := <-respCh:
+			return decodeCallResponse(method, resp)
+		default:
+			return nil, fmt.Errorf("codex-app-server: %s: transport closed before response: %w", method, io.ErrClosedPipe)
 		}
-		return resp.Result, nil
 	case <-ctx.Done():
 		return nil, &responseWaitError{cause: fmt.Errorf("codex-app-server: %s: %w", method, ctx.Err())}
 	case <-timer.C:
@@ -337,6 +351,7 @@ func (m *CodexAppServerManager) Shutdown(ctx context.Context) {
 	defer m.mu.Unlock()
 
 	m.state = stateStopped
+	m.setStdin(nil) // wakes calls even when no native process/reader remains
 
 	if m.idleTimer != nil {
 		m.idleTimer.Stop()
@@ -371,7 +386,7 @@ func (m *CodexAppServerManager) Shutdown(ctx context.Context) {
 		m.subsClosed.Store(true)
 		m.subMu.Lock()
 		for id, ch := range m.subscribers {
-			close(ch)
+			ch.close()
 			delete(m.subscribers, id)
 		}
 		m.subSessions = make(map[string]string)
@@ -422,21 +437,21 @@ func (m *CodexAppServerManager) startProcessLocked(ctx context.Context) error {
 		return fmt.Errorf("codex-app-server: start process: %w", err)
 	}
 
-	m.stdin = stdin
+	m.setStdin(stdin)
 	m.stdout = stdout
 	m.pgid = m.proc.PGID()
 
 	bgCtx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
-	go m.readNotifications(bgCtx, stdout)
-	go m.monitorProcess()
+	go m.readBoundNotifications(bgCtx, stdout, m.snapshotTransport())
+	go m.monitorBoundProcess(m.proc)
 
 	if err := m.handshake(ctx); err != nil {
 		cancel()
 		_ = m.proc.Kill()
 		m.proc = nil
 		m.pgid = 0
-		m.stdin = nil
+		m.setStdin(nil)
 		m.stdout = nil
 		m.state = stateIdle
 		return fmt.Errorf("codex-app-server: handshake: %w", err)
@@ -492,6 +507,10 @@ func (m *CodexAppServerManager) handshake(ctx context.Context) error {
 // is especially important for Notify, which has no response-wait timeout
 // unlike Call.
 func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
+	return m.writeFrameOn(ctx, v, m.snapshotTransport())
+}
+
+func (m *CodexAppServerManager) writeFrameOn(ctx context.Context, v any, transport codexTransport) error {
 	if err := ctx.Err(); err != nil {
 		return &writeNotStartedError{cause: err}
 	}
@@ -499,6 +518,10 @@ func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
 	// CAS linearizes cancellation against starting I/O, including a helper that
 	// is still waiting for writeMu after WriteWithCtx has returned.
 	var writePhase atomic.Int32
+	writer, version := transport.writer, transport.version
+	if writer == nil {
+		return io.ErrClosedPipe
+	}
 	_, callerHasDeadline := ctx.Deadline()
 	// The mutex MUST be acquired inside the closure, not at the call site:
 	// if ctx cancels and WriteWithCtx bails out, an orphaned goroutine
@@ -530,7 +553,20 @@ func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
 		if !writePhase.CompareAndSwap(0, 1) {
 			return &writeNotStartedError{cause: writeCtx.Err()}
 		}
-		return json.NewEncoder(m.stdin).Encode(v)
+		m.transportMu.RLock()
+		current := m.transportVersion == version
+		m.transportMu.RUnlock()
+		select {
+		case <-transport.done:
+			return io.ErrClosedPipe
+		default:
+		}
+		if !current {
+			return io.ErrClosedPipe
+		}
+		// The snapshot remains bound to the original process even if shutdown
+		// occurs after this check. Never resolve stdin again after waiting.
+		return json.NewEncoder(writer).Encode(v)
 	}, fallbackGrace)
 	// An orphaned write (ctx cancelled while syscall.Write is blocked) leaves
 	// the goroutine holding writeMu until the child exits. Because the manager
@@ -547,11 +583,6 @@ func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
 	return err
 }
 
-// writeRequest marshals and writes a JSON-RPC request to stdin.
-func (m *CodexAppServerManager) writeRequest(ctx context.Context, req *JSONRPCRequest) error {
-	return m.writeFrame(ctx, req)
-}
-
 // writeNotification marshals and writes a JSON-RPC notification to stdin.
 func (m *CodexAppServerManager) writeNotification(ctx context.Context, notif *JSONRPCNotification) error {
 	return m.writeFrame(ctx, notif)
@@ -561,6 +592,11 @@ func (m *CodexAppServerManager) writeNotification(ctx context.Context, notif *JS
 // pending response channels or subscriber notification channels.
 // reader is passed in to avoid acquiring m.mu at startup (caller holds it).
 func (m *CodexAppServerManager) readNotifications(ctx context.Context, reader io.Reader) {
+	m.readBoundNotifications(ctx, reader, m.snapshotTransport())
+}
+
+func (m *CodexAppServerManager) readBoundNotifications(ctx context.Context, reader io.Reader, transport codexTransport) {
+	defer m.closeTransport(transport)
 	defer func() {
 		if r := recover(); r != nil {
 			m.log.Error("codex-app-server: readNotifications panic",
@@ -1154,9 +1190,10 @@ func (m *CodexAppServerManager) SteerTurnContext(ctx context.Context, threadID, 
 }
 
 // InterruptTurn interrupts the running turn in the specified thread.
-// Upstream TurnInterruptParams (turn.rs:188) requires both threadId and turnId.
+// Upstream requires both threadId and turnId and a correlated request ACK.
+// An empty ACK confirms acceptance; turn/completed remains the final event.
 func (m *CodexAppServerManager) InterruptTurn(ctx context.Context, threadID, turnID string) error {
-	err := m.Notify(ctx, "turn/interrupt", map[string]any{
+	_, err := m.Call(ctx, "turn/interrupt", map[string]any{
 		"threadId": threadID,
 		"turnId":   turnID,
 	})
@@ -1354,65 +1391,49 @@ func (m *CodexAppServerManager) dispatchNotification(notif *JSONRPCNotification)
 
 // sendEnvelope delivers a single envelope to a subscriber channel with backpressure.
 // Delta events are dropped silently when full; critical events block with a 5s timeout.
-func (m *CodexAppServerManager) sendEnvelope(ch chan *events.Envelope, env *events.Envelope) {
-	// Recover from send on closed channel — release() may close ch
-	// concurrently with Unsubscribe+conn.Close after we released subMu.
-	defer func() {
-		if r := recover(); r != nil {
-			m.log.Debug("codex-app-server: send on closed channel, subscriber gone")
-		}
-	}()
+func (m *CodexAppServerManager) sendEnvelope(sub *codexSubscription, env *events.Envelope) {
 	if env.Event.Type == events.MessageDelta || env.Event.Type == events.Reasoning {
-		select {
-		case ch <- env:
-		default:
-		}
+		sub.gate.TrySend(sub.ch, env)
 		return
 	}
-	timer := time.NewTimer(criticalEventSendTimeout)
-	defer timer.Stop()
-	select {
-	case ch <- env:
-	case <-timer.C:
-		m.log.Warn("codex-app-server: critical event send timeout, dropping",
-			"event_type", env.Event.Type)
+	if !sub.gate.SendTimeout(sub.ch, env, criticalEventSendTimeout) {
+		m.log.Debug("codex-app-server: critical event not accepted by subscriber", "event_type", env.Event.Type)
 	}
 }
 
-// monitorProcess waits for the process to exit and handles crash recovery.
+// monitorProcess preserves the in-process compatibility entry point. Native
+// startup passes its immutable process directly to monitorBoundProcess.
 func (m *CodexAppServerManager) monitorProcess() {
 	m.mu.Lock()
 	pm := m.proc
 	m.mu.Unlock()
+	m.monitorBoundProcess(pm)
+}
+
+func (m *CodexAppServerManager) monitorBoundProcess(pm *proc.Manager) {
 	if pm == nil {
 		return
 	}
 	code, _ := pm.Wait()
-
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proc != pm {
+		return
+	} // a failed startup's old monitor owns no new state
 	wasRunning := m.state == stateRunning
 	refs := m.refs
-	// Guard against overwriting stateStopped set by Shutdown (mirrors OCS
-	// singleton.go): once stopped, monitorProcess must not flip the manager
-	// back to idle, which would let a post-Shutdown Acquire restart it.
-	if m.state != stateStopped {
-		m.state = stateIdle
-	}
 	m.proc = nil
 	m.pgid = 0
-	m.stdin = nil
+	m.setStdin(nil)
 	m.stdout = nil
-
 	if m.idleTimer != nil {
 		m.idleTimer.Stop()
 		m.idleTimer = nil
 	}
-
 	if m.cancel != nil {
 		m.cancel()
 		m.cancel = nil
 	}
-
 	if wasRunning && refs > 0 {
 		m.log.Warn("codex-app-server: process crashed", "exit_code", code, "refs", refs)
 		m.crashExitCode = code
@@ -1421,91 +1442,72 @@ func (m *CodexAppServerManager) monitorProcess() {
 	} else {
 		m.log.Info("codex-app-server: process exited", "exit_code", code, "refs", refs)
 	}
-	m.mu.Unlock()
-
-	if wasRunning {
-		m.clearConverters()
-		m.clearAllServerRequests()
-		m.subsClosed.Store(true)
-		m.subMu.Lock()
-		for id, ch := range m.subscribers {
-			close(ch)
-			delete(m.subscribers, id)
-		}
-		m.subSessions = make(map[string]string)
-		m.subMu.Unlock()
+	// Acquire cannot create the next generation until every old resource has
+	// been retired. Keep lifecycle ownership while clearing the old tables.
+	m.clearConverters()
+	m.clearAllServerRequests()
+	m.subsClosed.Store(true)
+	m.subMu.Lock()
+	for id, sub := range m.subscribers {
+		sub.close()
+		delete(m.subscribers, id)
+	}
+	m.subSessions = make(map[string]string)
+	m.subMu.Unlock()
+	if m.state != stateStopped {
+		m.state = stateIdle
 	}
 }
 
-// startIdleDrainLocked starts a timer to kill the process when idle.
-// Caller must hold m.mu.
+// claimIdleRetirementLocked linearizes Acquire against kill intent. The actual
+// OS kill happens outside the mutex, but no caller may lease the dying process.
+func (m *CodexAppServerManager) claimIdleRetirementLocked() int {
+	if m.refs != 0 || m.state != stateRunning || m.pgid <= 0 {
+		return 0
+	}
+	m.state = stateRetiring
+	return m.pgid
+}
+
+// startIdleDrainLocked starts an identity-bound timer; caller holds m.mu.
 func (m *CodexAppServerManager) startIdleDrainLocked() {
-	m.log.Info("codex-app-server: starting idle drain timer",
-		"period", m.cfg.IdleDrainPeriod)
-	m.idleTimer = time.AfterFunc(m.cfg.IdleDrainPeriod, func() {
+	if m.idleTimer != nil {
+		m.idleTimer.Stop()
+	}
+	m.log.Info("codex-app-server: starting idle drain timer", "period", m.cfg.IdleDrainPeriod)
+	var timer *time.Timer
+	timer = time.AfterFunc(m.cfg.IdleDrainPeriod, func() {
 		m.mu.Lock()
-		if m.idleTimer == nil {
-			// Timer was already stopped (e.g. by KillIfIdle or Acquire).
+		if m.idleTimer != timer {
 			m.mu.Unlock()
 			return
 		}
-		shouldKill := m.refs == 0 && m.state == stateRunning && m.pgid > 0
-		pgid := m.pgid
+		m.idleTimer = nil
+		pgid := m.claimIdleRetirementLocked()
 		m.mu.Unlock()
-
-		if shouldKill {
+		if pgid > 0 {
 			m.log.Info("codex-app-server: idle drain expired, killing process")
-			// Call package-level ForceKill + ForceKillTree directly instead
-			// of m.proc.Kill(). proc.Manager.Kill() is now async-safe (#838),
-			// but the direct call is defense-in-depth: it sends SIGKILL by
-			// PGID via syscall.Kill WITHOUT touching proc.mu, guaranteeing
-			// no interaction with monitorProcess's concurrent Wait() — which
-			// is what owns the singleton's post-exit cleanup. monitorProcess
-			// will observe the exit, set state to stateIdle, and clean up.
 			_ = proc.ForceKill(pgid)
 			proc.ForceKillTree(pgid, m.log)
 		}
-
-		m.mu.Lock()
-		m.idleTimer = nil
-		m.mu.Unlock()
 	})
+	m.idleTimer = timer
 }
 
-// KillIfIdle immediately kills the singleton process when no sessions hold
-// references (refs == 0). Used by both Kill() and Terminate() to avoid the
-// 30-minute idle drain wait.
-//
-// This skips the graceful SIGTERM→5s→SIGKILL protocol used by Shutdown()
-// because an idle process has no active sessions — there is nothing to
-// drain or notify.
-//
-// We call package-level ForceKill(pgid) directly instead of proc.Manager.Kill().
-// proc.Kill() is async-safe since #838 (cmd.Wait() moved off proc.mu), but
-// ForceKill here remains preferable: it sends SIGKILL by PGID via syscall.Kill
-// without ever acquiring proc.mu, guaranteeing zero interaction with the
-// monitorProcess goroutine's concurrent Wait() — which is the path that owns
-// the singleton's post-exit cleanup. This is defense-in-depth rather than a
-// required workaround.
-//
-// NOTE: There is a benign TOCTOU window between the shouldKill check (under
-// m.mu) and the ForceKill(pgid) call (after unlock). If the process exits
-// in this window, ForceKill returns ESRCH, which is harmless and ignored.
+// KillIfIdle claims retirement under the lifecycle mutex before issuing a
+// process-group kill. monitorBoundProcess owns final cleanup and idle publication.
 func (m *CodexAppServerManager) KillIfIdle() {
 	m.mu.Lock()
 	if m.idleTimer != nil {
 		m.idleTimer.Stop()
 		m.idleTimer = nil
 	}
-	shouldKill := m.refs == 0 && m.state == stateRunning && m.pgid > 0
-	pgid := m.pgid
+	pgid := m.claimIdleRetirementLocked()
 	m.mu.Unlock()
-
-	if shouldKill {
+	if pgid > 0 {
 		m.log.Info("codex-app-server: killing idle process immediately", "pgid", pgid)
 		_ = proc.ForceKill(pgid)
 		proc.ForceKillTree(pgid, m.log)
-		// monitorProcess will observe the exit, set state to stateIdle, and clean up.
 	}
 }
 
