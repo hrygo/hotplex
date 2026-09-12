@@ -399,15 +399,21 @@ func (w *AppServerWorker) startTurn(ctx context.Context, input []TurnInputItem) 
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	if err := json.Unmarshal(resp, &tr); err != nil {
-		w.Log.Debug("codexcli: turn/start response parse error", "err", err)
-	} else if tr.Turn.ID == "" {
-		w.Log.Debug("codexcli: turn/start response missing turn.id")
-	} else {
+	if err := json.Unmarshal(resp, &tr); err != nil || strings.TrimSpace(tr.Turn.ID) == "" {
 		w.mu.Lock()
-		w.turnID = tr.Turn.ID
+		w.turnID = ""
 		w.mu.Unlock()
+		// The request was accepted at the transport boundary, but its native
+		// identity was not confirmed. Reuse the gateway's unknown/timeout
+		// classification rather than dropping the durable input or replaying it.
+		return &worker.WorkerError{
+			Kind:    worker.ErrKindTimeout,
+			Message: "codexcli: turn/start response identity invalid; execution outcome unknown",
+		}
 	}
+	w.mu.Lock()
+	w.turnID = tr.Turn.ID
+	w.mu.Unlock()
 
 	// A new primary turn began here: the turn/start RPC succeeded, so the new
 	// turn is running. Clear the user-stop marker AFTER the successful send —
@@ -513,11 +519,13 @@ func (w *AppServerWorker) startNewThread(ctx context.Context, session worker.Ses
 	}
 
 	var result ThreadStartResult
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := json.Unmarshal(resp, &result); err != nil || strings.TrimSpace(result.Thread.ID) == "" {
 		w.mu.Lock()
 		w.closeAndMarkDone()
 		w.mu.Unlock()
-		return fmt.Errorf("codexcli: %s parse thread/start: %w", errPrefix, err)
+		// Do not publish a subscriber or connection without an authoritative
+		// native identity. Keep untrusted response bytes out of error output.
+		return fmt.Errorf("codexcli: %s: invalid thread/start response identity", errPrefix)
 	}
 
 	w.mu.Lock()
