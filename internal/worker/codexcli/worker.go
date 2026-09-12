@@ -137,13 +137,14 @@ var (
 
 // appConn implements worker.SessionConn for the app-server mode.
 type appConn struct {
-	userID     string
-	sessionID  string
-	recvCh     chan *events.Envelope
-	mu         sync.Mutex
-	closed     bool
-	manager    *CodexAppServerManager
-	lastReplay worker.InputReplay
+	userID         string
+	sessionID      string
+	recvCh         chan *events.Envelope
+	mu             sync.Mutex
+	closed         bool
+	manager        *CodexAppServerManager
+	lastReplay     worker.InputReplay
+	standaloneGate base.EventGate
 }
 
 var _ worker.InputReplayRecoverer = (*appConn)(nil)
@@ -189,12 +190,11 @@ func (c *appConn) setTextReplay(content string) {
 }
 func (c *appConn) Recv() <-chan *events.Envelope { return c.recvCh }
 func (c *appConn) TrySend(env *events.Envelope) bool {
-	select {
-	case c.recvCh <- env:
-		return true
-	default:
-		return false
+	if c.manager != nil {
+		gate := c.manager.subscriberGate(c.recvCh)
+		return gate != nil && gate.TrySend(c.recvCh, env)
 	}
+	return c.standaloneGate.TrySend(c.recvCh, env)
 }
 func (c *appConn) Close() error {
 	c.mu.Lock()
@@ -203,9 +203,14 @@ func (c *appConn) Close() error {
 		return nil
 	}
 	c.closed = true
-	close(c.recvCh)
+	if c.manager != nil {
+		c.manager.closeSubscriber(c.recvCh)
+	} else {
+		c.standaloneGate.Close(c.recvCh)
+	}
 	return nil
 }
+
 func (c *appConn) UserID() string    { return c.userID }
 func (c *appConn) SessionID() string { return c.sessionID }
 
