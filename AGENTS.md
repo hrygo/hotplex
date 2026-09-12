@@ -203,3 +203,7 @@ Slack（send-message / upload-file / bookmark / react 等）与 Cron（create / 
 - PostgreSQL 支持已实现（`db.driver: "postgres"`），SQLite 仍为默认
 - ACP 适配器已实现（JSON-RPC 2.0 over stdio）
 - Windows 自更新不支持（exe 运行时被锁，使用 `scripts/install.ps1` 替代）
+
+### 本批独立Issue文档
+
+用户授权先以 `docs/issues/2026-09-runtime-audit/D*.md` 保存Issue，再修复；该目录是本批发现真相源。每份记录基准、Source/Test/Live、复现、验收、修复提交和PR。此批目标10个独立修复PR，保留既有PR #986作为基线，不将原已完成问题重复计数。
