@@ -7,6 +7,7 @@ on:
       - .github/workflows/codex-source-audit.yml
       - scripts/audit/**
       - scripts/worker-channel-audit-*.py
+      - scripts/audit-review-stdin.py
 
 permissions:
   contents: read
@@ -29,6 +30,7 @@ jobs:
           cp scripts/audit/worker_channel_hardening.py "$RUNNER_TEMP/hardening.py"
           cp scripts/worker-channel-audit-extra.py "$RUNNER_TEMP/extra.py"
           cp scripts/worker-channel-audit-publish.py "$RUNNER_TEMP/report.py"
+          cp scripts/audit-review-stdin.py "$RUNNER_TEMP/review.py"
       - uses: actions/checkout@v6
         with:
           ref: 29a23f02fa2874b9e856f2c0c1529f537f5f4ba4
@@ -45,6 +47,7 @@ jobs:
           git rev-parse HEAD | tee "$RUNNER_TEMP/hotplex-audit/base.txt"
           python "$RUNNER_TEMP/hardening.py" tests
           python "$RUNNER_TEMP/extra.py" tests
+          python "$RUNNER_TEMP/review.py" tests
           find internal -name '*_audit_test.go' -exec gofmt -w {} +
       - name: Reproduce defects on the unmodified implementation
         run: |
@@ -56,12 +59,17 @@ jobs:
           result=$?
           echo "baseline_exit=$result" | tee "$RUNNER_TEMP/hotplex-audit/red-exit.txt"
           exit 0
-      - name: Apply exact-source fixes
+      - name: Apply exact-source fixes and review the write-lock boundary
         run: |
           set -euo pipefail
           python "$RUNNER_TEMP/hardening.py" fixes
           python "$RUNNER_TEMP/extra.py" fixes
           git add -N internal
+          git diff --name-only -- '*.go' | xargs gofmt -w
+          set +e
+          go test -json -race -count=1 -timeout=30s -run '^TestAuditStdinSnapshotDoesNotWaitForPipeWriter$' ./internal/worker/base > "$RUNNER_TEMP/hotplex-audit/review-red.jsonl" 2>&1
+          set -e
+          python "$RUNNER_TEMP/review.py" fixes
           git diff --name-only -- '*.go' | xargs gofmt -w
           git diff --check
           git diff --stat
@@ -94,7 +102,7 @@ jobs:
           from pathlib import Path
           root = Path(os.environ['RUNNER_TEMP']) / 'hotplex-audit'
           summary = {}
-          for name in ('red', 'green', 'broad', 'client'):
+          for name in ('red', 'green', 'broad', 'client', 'review-red'):
               records = []
               for line in (root / (name + '.jsonl')).read_text().splitlines():
                   try: record = json.loads(line)
@@ -112,6 +120,8 @@ jobs:
               raise SystemExit('Missing per-test baseline failure evidence: ' + ', '.join(sorted(missing)))
           if summary['green']['fail'] or summary['green']['skip']:
               raise SystemExit('Repaired regressions must have no failures or skips')
+          if not any(r['Test'] == 'TestAuditStdinSnapshotDoesNotWaitForPipeWriter' for r in summary['review-red']['fail']):
+              raise SystemExit('Missing deterministic write-lock regression evidence')
           PY
           python "$RUNNER_TEMP/report.py"
       - name: Lint product changes with the repository-pinned linter
@@ -183,6 +193,7 @@ jobs:
           set -euo pipefail
           branch=codex/worker-channel-hardening-20260912
           test "$(git branch --show-current)" = "$branch"
+          test "$(git ls-remote origin refs/heads/codex/source-audit-bootstrap-20260912 | cut -f1)" = "$GITHUB_SHA"
           git config user.name 'HotPlex Audit'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -- README.md README_zh.md docs/architecture/worker-channel-reliability-audit-20260912.md internal
