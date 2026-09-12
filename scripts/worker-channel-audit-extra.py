@@ -41,8 +41,8 @@ func TestAuditCodexCallHonorsResponseCancellation(t *testing.T) {
         defer cancel()
         result := make(chan error, 1)
         go func() { _, err := m.Call(ctx, "probe", nil); result <- err }()
-        // The request has been written and the caller is durably blocked in
-        // the response wait. This does not rely on wall-clock sleeps.
+        // The request is written and the caller is durably blocked waiting
+        // for a response, without any wall-clock sleeps.
         synctest.Wait()
         cancel()
         synctest.Wait()
@@ -54,6 +54,11 @@ func TestAuditCodexCallHonorsResponseCancellation(t *testing.T) {
             require.Zero(t, pending)
             require.True(t, m.IsRunning(), "one canceled call must not stop the shared server")
         default:
+            // Advance only the bubble's virtual clock to retire the defective
+            // baseline call before failing. Otherwise it can abort the entire
+            // package and hide independent regression results.
+            time.Sleep(2 * time.Hour)
+            <-result
             t.Fatal("Call ignored cancellation after the request had been written")
         }
     })
@@ -81,6 +86,8 @@ func TestAuditCodexResponseCancellationIsNotUnavailable(t *testing.T) {
             }
             require.True(t, m.IsRunning())
         default:
+            time.Sleep(2 * time.Hour) // virtual time only; drain baseline failure
+            <-result
             t.Fatal("turn/start ignored caller cancellation")
         }
     })
@@ -163,7 +170,7 @@ func (e *responseWaitError) Unwrap() error { return e.cause }
         if errors.As(err, &responseErr) {
             return &worker.WorkerError{
                 Kind: worker.ErrKindTimeout,
-                Message: "codexcli: turn/start response was not received within the caller budget",
+                Message: fmt.Sprintf("codexcli: turn/start: %v", err),
                 Cause: err,
             }
         }''')
