@@ -1190,9 +1190,10 @@ func (m *CodexAppServerManager) SteerTurnContext(ctx context.Context, threadID, 
 }
 
 // InterruptTurn interrupts the running turn in the specified thread.
-// Upstream TurnInterruptParams (turn.rs:188) requires both threadId and turnId.
+// Upstream requires both threadId and turnId and a correlated request ACK.
+// An empty ACK confirms acceptance; turn/completed remains the final event.
 func (m *CodexAppServerManager) InterruptTurn(ctx context.Context, threadID, turnID string) error {
-	err := m.Notify(ctx, "turn/interrupt", map[string]any{
+	_, err := m.Call(ctx, "turn/interrupt", map[string]any{
 		"threadId": threadID,
 		"turnId":   turnID,
 	})

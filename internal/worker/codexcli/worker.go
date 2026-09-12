@@ -675,9 +675,9 @@ func (w *AppServerWorker) StopCurrentTurn(ctx context.Context) error {
 	}
 	w.MarkStopped()
 	if err := w.manager.InterruptTurn(ctx, tid, turnID); err != nil {
-		// The interrupt never took effect — the turn is still running and the
-		// gateway rolls back its stop fence. Unmark so the turn's completion
-		// is not misread as a user-stop (crash fallback preserved correctly).
+		// No successful interrupt acknowledgement was observed. Roll back the
+		// local stop marker with the gateway fence; a transport timeout can
+		// still be an unknown remote outcome, not permission for blind replay.
 		w.ClearStopped()
 		return err
 	}
