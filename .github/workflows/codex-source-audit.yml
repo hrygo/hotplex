@@ -1,0 +1,212 @@
+name: Codex worker-channel audit
+
+on:
+  push:
+    branches: [codex/source-audit-bootstrap-20260912]
+    paths:
+      - .github/workflows/codex-source-audit.yml
+      - scripts/audit/**
+      - scripts/worker-channel-audit-*.py
+      - scripts/audit-review-stdin.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-worker-channel-audit
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Preserve bootstrap tools outside the product worktree
+        run: |
+          mkdir -p "$RUNNER_TEMP/hotplex-audit"
+          cp scripts/audit/worker_channel_hardening.py "$RUNNER_TEMP/hardening.py"
+          cp scripts/worker-channel-audit-extra.py "$RUNNER_TEMP/extra.py"
+          cp scripts/worker-channel-audit-publish.py "$RUNNER_TEMP/report.py"
+          cp scripts/audit-review-stdin.py "$RUNNER_TEMP/review.py"
+      - uses: actions/checkout@v6
+        with:
+          ref: 29a23f02fa2874b9e856f2c0c1529f537f5f4ba4
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+      - name: Install hooks and add regressions
+        run: |
+          set -euo pipefail
+          make hooks
+          go version | tee "$RUNNER_TEMP/hotplex-audit/toolchain.txt"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/hotplex-audit/base.txt"
+          python "$RUNNER_TEMP/hardening.py" tests
+          python "$RUNNER_TEMP/extra.py" tests
+          python "$RUNNER_TEMP/review.py" tests
+          find internal -name '*_audit_test.go' -exec gofmt -w {} +
+      - name: Reproduce defects on the unmodified implementation
+        run: |
+          set +e
+          go test -json -race -count=1 -shuffle=on -timeout=2m -run '^TestAudit' \
+            ./internal/worker/base ./internal/worker/acp ./internal/worker/opencodeserver \
+            ./internal/worker/codexcli ./internal/messaging ./internal/messaging/feishu ./internal/gateway \
+            > "$RUNNER_TEMP/hotplex-audit/red.jsonl" 2>&1
+          result=$?
+          echo "baseline_exit=$result" | tee "$RUNNER_TEMP/hotplex-audit/red-exit.txt"
+          exit 0
+      - name: Apply exact-source fixes and review the write-lock boundary
+        run: |
+          set -euo pipefail
+          python "$RUNNER_TEMP/hardening.py" fixes
+          python "$RUNNER_TEMP/extra.py" fixes
+          git add -N internal
+          git diff --name-only -- '*.go' | xargs gofmt -w
+          set +e
+          go test -json -race -count=1 -timeout=30s -run '^TestAuditStdinSnapshotDoesNotWaitForPipeWriter$' ./internal/worker/base > "$RUNNER_TEMP/hotplex-audit/review-red.jsonl" 2>&1
+          set -e
+          python "$RUNNER_TEMP/review.py" fixes
+          git diff --name-only -- '*.go' | xargs gofmt -w
+          git diff --check
+          git diff --stat
+      - name: Repeat regressions with the race detector
+        run: |
+          set -euo pipefail
+          go test -json -race -count=5 -shuffle=on -timeout=3m -run '^(TestAudit|TestEventGate)' \
+            ./internal/worker/base ./internal/worker/acp ./internal/worker/opencodeserver \
+            ./internal/worker/codexcli ./internal/messaging ./internal/messaging/feishu ./internal/gateway \
+            > "$RUNNER_TEMP/hotplex-audit/green.jsonl" 2>&1
+      - name: Run worker, messaging and gateway suites
+        run: |
+          set -euo pipefail
+          GORACE=history_size=5 go test -json -short -race -count=1 -shuffle=on -timeout=10m \
+            ./internal/worker/... ./internal/messaging/... ./internal/gateway/... \
+            > "$RUNNER_TEMP/hotplex-audit/broad.jsonl" 2>&1
+      - name: Run the twelve-combination contract gate
+        run: |
+          set -o pipefail
+          make test-contract-matrix | tee "$RUNNER_TEMP/hotplex-audit/contract-matrix.log"
+      - name: Verify the Go SDK submodule
+        run: |
+          set -euo pipefail
+          cd client
+          go test -json -short -race -count=1 -shuffle=on -timeout=5m ./... > "$RUNNER_TEMP/hotplex-audit/client.jsonl" 2>&1
+      - name: Reject false red results and document actual outcomes
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'hotplex-audit'
+          summary = {}
+          for name in ('red', 'green', 'broad', 'client', 'review-red'):
+              records = []
+              for line in (root / (name + '.jsonl')).read_text().splitlines():
+                  try: record = json.loads(line)
+                  except json.JSONDecodeError: continue
+                  if record.get('Action') in ('pass', 'fail', 'skip') and record.get('Test'):
+                      records.append({key: record[key] for key in ('Package', 'Test', 'Action')})
+              summary[name] = {action: [r for r in records if r['Action'] == action] for action in ('pass', 'fail', 'skip')}
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2))
+          for name, group in summary.items():
+              print(name, {key: len(val) for key, val in group.items()})
+          required = ['TestAuditProcCompletionPreservesReplacement', 'TestAuditConnTrySendAfterClose', 'TestAuditDedupExpiresBeforeSweep', 'TestAuditDedupCloseBeforeStart', 'TestAuditChatQueuePanicPreservesAcceptedTail', 'TestAuditPlatformTimerRearmsAfterFlush', 'TestAuditPlatformReasoningIsNotTextCoalesced', 'TestAuditPromptPreservesWorkspaceDirectory', 'TestAuditCodexCallHonorsResponseCancellation', 'TestAuditCodexResponseCancellationIsNotUnavailable', 'TestAuditCodexResponseTimeoutPreservesDeadlineIdentity']
+          failed = {r['Test'].split('/')[0] for r in summary['red']['fail']}
+          missing = set(required) - failed
+          if missing:
+              raise SystemExit('Missing per-test baseline failure evidence: ' + ', '.join(sorted(missing)))
+          if summary['green']['fail'] or summary['green']['skip']:
+              raise SystemExit('Repaired regressions must have no failures or skips')
+          if not any(r['Test'] == 'TestAuditStdinSnapshotDoesNotWaitForPipeWriter' for r in summary['review-red']['fail']):
+              raise SystemExit('Missing deterministic write-lock regression evidence')
+          PY
+          python "$RUNNER_TEMP/report.py"
+      - name: Lint product changes with the repository-pinned linter
+        uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.4
+          args: --timeout=10m
+      - name: Rebuild documentation and verify modules
+        run: |
+          set -euo pipefail
+          go run ./cmd/build-docs
+          go mod verify
+          go vet ./...
+          go build ./...
+          git add -N internal docs/architecture/worker-channel-reliability-audit-20260912.md
+          git diff --check
+      - name: Preserve review artifacts even on failure
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/hotplex-audit"
+          git add -N internal docs/architecture/worker-channel-reliability-audit-20260912.md 2>/dev/null || git add -N internal
+          git diff --binary > "$RUNNER_TEMP/hotplex-audit/hardening.patch"
+          git diff --stat > "$RUNNER_TEMP/hotplex-audit/diff-stat.txt"
+          git diff --name-only > "$RUNNER_TEMP/hotplex-audit/changed-files.txt"
+          for name in green broad client; do
+            tail -40 "$RUNNER_TEMP/hotplex-audit/$name.jsonl" 2>/dev/null || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hotplex-hardening-evidence-${{ github.run_number }}
+          path: ${{ runner.temp }}/hotplex-audit/
+          retention-days: 7
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 29a23f02fa2874b9e856f2c0c1529f537f5f4ba4
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: hotplex-hardening-evidence-${{ github.run_number }}
+          path: ${{ runner.temp }}/hotplex-audit/
+      - name: Apply only the verified product patch
+        run: |
+          set -euo pipefail
+          git apply --check "$RUNNER_TEMP/hotplex-audit/hardening.patch"
+          git apply "$RUNNER_TEMP/hotplex-audit/hardening.patch"
+          test ! -e .github/workflows/codex-source-audit.yml
+          test ! -e scripts/audit/worker_channel_hardening.py
+          git checkout -b codex/worker-channel-hardening-20260912
+          make hooks
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+      - name: Install and run the repository-pinned linter
+        uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.4
+          args: --timeout=10m
+      - name: Commit and push through the unmodified repository hooks
+        run: |
+          set -euo pipefail
+          branch=codex/worker-channel-hardening-20260912
+          test "$(git branch --show-current)" = "$branch"
+          test "$(git ls-remote origin refs/heads/codex/source-audit-bootstrap-20260912 | cut -f1)" = "$GITHUB_SHA"
+          git config user.name 'HotPlex Audit'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- README.md README_zh.md docs/architecture/worker-channel-reliability-audit-20260912.md internal
+          git commit -m 'fix(runtime): harden worker lifecycle and channel delivery contracts'
+          set -o pipefail
+          git push origin "HEAD:refs/heads/$branch" 2>&1 | tee "$RUNNER_TEMP/hotplex-audit/publish.log"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/hotplex-audit/product-commit.txt"
+          git status --short
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hotplex-hardening-publish-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/hotplex-audit/publish.log
+            ${{ runner.temp }}/hotplex-audit/product-commit.txt
+          retention-days: 7

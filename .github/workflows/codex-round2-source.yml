@@ -1,0 +1,42 @@
+name: Codex round two source export
+on:
+  push:
+    branches: [codex/source-audit-bootstrap-20260912]
+    paths: [.github/workflows/codex-round2-source.yml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 1887b9b932be307120483a91cb2ce5f1e864ea97
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+      - uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.4
+          install-only: true
+      - name: Export source and offline test fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/round2-source"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/round2-source/source.tar.gz"
+          git cat-file commit HEAD > "$RUNNER_TEMP/round2-source/COMMIT_OBJECT"
+          git ls-files -s > "$RUNNER_TEMP/round2-source/FILES"
+          git rev-parse HEAD > "$RUNNER_TEMP/round2-source/COMMIT"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/round2-source/TREE"
+          tar -czf "$RUNNER_TEMP/round2-source/embed-fixtures.tar.gz" internal/webchat/out internal/docs/out docs/swagger/swagger.json
+          cp "$HOME/golangci-lint-2.11.4-linux-amd64/golangci-lint" "$RUNNER_TEMP/round2-source/golangci-lint"
+          cd "$RUNNER_TEMP/round2-source"
+          sha256sum source.tar.gz embed-fixtures.tar.gz golangci-lint > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hotplex-round2-source-1887b9b
+          path: ${{ runner.temp }}/round2-source/
+          retention-days: 7
