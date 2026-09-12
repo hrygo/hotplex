@@ -111,6 +111,8 @@ HotPlex separates the place where a user talks from the agent that performs the 
 
 ![HotPlex Architecture](docs/assets/architecture.svg)
 
+See the [worker and channel reliability audit](docs/architecture/worker-channel-reliability-audit-20260912.md) for lifecycle ownership, cancellation semantics, regression evidence, and explicit integration limits.
+
 ## 🔌 Integrations
 
 ### Meet users where they work

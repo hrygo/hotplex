@@ -280,6 +280,11 @@ func (e *pcEntry) writeLoop() {
 
 	var db strings.Builder
 	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	var timerCh <-chan time.Time
 	var pendingSID string // tracks SessionID for pending coalesced deltas
 	var runeCount int
@@ -318,7 +323,7 @@ func (e *pcEntry) writeLoop() {
 			}
 			env := write.env
 
-			if isDroppable(env.Event.Type) {
+			if isCoalesciblePlatformEvent(env.Event.Type) {
 				content := extractDeltaContent(env)
 				if db.Len() == 0 {
 					pendingSID = env.SessionID
@@ -340,6 +345,7 @@ func (e *pcEntry) writeLoop() {
 						}
 					}
 					timer.Reset(e.cfg.CoalesceIntvl)
+					timerCh = timer.C
 				}
 			} else {
 				flush(pendingSID)
@@ -354,7 +360,7 @@ func (e *pcEntry) writeLoop() {
 			for {
 				select {
 				case write := <-e.ch:
-					if isDroppable(write.env.Event.Type) {
+					if isCoalesciblePlatformEvent(write.env.Event.Type) {
 						if db.Len() == 0 {
 							pendingSID = write.env.SessionID
 						}
@@ -376,7 +382,7 @@ func (e *pcEntry) writeLoop() {
 					for {
 						select {
 						case write := <-e.ch:
-							if isDroppable(write.env.Event.Type) {
+							if isCoalesciblePlatformEvent(write.env.Event.Type) {
 								if db.Len() == 0 {
 									pendingSID = write.env.SessionID
 								}
@@ -425,6 +431,13 @@ func (e *pcEntry) writeOne(write platformWrite) {
 			"session_id", write.env.SessionID,
 			"err", err)
 	}
+}
+
+// Droppability is a congestion policy, not permission to rewrite an event.
+// Reasoning keeps its type and payload when admitted; only text-compatible
+// deltas use the legacy text coalescer.
+func isCoalesciblePlatformEvent(kind events.Kind) bool {
+	return kind == events.MessageDelta || kind == events.Raw
 }
 
 func isTerminalPlatformEvent(kind events.Kind) bool {

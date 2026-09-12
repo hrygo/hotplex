@@ -305,9 +305,11 @@ func (m *CodexAppServerManager) Call(ctx context.Context, method string, params 
 				method, resp.Error.Message, resp.Error.Code)
 		}
 		return resp.Result, nil
+	case <-ctx.Done():
+		return nil, &responseWaitError{cause: fmt.Errorf("codex-app-server: %s: %w", method, ctx.Err())}
 	case <-timer.C:
-		return nil, fmt.Errorf("codex-app-server: %s: timeout after %v",
-			method, callTimeout)
+		return nil, &responseWaitError{cause: fmt.Errorf("codex-app-server: %s: timeout after %v: %w",
+			method, callTimeout, context.DeadlineExceeded)}
 	}
 }
 

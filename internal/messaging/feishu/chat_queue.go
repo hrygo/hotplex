@@ -107,25 +107,38 @@ func (q *ChatQueue) runWorker(chatID string, w *chatWorker) {
 			}
 			idleTimer.Reset(chatIdleTimeout)
 
-			ctx, cancel := context.WithTimeout(context.Background(), chatTaskTimeout)
-			w.mu.Lock()
-			w.cancel = cancel
-			w.mu.Unlock()
-
-			if err := task(ctx); err != nil && q.log != nil {
-				if ctx.Err() != nil {
-					q.log.Warn("feishu: chat queue task timed out", "chat_id", chatID, "err", err)
-				} else {
-					q.log.Warn("feishu: chat queue task error", "chat_id", chatID, "err", err)
-				}
-			}
-			cancel()
+			q.runTask(chatID, w, task)
 
 		case <-idleTimer.C:
 			if q.tryRemoveIdleWorker(chatID, w) {
 				return
 			}
 			idleTimer.Reset(chatIdleTimeout)
+		}
+	}
+}
+
+// runTask contains failures to one accepted task. Recovering only in
+// runWorker would retire the worker and strand the rest of its accepted queue.
+func (q *ChatQueue) runTask(chatID string, w *chatWorker, task func(context.Context) error) {
+	ctx, cancel := context.WithTimeout(context.Background(), chatTaskTimeout)
+	w.mu.Lock()
+	w.cancel = cancel
+	w.mu.Unlock()
+	defer func() {
+		cancel()
+		w.mu.Lock()
+		w.cancel = nil
+		w.mu.Unlock()
+		if r := recover(); r != nil && q.log != nil {
+			q.log.Error("feishu: panic in chat queue task", "chat_id", chatID, "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	if err := task(ctx); err != nil && q.log != nil {
+		if ctx.Err() != nil {
+			q.log.Warn("feishu: chat queue task timed out", "chat_id", chatID, "err", err)
+		} else {
+			q.log.Warn("feishu: chat queue task error", "chat_id", chatID, "err", err)
 		}
 	}
 }

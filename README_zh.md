@@ -111,6 +111,8 @@ HotPlex 把“用户在哪里对话”和“哪个 Agent 执行任务”分离�
 
 ![HotPlex 架构](docs/assets/architecture.svg)
 
+[Worker 与消息渠道可靠性审计](docs/architecture/worker-channel-reliability-audit-20260912.md)记录了生命周期所有权、取消语义、回归证据和仍需联调的能力边界。
+
 ## 🔌 集成能力
 
 ### 在用户工作的入口提供 Agent

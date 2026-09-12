@@ -256,7 +256,7 @@ func (w *AppServerWorker) Start(ctx context.Context, session worker.SessionInfo)
 	w.crashSub = crashCh
 	w.mu.Unlock()
 
-	if err := w.startNewThread(session, "start"); err != nil {
+	if err := w.startNewThread(ctx, session, "start"); err != nil {
 		w.manager.Release()
 		return err
 	}
@@ -369,6 +369,14 @@ func (w *AppServerWorker) startTurn(ctx context.Context, input []TurnInputItem) 
 
 	resp, err := w.manager.Call(ctx, "turn/start", params)
 	if err != nil {
+		var responseErr *responseWaitError
+		if errors.As(err, &responseErr) {
+			return &worker.WorkerError{
+				Kind:    worker.ErrKindTimeout,
+				Message: fmt.Sprintf("codexcli: turn/start: %v", err),
+				Cause:   err,
+			}
+		}
 		// A stalled stdin write (singleton writeMu held by orphan goroutine)
 		// wedges ALL codex sessions. Classify as Unavailable so the gateway
 		// kills the app-server process and unblocks the goroutine (EPIPE).
@@ -465,7 +473,7 @@ func (w *AppServerWorker) resetLifecycleState() {
 
 // startNewThread starts a fresh thread on the manager and wires up worker
 // state. errPrefix is used in error messages for caller identification.
-func (w *AppServerWorker) startNewThread(session worker.SessionInfo, errPrefix string) error {
+func (w *AppServerWorker) startNewThread(ctx context.Context, session worker.SessionInfo, errPrefix string) error {
 	if w.manager != nil && !w.manager.IsRunning() {
 		w.mu.Lock()
 		w.closeAndMarkDone()
@@ -492,7 +500,7 @@ func (w *AppServerWorker) startNewThread(session worker.SessionInfo, errPrefix s
 		return fmt.Errorf("codexcli: %s: capture permission ceiling: %w", errPrefix, err)
 	}
 
-	resp, err := w.manager.Call(context.Background(), "thread/start", params)
+	resp, err := w.manager.Call(ctx, "thread/start", params)
 	if err != nil {
 		w.mu.Lock()
 		w.closeAndMarkDone()
@@ -628,7 +636,7 @@ func (w *AppServerWorker) Resume(ctx context.Context, session worker.SessionInfo
 
 	w.cleanupOldThread(ctx)
 	w.resetLifecycleState()
-	if err := w.startNewThread(session, "resume"); err != nil {
+	if err := w.startNewThread(ctx, session, "resume"); err != nil {
 		return err
 	}
 	w.mu.Lock()
@@ -786,7 +794,7 @@ func (w *AppServerWorker) ResetContext(ctx context.Context) (worker.ResetResult,
 		return worker.ResetResult{ConnReplaced: true}, nil
 	}
 	origSess.ConversationHistory = nil // /reset clears context, do not re-inject old history
-	if err := w.startNewThread(origSess, "reset"); err != nil {
+	if err := w.startNewThread(ctx, origSess, "reset"); err != nil {
 		return worker.ResetResult{}, err
 	}
 	return worker.ResetResult{ConnReplaced: true}, nil

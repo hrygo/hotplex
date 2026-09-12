@@ -1127,18 +1127,17 @@ func (w *Worker) forwardBusEvents(ctx context.Context, sessionID string, busCh c
 			}
 
 			if isDroppable(env.Event.Type) {
-				if !trySendEnvelope(recvCh, env, false, 0) {
+				if !ch.recvGate.TrySend(recvCh, env) {
 					w.Log.Warn("opencodeserver: recv channel full or closed, dropping droppable event",
 						"event_type", env.Event.Type, "event_id", env.ID)
 				}
 				continue
 			}
 
-			// Critical event: block with timeout to guarantee delivery.
-			// trySendEnvelope recovers from send-on-closed-channel panics
-			// (TOCTOU race: conn.Close can close recvCh between our closed
-			// check above and the actual send).
-			if !trySendEnvelope(recvCh, env, true, criticalEventSendTimeout) {
+			// Critical events retain their bounded send budget. EventGate wakes
+			// blocked sends before Close closes recvCh, eliminating the former
+			// send/close race rather than merely recovering its panic.
+			if !ch.recvGate.SendTimeout(recvCh, env, criticalEventSendTimeout) {
 				w.Log.Warn("opencodeserver: critical event send failed (channel closed or stuck)",
 					"event_type", env.Event.Type, "event_id", env.ID)
 				return
@@ -1375,6 +1374,7 @@ type conn struct {
 	client       *http.Client
 	sendClient   *http.Client // bounded client for prompt acceptance
 	recvCh       chan *events.Envelope
+	recvGate     base.EventGate
 	log          *slog.Logger
 	systemPrompt string
 	projectDir   string
@@ -1492,6 +1492,9 @@ func (c *conn) Send(ctx context.Context, msg *events.Envelope) error {
 	}
 
 	msgURL := fmt.Sprintf("%s/session/%s/prompt_async", c.httpAddr, url.PathEscape(sessionID))
+	if c.projectDir != "" {
+		msgURL += "?directory=" + url.QueryEscape(c.projectDir)
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", msgURL, strings.NewReader(string(payload)))
 	if err != nil {
 		return fmt.Errorf("opencodeserver: create request: %w", err)
@@ -1538,7 +1541,7 @@ func (c *conn) Close() error {
 
 	c.closeOnce.Do(func() {
 		c.closed = true
-		close(c.recvCh)
+		c.recvGate.Close(c.recvCh)
 	})
 
 	return nil
@@ -1562,7 +1565,10 @@ func (c *conn) getSessionID() string {
 }
 
 func (c *conn) Inject(env *events.Envelope) {
-	base.InjectWithTimeout(c.recvCh, env, c.log, c.getSessionID())
+	if !c.recvGate.SendTimeout(c.recvCh, env, 2*time.Second) && c.log != nil {
+		c.log.Warn("opencodeserver: inject failed, channel closed or full",
+			"session_id", c.getSessionID(), "event_type", env.Event.Type)
+	}
 }
 
 // isTimeoutError reports whether the error is a timeout (deadline exceeded or
