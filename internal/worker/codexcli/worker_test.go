@@ -713,20 +713,22 @@ func TestAppServerWorker_StopThenTerminatePreservesSiblingWrapper(t *testing.T) 
 	connA := &appConn{userID: "user-1", sessionID: "session-a", recvCh: recvA, manager: mgr}
 	connB := &appConn{userID: "user-1", sessionID: "session-b", recvCh: recvB, manager: mgr}
 	workerA := &AppServerWorker{
-		BaseWorker: base.NewBaseWorker(slog.Default(), nil),
-		manager:    mgr,
-		threadID:   "thread-a",
-		turnID:     "turn-a",
-		doneCh:     make(chan struct{}),
-		conn:       connA,
+		managerRefHeld: true, // fixture simulates a successful Acquire
+		BaseWorker:     base.NewBaseWorker(slog.Default(), nil),
+		manager:        mgr,
+		threadID:       "thread-a",
+		turnID:         "turn-a",
+		doneCh:         make(chan struct{}),
+		conn:           connA,
 	}
 	workerB := &AppServerWorker{
-		BaseWorker: base.NewBaseWorker(slog.Default(), nil),
-		manager:    mgr,
-		threadID:   "thread-b",
-		turnID:     "turn-b",
-		doneCh:     make(chan struct{}),
-		conn:       connB,
+		managerRefHeld: true, // fixture simulates a successful Acquire
+		BaseWorker:     base.NewBaseWorker(slog.Default(), nil),
+		manager:        mgr,
+		threadID:       "thread-b",
+		turnID:         "turn-b",
+		doneCh:         make(chan struct{}),
+		conn:           connB,
 	}
 
 	require.NoError(t, workerA.StopCurrentTurn(context.Background()))
