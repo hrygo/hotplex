@@ -492,6 +492,13 @@ func (m *CodexAppServerManager) handshake(ctx context.Context) error {
 // is especially important for Notify, which has no response-wait timeout
 // unlike Call.
 func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
+	if err := ctx.Err(); err != nil {
+		return &writeNotStartedError{cause: err}
+	}
+	// 0: queued; 1: encoder owns frame; 2: caller abandoned before encoding.
+	// CAS linearizes cancellation against starting I/O, including a helper that
+	// is still waiting for writeMu after WriteWithCtx has returned.
+	var writePhase atomic.Int32
 	_, callerHasDeadline := ctx.Deadline()
 	// The mutex MUST be acquired inside the closure, not at the call site:
 	// if ctx cancels and WriteWithCtx bails out, an orphaned goroutine
@@ -517,6 +524,12 @@ func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
 	err := base.WriteWithCtx(writeCtx, func() error {
 		m.writeMu.Lock()
 		defer m.writeMu.Unlock()
+		if err := writeCtx.Err(); err != nil {
+			return &writeNotStartedError{cause: err}
+		}
+		if !writePhase.CompareAndSwap(0, 1) {
+			return &writeNotStartedError{cause: writeCtx.Err()}
+		}
 		return json.NewEncoder(m.stdin).Encode(v)
 	}, fallbackGrace)
 	// An orphaned write (ctx cancelled while syscall.Write is blocked) leaves
@@ -525,6 +538,9 @@ func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
 	// session's writes until recovery. Log at warn so operators can correlate
 	// a multi-session stall with a stalled child process.
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if writePhase.CompareAndSwap(0, 2) {
+			return &writeNotStartedError{cause: err}
+		}
 		m.log.Warn("codex-app-server: stdin write cancelled, writeMu held by orphaned goroutine until child exits",
 			"err", err)
 	}
@@ -1078,7 +1094,12 @@ func (m *CodexAppServerManager) UpdateThreadSettings(threadID string, settings m
 // CompactThread starts context compaction for the specified thread, returning
 // the compaction result.
 func (m *CodexAppServerManager) CompactThread(threadID string) (json.RawMessage, error) {
-	resp, err := m.Call(context.Background(), "thread/compact/start", map[string]any{"threadId": threadID})
+	return m.CompactThreadContext(context.Background(), threadID)
+}
+
+// CompactThreadContext preserves the caller cancellation budget.
+func (m *CodexAppServerManager) CompactThreadContext(ctx context.Context, threadID string) (json.RawMessage, error) {
+	resp, err := m.Call(ctx, "thread/compact/start", map[string]any{"threadId": threadID})
 	if err != nil {
 		return nil, fmt.Errorf("codex-app-server: thread/compact/start: %w", err)
 	}
@@ -1089,10 +1110,15 @@ func (m *CodexAppServerManager) CompactThread(threadID string) (json.RawMessage,
 // Upstream ThreadRollbackParams (thread.rs:956) requires num_turns (>= 1),
 // not a target ID. numTurns < 1 is clamped to 1.
 func (m *CodexAppServerManager) RollbackThread(threadID string, numTurns uint32) (json.RawMessage, error) {
+	return m.RollbackThreadContext(context.Background(), threadID, numTurns)
+}
+
+// RollbackThreadContext preserves the caller cancellation budget.
+func (m *CodexAppServerManager) RollbackThreadContext(ctx context.Context, threadID string, numTurns uint32) (json.RawMessage, error) {
 	if numTurns < 1 {
 		numTurns = 1
 	}
-	resp, err := m.Call(context.Background(), "thread/rollback", map[string]any{
+	resp, err := m.Call(ctx, "thread/rollback", map[string]any{
 		"threadId": threadID,
 		"numTurns": numTurns,
 	})
@@ -1109,7 +1135,12 @@ func (m *CodexAppServerManager) RollbackThread(threadID string, numTurns uint32)
 // expectedTurnId (the currently-active turn; the request fails if it does not
 // match). The text is wrapped as a single UserInput text item.
 func (m *CodexAppServerManager) SteerTurn(threadID, expectedTurnID, text string) (json.RawMessage, error) {
-	resp, err := m.Call(context.Background(), "turn/steer", map[string]any{
+	return m.SteerTurnContext(context.Background(), threadID, expectedTurnID, text)
+}
+
+// SteerTurnContext preserves the caller cancellation budget.
+func (m *CodexAppServerManager) SteerTurnContext(ctx context.Context, threadID, expectedTurnID, text string) (json.RawMessage, error) {
+	resp, err := m.Call(ctx, "turn/steer", map[string]any{
 		"threadId":       threadID,
 		"expectedTurnId": expectedTurnID,
 		"input": []map[string]any{
@@ -1158,7 +1189,12 @@ func (m *CodexAppServerManager) AddEnvironment(environmentID, execServerURL stri
 // so the params field must be present — send an empty object, not nil,
 // or codex-app-server rejects the request with "missing field params".
 func (m *CodexAppServerManager) ListMCPServerStatus() (json.RawMessage, error) {
-	resp, err := m.Call(context.Background(), "mcpServerStatus/list", map[string]any{})
+	return m.ListMCPServerStatusContext(context.Background())
+}
+
+// ListMCPServerStatusContext preserves the caller cancellation budget.
+func (m *CodexAppServerManager) ListMCPServerStatusContext(ctx context.Context) (json.RawMessage, error) {
+	resp, err := m.Call(ctx, "mcpServerStatus/list", map[string]any{})
 	if err != nil {
 		return nil, fmt.Errorf("codex-app-server: mcpServerStatus/list: %w", err)
 	}
@@ -1200,7 +1236,12 @@ func (m *CodexAppServerManager) CallMCPTool(threadID, server, tool string, args 
 // RefreshMCPServer reloads the global MCP server registry.
 // Upstream McpServerRefresh (common.rs:874) takes no params (undefined/None).
 func (m *CodexAppServerManager) RefreshMCPServer() error {
-	err := m.Notify(context.Background(), "config/mcpServer/reload", nil)
+	return m.RefreshMCPServerContext(context.Background())
+}
+
+// RefreshMCPServerContext preserves the caller cancellation budget.
+func (m *CodexAppServerManager) RefreshMCPServerContext(ctx context.Context) error {
+	err := m.Notify(ctx, "config/mcpServer/reload", nil)
 	if err != nil {
 		return fmt.Errorf("codex-app-server: config/mcpServer/reload: %w", err)
 	}
@@ -1210,7 +1251,12 @@ func (m *CodexAppServerManager) RefreshMCPServer() error {
 // MCPServerOAuthLogin initiates an OAuth login flow for the named MCP server.
 // Upstream McpServerOauthLoginParams (mcp.rs:187) uses "name", not "serverName".
 func (m *CodexAppServerManager) MCPServerOAuthLogin(name string) (json.RawMessage, error) {
-	resp, err := m.Call(context.Background(), "mcpServer/oauth/login", map[string]any{"name": name})
+	return m.MCPServerOAuthLoginContext(context.Background(), name)
+}
+
+// MCPServerOAuthLoginContext preserves the caller cancellation budget.
+func (m *CodexAppServerManager) MCPServerOAuthLoginContext(ctx context.Context, name string) (json.RawMessage, error) {
+	resp, err := m.Call(ctx, "mcpServer/oauth/login", map[string]any{"name": name})
 	if err != nil {
 		return nil, fmt.Errorf("codex-app-server: mcpServer/oauth/login: %w", err)
 	}

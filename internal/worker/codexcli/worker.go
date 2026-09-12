@@ -369,6 +369,10 @@ func (w *AppServerWorker) startTurn(ctx context.Context, input []TurnInputItem) 
 
 	resp, err := w.manager.Call(ctx, "turn/start", params)
 	if err != nil {
+		var notStarted *writeNotStartedError
+		if errors.As(err, &notStarted) {
+			return fmt.Errorf("codexcli: turn/start: %w", err)
+		}
 		var responseErr *responseWaitError
 		if errors.As(err, &responseErr) {
 			return &worker.WorkerError{
@@ -693,7 +697,7 @@ func (w *AppServerWorker) InjectMidTurn(ctx context.Context, content string, met
 	if tid == "" || turnID == "" {
 		return fmt.Errorf("codexcli: no active turn to steer")
 	}
-	_, err := w.manager.SteerTurn(tid, turnID, content)
+	_, err := w.manager.SteerTurnContext(ctx, tid, turnID, content)
 	return err
 }
 
@@ -861,7 +865,7 @@ func (w *AppServerWorker) Compact(ctx context.Context, args map[string]any) erro
 	if tid == "" {
 		return fmt.Errorf("codexcli: no active thread")
 	}
-	_, err := w.manager.CompactThread(tid)
+	_, err := w.manager.CompactThreadContext(ctx, tid)
 	if err != nil {
 		return fmt.Errorf("codexcli: compact: %w", err)
 	}
@@ -901,7 +905,7 @@ func (w *AppServerWorker) Rewind(ctx context.Context, targetID string) error {
 			numTurns = uint32(n)
 		}
 	}
-	_, err := w.manager.RollbackThread(tid, numTurns)
+	_, err := w.manager.RollbackThreadContext(ctx, tid, numTurns)
 	if err != nil {
 		return fmt.Errorf("codexcli: rewind: %w", err)
 	}

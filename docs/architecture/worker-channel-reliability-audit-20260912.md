@@ -128,3 +128,31 @@ make test-contract-matrix
 ## 最终提交验证
 
 前一发布运行在全部 lint、重复回归和文档构建通过之后，因审计脚本误用了默认 hooks 路径及 shell heredoc 缩进而停止，未提交或推送代码。这不是产品测试失败。本次 [提交验证运行](https://github.com/hrygo/hotplex/actions/runs/34683744139) 使用 `make hooks` 配置的 `scripts/git-hooks`，由正常 `git commit` / `git push` 调用钩子；保留全部检查，未使用 `--no-verify`。
+
+
+## 第二轮增量：取消传播与尚未开始的写入（Issue #987）
+
+第二轮发现先保存在 [Issue #987](https://github.com/hrygo/hotplex/issues/987)，继续通过 PR #986 交付。该 Issue 创建时 A01–A08 均标注 Source，本节只更新本次实际验证的 A02 / A07，不关闭整张跟踪 Issue。
+
+### 实现与边界
+
+- **A02**：编码前取消返回独立的 `writeNotStartedError`；排队写入与开始编码用原子状态转换分界。等待写锁期间调用方放弃后，延迟执行的闭包不得再编码该请求。此类错误不再误分类为共享进程 unavailable，也不误报为已有孤儿管道写入。已经进入编码/管道写入后的取消仍保留原恢复分类与未知结果边界。
+- **A07**：steer、compact、rewind、ServerCommander compact、MCP status / refresh / OAuth 贯穿调用方 context。manager 的六个原有无 context helper 保留兼容包装，Worker 和 ServerCommander 使用 Context 版本。正常 JSON-RPC method / params 不变。
+- **验证**：`TestAudit987*` 校验七个入口的已取消零写入、六个请求的等待响应取消、七个正常协议载荷，以及 turn/start 取消阶段。已有单例真正阻塞写入的恢复分类单独防回归。
+- **未外推**：这不是 A03 的完整 stdin/进程代际隔离，也不解决 A01、A04、A05、A06、A08；不改变公共 Worker / AEP 接口，不增加自动重放，不使用真实平台或模型凭据。
+
+### 本地证据
+
+完整恢复并校验 PR 基准 `1887b9b932be307120483a91cb2ce5f1e864ea97` 的 1,924 个受版本控制文件，Git tree 为 `dbe3d454b74f1dfb15dfc45b193b7c1aeb5260d3`。工具链为导出的离线 Go 1.26.8 / Linux amd64。RTK 不可用，使用原生 `make hooks`，未经 RTK 过滤或统计。
+
+| 范围 | 通过 | 失败 | 跳过 |
+| --- | ---: | ---: | ---: |
+| 原实现 + 最终新增测试 | 9 | 19 | 0 |
+| 修复后新增测试，5 轮 race / shuffle | 140 | 0 | 0 |
+| Codex CLI 与 Base 相关短测，race / shuffle | 335 | 0 | 4 |
+
+以上为 go test -json 终态记录，含父子测试和重复轮次，不是独立缺陷数量。初版测试封装中的虚拟时间/互斥锁等待问题已修正，表中只统计修正后的实际用例结果，不能用测试超时或编译失败冒充缺陷复现。后续隔离 Actions 会再次验证本补丁、运行契约矩阵及仓库原始提交/推送门禁；实际运行链接与状态写回 Issue #987 和 PR #986。
+
+### 本批隔离运行验证
+
+[Issue #987 A02/A07 验证运行](https://github.com/hrygo/hotplex/actions/runs/34687204751) 校验了本地补丁 SHA-256，再执行原实现失败、修复后 5 轮 race 回归以及现有 12 组合 / 96 场景契约矩阵。 原实现：9 通过、19 失败、0 跳过。 修复后重复回归：140 通过、0 失败、0 跳过。 相关短测：335 通过、0 失败、4 跳过。 最终提交与推送使用仓库原始 hooks；是否完成发布以该运行最终状态及 PR 提交记录为准。

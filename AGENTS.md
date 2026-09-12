@@ -108,6 +108,8 @@ configs/   - 配置文件
 
 ### 可靠性变更检查清单
 
+- **发现先落 Issue**：新增审计发现先登记 Issue（含基准提交、触发路径、证据等级与验收条件），再补失败回归和修复；区分 Source / Test / Live，修复提交和验证结果回填 Issue，增量交付到当前实施 PR，不能让发现仅保留在会话或临时环境中。
+
 - **输入生命周期**：覆盖重复 ID、payload 冲突、active gate、Worker 投递失败、lease 过期与晚到 `done` 收敛；不能把 `unknown` 当作可安全重投。
 - **会话删除**：验证本地状态变更与 cleanup task 原子入队；远端清理失败只能重试，不能复活或阻塞已删除会话。
 - **事件顺序**：所有转发路径使用 per-session Seq；替换 Worker Conn 或 `/reset` 时旧 forwarder 不得处理新连接事件或触发 crash recovery。
