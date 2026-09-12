@@ -1,0 +1,70 @@
+name: Audit 987 consolidate all fixes in PR 986
+on:
+  push:
+    branches: [chore/987-documented-audit-20260912]
+    paths: [.github/workflows/audit-987-consolidate.yml]
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: audit-987-consolidate-pr986
+  cancel-in-progress: false
+jobs:
+  verify-consolidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Preserve the consolidation script outside the product tree
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr986-consolidated"
+          cp scripts/audit/consolidate-pr986.py "$RUNNER_TEMP/consolidate-pr986.py"
+      - uses: actions/download-artifact@v4
+        with:
+          name: audit-987-runtime-series-2
+          run-id: 34693369860
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/pr986-consolidated/original-series/
+      - uses: actions/checkout@v6
+        with:
+          ref: 34f937028c3796eef35e87575618b134d39051cb
+          fetch-depth: 32
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+      - uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.4
+          install-only: true
+      - name: Install original repository hooks and verify provenance
+        run: |
+          set -euo pipefail
+          echo "$HOME/golangci-lint-2.11.4-linux-amd64" >> "$GITHUB_PATH"
+          test -x "$HOME/golangci-lint-2.11.4-linux-amd64/golangci-lint"
+          if command -v rtk >/dev/null 2>&1; then rtk proxy make hooks; else echo 'RTK unavailable; using original make hooks without RTK filtering'; make hooks; fi
+          test "$(git config --get core.hooksPath)" = 'scripts/git-hooks'
+          test ! -e .github/workflows/audit-987-consolidate.yml
+          git rev-parse HEAD > "$RUNNER_TEMP/pr986-consolidated/VERIFIED_CODE_COMMIT"
+      - name: Repeat all ten regressions, validate related contracts, and update PR branch
+        env:
+          GORACE: history_size=5
+        run: python "$RUNNER_TEMP/consolidate-pr986.py"
+      - name: Preserve every result on success or failure
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr986-consolidated"
+          git log -14 --oneline > "$RUNNER_TEMP/pr986-consolidated/commits.txt"
+          git diff --stat fb53e8be5ee8171ccb11e6eefe9fc6625abb98e3 > "$RUNNER_TEMP/pr986-consolidated/diff-stat.txt" || true
+          for file in consolidated-commit.log consolidated-push.log consolidated-contract.log consolidated-lint.log; do
+            echo "### $file"
+            tail -80 "$RUNNER_TEMP/pr986-consolidated/$file" 2>/dev/null || true
+          done
+          cat "$RUNNER_TEMP/pr986-consolidated/PUBLISHED_HEAD" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit-987-consolidated-${{ github.run_number }}
+          path: ${{ runner.temp }}/pr986-consolidated/
+          retention-days: 90

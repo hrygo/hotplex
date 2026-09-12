@@ -1,0 +1,88 @@
+name: Audit 987 issue documents
+on:
+  push:
+    branches: [chore/987-documented-audit-20260912]
+    paths: [.github/workflows/audit-987-issue-docs.yml]
+permissions:
+  contents: write
+concurrency:
+  group: audit-987-issue-docs
+  cancel-in-progress: false
+jobs:
+  document:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Preserve issue records
+        run: |
+          cp scripts/audit/runtime-issues.json "$RUNNER_TEMP/issues.json"
+          mkdir -p "$RUNNER_TEMP/evidence"
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/985-worker-channel-hardening
+          fetch-depth: 1
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+      - uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.4
+          install-only: true
+      - name: Generate independent source issue documents before any implementation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 68b9f7f0cd11e2dbf603971c4a987fa2de682fb0
+          echo "$HOME/golangci-lint-2.11.4-linux-amd64" >> "$GITHUB_PATH"
+          make hooks
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data=json.loads((Path(os.environ['RUNNER_TEMP'])/'issues.json').read_text())
+          out=Path('docs/issues/2026-09-runtime-audit')
+          out.mkdir(parents=True,exist_ok=True)
+          index=['---','title: "Worker 与消息渠道独立缺陷台账"','weight: 66','description: "十份独立Issue文档与对应修复证据。"','---','','# 十项独立缺陷台账','',data['delivery'],'','| ID | 问题 | 状态 |','| --- | --- | --- |']
+          for item in data['issues']:
+              name=item['id']+'-'+item['slug']+'.md'
+              text=['---','title: "'+item['id']+'：'+item['title']+'"','weight: '+str(int(item['id'][1:])),'description: "根因、触发路径、修复与验收证据。"','---','','# '+item['id']+' — '+item['title'],'','- 优先级：'+item['priority'],'- 基准：`'+data['baseline']+'`','- 来源：Issue #987 / '+item['prior'],'- 状态：已登记，待修复','- 证据：Source；本批运行证据尚未生成','- 实施PR：待创建','- 位置：'+', '.join('`'+p+'`' for p in item['files']),'','## 根因与影响','',item['root_cause'],'','## 复现路径','',item['reproduction'],'','## 验收条件','',item['acceptance'],'','## 证据记录','','失败回归、通过回归、相关测试、提交与PR按实际结果回填。源码推断不等于Test，fake不等于Live；禁止用编译失败冒充复现，不合并main。']
+              if item.get('upstream'): text+=['','## 上游参考','',item['upstream']+'（2026-09-12核验；运行实例版本需单独记录。）']
+              (out/name).write_text('\n'.join(text)+'\n')
+              index+=['| '+item['id']+' | ['+item['title']+']('+name+') | Source，已登记 |']
+          index+=['','本台账文档先于实现提交。每个修复PR仅处理一个独立根因；有依赖时明确base，不重复计算PR #986已修复的问题。RTK不可用，使用原生make hooks。']
+          (out/'README.md').write_text('\n'.join(index)+'\n')
+          assert len(list(out.glob('D*.md')))==10
+          agents=Path('AGENTS.md')
+          agents.write_text(agents.read_text()+'\n### 本批独立Issue文档\n\n用户授权先以 `docs/issues/2026-09-runtime-audit/D*.md` 保存Issue，再修复；该目录是本批发现真相源。每份记录基准、Source/Test/Live、复现、验收、修复提交和PR。此批目标10个独立修复PR，保留既有PR #986作为基线，不将原已完成问题重复计数。\n')
+          for file in ('README.md','README_zh.md'):
+              p=Path(file)
+              p.write_text(p.read_text()+'\n[Worker / 消息渠道独立缺陷台账](docs/issues/2026-09-runtime-audit/README.md)\n')
+          PY
+          git diff --check
+          go run ./cmd/build-docs > "$RUNNER_TEMP/evidence/docs-build.log" 2>&1
+      - name: Commit documents and push through the original hooks
+        run: |
+          set -euo pipefail
+          git config user.name 'HotPlex Audit'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add AGENTS.md README.md README_zh.md docs/issues
+          git commit -m 'docs(audit): record ten independent runtime issues before fixes' -m 'Refs #987. Independent source issue documents precede implementation.' > "$RUNNER_TEMP/evidence/commit.log" 2>&1
+          git push origin HEAD:refs/heads/fix/985-worker-channel-hardening > "$RUNNER_TEMP/evidence/push.log" 2>&1
+          git rev-parse HEAD > "$RUNNER_TEMP/evidence/COMMIT"
+          git cat-file commit HEAD > "$RUNNER_TEMP/evidence/COMMIT_OBJECT"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/evidence/TREE"
+          git diff --binary 68b9f7f0 > "$RUNNER_TEMP/evidence/docs.patch"
+          cat "$RUNNER_TEMP/evidence/COMMIT"
+      - name: Preserve evidence
+        if: always()
+        run: |
+          git diff --binary 68b9f7f0 > "$RUNNER_TEMP/evidence/docs.patch"
+          tail -50 "$RUNNER_TEMP/evidence/commit.log" 2>/dev/null || true
+          tail -50 "$RUNNER_TEMP/evidence/push.log" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit-987-issue-documents
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 7
