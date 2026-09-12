@@ -68,14 +68,16 @@ type CodexAppServerManager struct {
 	log *slog.Logger
 	cfg config.CodexCLIConfig
 
-	mu            sync.Mutex
-	proc          *proc.Manager
-	stdin         io.WriteCloser
-	stdout        io.Reader
-	refs          int
-	state         managerState
-	crashCh       chan struct{} // closed when process exits unexpectedly
-	crashExitCode int           // OS exit code set before crashCh is closed
+	mu               sync.Mutex
+	proc             *proc.Manager
+	stdin            io.WriteCloser
+	transportMu      sync.RWMutex
+	transportVersion uint64
+	stdout           io.Reader
+	refs             int
+	state            managerState
+	crashCh          chan struct{} // closed when process exits unexpectedly
+	crashExitCode    int           // OS exit code set before crashCh is closed
 
 	// pending maps JSON-RPC request IDs to response channels.
 	pending sync.Map // map[int64]chan *JSONRPCResponse
@@ -426,7 +428,7 @@ func (m *CodexAppServerManager) startProcessLocked(ctx context.Context) error {
 		return fmt.Errorf("codex-app-server: start process: %w", err)
 	}
 
-	m.stdin = stdin
+	m.setStdin(stdin)
 	m.stdout = stdout
 	m.pgid = m.proc.PGID()
 
@@ -440,7 +442,7 @@ func (m *CodexAppServerManager) startProcessLocked(ctx context.Context) error {
 		_ = m.proc.Kill()
 		m.proc = nil
 		m.pgid = 0
-		m.stdin = nil
+		m.setStdin(nil)
 		m.stdout = nil
 		m.state = stateIdle
 		return fmt.Errorf("codex-app-server: handshake: %w", err)
@@ -503,6 +505,10 @@ func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
 	// CAS linearizes cancellation against starting I/O, including a helper that
 	// is still waiting for writeMu after WriteWithCtx has returned.
 	var writePhase atomic.Int32
+	writer, version := m.snapshotStdin()
+	if writer == nil {
+		return io.ErrClosedPipe
+	}
 	_, callerHasDeadline := ctx.Deadline()
 	// The mutex MUST be acquired inside the closure, not at the call site:
 	// if ctx cancels and WriteWithCtx bails out, an orphaned goroutine
@@ -534,7 +540,15 @@ func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
 		if !writePhase.CompareAndSwap(0, 1) {
 			return &writeNotStartedError{cause: writeCtx.Err()}
 		}
-		return json.NewEncoder(m.stdin).Encode(v)
+		m.transportMu.RLock()
+		current := m.transportVersion == version
+		m.transportMu.RUnlock()
+		if !current {
+			return io.ErrClosedPipe
+		}
+		// The snapshot remains bound to the original process even if shutdown
+		// occurs after this check. Never resolve stdin again after waiting.
+		return json.NewEncoder(writer).Encode(v)
 	}, fallbackGrace)
 	// An orphaned write (ctx cancelled while syscall.Write is blocked) leaves
 	// the goroutine holding writeMu until the child exits. Because the manager
@@ -1389,7 +1403,7 @@ func (m *CodexAppServerManager) monitorProcess() {
 	}
 	m.proc = nil
 	m.pgid = 0
-	m.stdin = nil
+	m.setStdin(nil)
 	m.stdout = nil
 
 	if m.idleTimer != nil {
