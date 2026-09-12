@@ -11,7 +11,7 @@ description: "根因、触发路径、修复与验收证据。"
 - 来源：Issue #987 / A01
 - 状态：修复已通过定向与相关测试，未合并
 - 证据：Test；源码分析与运行复现已相互印证，非Live
-- 实施PR：对应分支 `fix/987-d01-codex-subscription-ownership`；目标分支 `fix/985-worker-channel-hardening`（堆叠依赖）
+- 实施PR：[统一 PR #986](https://github.com/hrygo/hotplex/pull/986)；关联 Issue #987
 - 位置：`internal/worker/codexcli/manager.go`, `internal/worker/codexcli/worker.go`
 
 ## 根因与影响
@@ -48,3 +48,10 @@ manager.Shutdown/monitorProcess和appConn.Close都直接关闭同一recvCh，app
 - `TestIntegrationStartSavesSessionAndResetRestarts`
 - `TestManager_PerThreadConverterIsolation/concurrent_dispatch_no_data_race`
 - `TestIntegrationKillImmediatelyTerminatesIdleProcess`
+
+## 统一交付复核
+
+修复提交：`3da1511e7428ec277be5aafe830f946bf8d893c3`。十项连续提交的完整代码树：`34f937028c3796eef35e87575618b134d39051cb`。
+
+[统一验证运行](https://github.com/hrygo/hotplex/actions/runs/34694026803) 再次执行所有 D01–D10 定向测试（5 轮 race/shuffle）、相关模块、96 场景契约矩阵及 Go SDK。
+结果与实际跳过名单见同目录 `verification-20260912.json`；原始日志保存在运行 artifact。提交/推送结果以该运行最终状态与 PR HEAD 为准。未合并 main，未连接真实平台或收费模型。
