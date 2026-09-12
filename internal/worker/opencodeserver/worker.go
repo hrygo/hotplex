@@ -674,7 +674,12 @@ func (w *Worker) ResetContext(ctx context.Context) (worker.ResetResult, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+	// A missing endpoint is not evidence that native history was cleared.
+	// Preserve local generation and connection state on unsupported reset.
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return worker.ResetResult{}, fmt.Errorf("opencodeserver: reset unsupported (status %d): %w", resp.StatusCode, worker.ErrNotImplemented)
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		return worker.ResetResult{}, fmt.Errorf("opencodeserver: reset: status %d: %s", resp.StatusCode, string(body))
 	}
