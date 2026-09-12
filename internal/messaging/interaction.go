@@ -144,7 +144,7 @@ type PendingInteraction struct {
 	// worker accepted it. Interactive card actions use it to avoid presenting a
 	// successful state before the worker can continue.
 	SendResponseSync func(context.Context, map[string]any) error
-	// cancelCh is closed by CancelAll to abort the watchTimeout goroutine.
+	// cancelCh identifies one registration and is closed on completion or cancellation.
 	cancelCh  chan struct{}
 	resolving bool
 }
@@ -178,11 +178,14 @@ func (m *InteractionManager) Register(pi *PendingInteraction) {
 	}
 
 	pi.cancelCh = make(chan struct{})
+	pi.resolving = false
+	cancelCh, timeout := pi.cancelCh, pi.Timeout
 	m.pending[pi.ID] = pi
 	m.mu.Unlock()
 
-	// Start timeout goroutine
-	go m.watchTimeout(pi)
+	// Capture the registration signal before another caller can complete and
+	// re-register the same object. A watcher never follows a replacement.
+	go m.watchRegistrationTimeout(pi, cancelCh, timeout)
 }
 
 // Get retrieves a pending interaction by its request ID.
@@ -202,7 +205,9 @@ func (m *InteractionManager) Complete(requestID string) (*PendingInteraction, bo
 	pi, ok := m.pending[requestID]
 	if ok {
 		delete(m.pending, requestID)
-		close(pi.cancelCh)
+		if pi.cancelCh != nil {
+			close(pi.cancelCh)
+		}
 	}
 	return pi, ok
 }
@@ -234,7 +239,9 @@ func (m *InteractionManager) CompleteClaimed(requestID string) (*PendingInteract
 		return nil, false
 	}
 	delete(m.pending, requestID)
-	close(pi.cancelCh)
+	if pi.cancelCh != nil {
+		close(pi.cancelCh)
+	}
 	return pi, true
 }
 
@@ -298,13 +305,13 @@ func (m *InteractionManager) GetBySession(sessionID string) []*PendingInteractio
 }
 
 // watchTimeout waits for the interaction timeout and auto-denies.
-func (m *InteractionManager) watchTimeout(pi *PendingInteraction) {
-	timer := time.NewTimer(pi.Timeout)
+func (m *InteractionManager) watchRegistrationTimeout(pi *PendingInteraction, cancelCh chan struct{}, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
-	case <-pi.cancelCh:
-		// Cancelled by CancelAll — interaction already removed from map.
+	case <-cancelCh:
+		// This exact registration was completed or cancelled.
 		return
 	case <-timer.C:
 	}
@@ -312,39 +319,30 @@ func (m *InteractionManager) watchTimeout(pi *PendingInteraction) {
 	// Claim before auto-denying. A card click may already be submitting the
 	// response; in that case it owns the resolution and the timeout must not
 	// race it with a stale denial.
-	m.mu.Lock()
-	claimed, ok := m.pending[pi.ID]
-	if !ok || claimed != pi || claimed.resolving {
-		m.mu.Unlock()
+	claimed, ok := m.completeTimedOutRegistration(pi, cancelCh)
+	if !ok {
 		return
 	}
-	// The timer owns this exact registration, not every future reuse of ID.
-	// Claim and remove atomically so CancelAll/re-register cannot replace it
-	// between two ID-only operations.
-	claimed.resolving = true
-	delete(m.pending, pi.ID)
-	close(pi.cancelCh)
-	m.mu.Unlock()
 
 	m.log.Info("interaction: timeout, auto-denying",
-		"request_id", pi.ID,
-		"type", pi.Type,
-		"session_id", pi.SessionID)
+		"request_id", claimed.ID,
+		"type", claimed.Type,
+		"session_id", claimed.SessionID)
 
 	// Recover from panics in SendResponse — platform connection may be closed.
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				m.log.Error("interaction: panic in SendResponse during timeout",
-					"request_id", pi.ID,
-					"type", pi.Type,
-					"session_id", pi.SessionID,
+					"request_id", claimed.ID,
+					"type", claimed.Type,
+					"session_id", claimed.SessionID,
 					"panic", r)
 			}
 		}()
 
 		// Send auto-deny/reject response based on type
-		switch pi.Type {
+		switch claimed.Type {
 		case events.PermissionRequest:
 			claimed.SendResponse(BuildPermissionResponse(claimed.ID, false, "interaction timed out"))
 		case events.QuestionRequest:
@@ -353,6 +351,27 @@ func (m *InteractionManager) watchTimeout(pi *PendingInteraction) {
 			claimed.SendResponse(BuildElicitationResponse(claimed.ID, "cancel"))
 		}
 	}()
+}
+
+// completeTimedOutRegistration performs identity comparison, claim and removal
+// in one critical section. A timer already firing during Complete/CancelAll
+// cannot claim a newer request that happens to reuse the worker request ID.
+func (m *InteractionManager) completeTimedOutRegistration(pi *PendingInteraction, cancelCh chan struct{}) (*PendingInteraction, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.pending[pi.ID]
+	if !ok || current != pi || current.cancelCh != cancelCh || current.resolving {
+		return nil, false
+	}
+	current.resolving = true
+	delete(m.pending, pi.ID)
+	if cancelCh != nil {
+		close(cancelCh)
+	}
+	// The response runs outside the lock. Copy the registration fields so a
+	// later registration of the same input object cannot change its kind.
+	snapshot := *current
+	return &snapshot, true
 }
 
 // CancelAll removes all pending interactions for a given session.
