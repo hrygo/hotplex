@@ -74,6 +74,7 @@ type CodexAppServerManager struct {
 	stdin            io.WriteCloser
 	transportMu      sync.RWMutex
 	transportVersion uint64
+	transportDone    chan struct{}
 	stdout           io.Reader
 	refs             int
 	state            managerState
@@ -294,7 +295,8 @@ func (m *CodexAppServerManager) Call(ctx context.Context, method string, params 
 	m.pending.Store(id, respCh)
 	defer m.pending.Delete(id)
 
-	if err := m.writeRequest(ctx, &req); err != nil {
+	transport := m.snapshotTransport()
+	if err := m.writeFrameOn(ctx, &req, transport); err != nil {
 		return nil, fmt.Errorf("codex-app-server: write request: %w", err)
 	}
 
@@ -307,11 +309,16 @@ func (m *CodexAppServerManager) Call(ctx context.Context, method string, params 
 
 	select {
 	case resp := <-respCh:
-		if resp.Error != nil {
-			return nil, fmt.Errorf("codex-app-server: %s: %s (code %d)",
-				method, resp.Error.Message, resp.Error.Code)
+		return decodeCallResponse(method, resp)
+	case <-transport.done:
+		// EOF may follow a valid buffered response. Prefer that accepted reply
+		// rather than turning an acknowledged result into an unknown outcome.
+		select {
+		case resp := <-respCh:
+			return decodeCallResponse(method, resp)
+		default:
+			return nil, fmt.Errorf("codex-app-server: %s: transport closed before response: %w", method, io.ErrClosedPipe)
 		}
-		return resp.Result, nil
 	case <-ctx.Done():
 		return nil, &responseWaitError{cause: fmt.Errorf("codex-app-server: %s: %w", method, ctx.Err())}
 	case <-timer.C:
@@ -344,6 +351,7 @@ func (m *CodexAppServerManager) Shutdown(ctx context.Context) {
 	defer m.mu.Unlock()
 
 	m.state = stateStopped
+	m.setStdin(nil) // wakes calls even when no native process/reader remains
 
 	if m.idleTimer != nil {
 		m.idleTimer.Stop()
@@ -435,7 +443,7 @@ func (m *CodexAppServerManager) startProcessLocked(ctx context.Context) error {
 
 	bgCtx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
-	go m.readNotifications(bgCtx, stdout)
+	go m.readBoundNotifications(bgCtx, stdout, m.snapshotTransport())
 	go m.monitorBoundProcess(m.proc)
 
 	if err := m.handshake(ctx); err != nil {
@@ -499,6 +507,10 @@ func (m *CodexAppServerManager) handshake(ctx context.Context) error {
 // is especially important for Notify, which has no response-wait timeout
 // unlike Call.
 func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
+	return m.writeFrameOn(ctx, v, m.snapshotTransport())
+}
+
+func (m *CodexAppServerManager) writeFrameOn(ctx context.Context, v any, transport codexTransport) error {
 	if err := ctx.Err(); err != nil {
 		return &writeNotStartedError{cause: err}
 	}
@@ -506,7 +518,7 @@ func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
 	// CAS linearizes cancellation against starting I/O, including a helper that
 	// is still waiting for writeMu after WriteWithCtx has returned.
 	var writePhase atomic.Int32
-	writer, version := m.snapshotStdin()
+	writer, version := transport.writer, transport.version
 	if writer == nil {
 		return io.ErrClosedPipe
 	}
@@ -544,6 +556,11 @@ func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
 		m.transportMu.RLock()
 		current := m.transportVersion == version
 		m.transportMu.RUnlock()
+		select {
+		case <-transport.done:
+			return io.ErrClosedPipe
+		default:
+		}
 		if !current {
 			return io.ErrClosedPipe
 		}
@@ -566,11 +583,6 @@ func (m *CodexAppServerManager) writeFrame(ctx context.Context, v any) error {
 	return err
 }
 
-// writeRequest marshals and writes a JSON-RPC request to stdin.
-func (m *CodexAppServerManager) writeRequest(ctx context.Context, req *JSONRPCRequest) error {
-	return m.writeFrame(ctx, req)
-}
-
 // writeNotification marshals and writes a JSON-RPC notification to stdin.
 func (m *CodexAppServerManager) writeNotification(ctx context.Context, notif *JSONRPCNotification) error {
 	return m.writeFrame(ctx, notif)
@@ -580,6 +592,11 @@ func (m *CodexAppServerManager) writeNotification(ctx context.Context, notif *JS
 // pending response channels or subscriber notification channels.
 // reader is passed in to avoid acquiring m.mu at startup (caller holds it).
 func (m *CodexAppServerManager) readNotifications(ctx context.Context, reader io.Reader) {
+	m.readBoundNotifications(ctx, reader, m.snapshotTransport())
+}
+
+func (m *CodexAppServerManager) readBoundNotifications(ctx context.Context, reader io.Reader, transport codexTransport) {
+	defer m.closeTransport(transport)
 	defer func() {
 		if r := recover(); r != nil {
 			m.log.Error("codex-app-server: readNotifications panic",
