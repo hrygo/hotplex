@@ -10,7 +10,7 @@ description: "十份独立Issue文档与对应修复证据。"
 
 | ID | 问题 | 状态 |
 | --- | --- | --- |
-| D01 | [Codex订阅通道多方关闭与发送竞态](D01-codex-subscription-ownership.md) | Source，已登记 |
+| D01 | [Codex订阅通道多方关闭与发送竞态](D01-codex-subscription-ownership.md) | Test，修复通过；`fix/987-d01-codex-subscription-ownership` |
 | D02 | [Codex重置建线程失败泄漏共享进程引用](D02-codex-reference-release.md) | Source，已登记 |
 | D03 | [Codex排队写入未绑定进程传输快照](D03-codex-transport-generation.md) | Source，已登记 |
 | D04 | [Codex旧进程清理和空闲回收与新Acquire交错](D04-codex-process-retirement.md) | Source，已登记 |

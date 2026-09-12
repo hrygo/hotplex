@@ -140,6 +140,7 @@ type appConn struct {
 	userID     string
 	sessionID  string
 	recvCh     chan *events.Envelope
+	recvGate   *base.EventGate
 	mu         sync.Mutex
 	closed     bool
 	manager    *CodexAppServerManager
@@ -188,22 +189,24 @@ func (c *appConn) setTextReplay(content string) {
 	c.mu.Unlock()
 }
 func (c *appConn) Recv() <-chan *events.Envelope { return c.recvCh }
-func (c *appConn) TrySend(env *events.Envelope) bool {
-	select {
-	case c.recvCh <- env:
-		return true
-	default:
-		return false
+func (c *appConn) eventGate() *base.EventGate {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Standalone connections own their channel. Managed connections are
+	// constructed with their subscription's gate before being published.
+	if c.recvGate == nil {
+		c.recvGate = &base.EventGate{}
 	}
+	return c.recvGate
+}
+func (c *appConn) TrySend(env *events.Envelope) bool {
+	return c.eventGate().TrySend(c.recvCh, env)
 }
 func (c *appConn) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil
-	}
 	c.closed = true
-	close(c.recvCh)
+	c.mu.Unlock()
+	c.eventGate().Close(c.recvCh)
 	return nil
 }
 func (c *appConn) UserID() string    { return c.userID }
@@ -526,13 +529,15 @@ func (w *AppServerWorker) startNewThread(ctx context.Context, session worker.Ses
 	w.sessionID = session.SessionID
 	w.userID = session.UserID
 	w.origSession = session
-	w.recvCh = w.manager.Subscribe(result.Thread.ID, session.SessionID)
+	sub := w.manager.subscribe(result.Thread.ID, session.SessionID)
+	w.recvCh = sub.ch
 	w.commands = NewServerCommander(w.manager, result.Thread.ID)
 	w.manager.SetCurrentModel(result.Thread.ID, cfg.Model)
 	w.conn = &appConn{
 		userID:    session.UserID,
 		sessionID: session.SessionID,
 		recvCh:    w.recvCh,
+		recvGate:  &sub.gate,
 		manager:   w.manager,
 	}
 	w.StartTime = time.Now()

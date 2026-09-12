@@ -98,7 +98,7 @@ type CodexAppServerManager struct {
 
 	// subMu protects subscribers for thread event routing.
 	subMu       sync.Mutex
-	subscribers map[string]chan *events.Envelope
+	subscribers map[string]*codexSubscription
 	subSessions map[string]string // threadID → sessionID mapping for envelope population
 	subsClosed  atomic.Bool       // set when subscribers have been closed (prevents double-close)
 
@@ -123,7 +123,7 @@ func NewCodexAppServerManager(log *slog.Logger, cfg config.CodexCLIConfig) *Code
 		log:         log.With("component", "codex-app-server"),
 		cfg:         cfg,
 		crashCh:     make(chan struct{}),
-		subscribers: make(map[string]chan *events.Envelope),
+		subscribers: make(map[string]*codexSubscription),
 		subSessions: make(map[string]string),
 		converters:  make(map[string]*Mapper),
 	}
@@ -234,6 +234,10 @@ func (m *CodexAppServerManager) Release() {
 
 // Subscribe returns a channel that receives AEP events for the given thread ID.
 func (m *CodexAppServerManager) Subscribe(threadID, sessionID string) chan *events.Envelope {
+	return m.subscribe(threadID, sessionID).ch
+}
+
+func (m *CodexAppServerManager) subscribe(threadID, sessionID string) *codexSubscription {
 	m.subMu.Lock()
 	defer m.subMu.Unlock()
 
@@ -241,7 +245,7 @@ func (m *CodexAppServerManager) Subscribe(threadID, sessionID string) chan *even
 		return ch
 	}
 
-	ch := make(chan *events.Envelope, 256)
+	ch := &codexSubscription{ch: make(chan *events.Envelope, 256)}
 	m.subscribers[threadID] = ch
 	m.subSessions[threadID] = sessionID
 	m.log.Debug("codex-app-server: subscribed", "thread_id", threadID, "session_id", sessionID)
@@ -371,7 +375,7 @@ func (m *CodexAppServerManager) Shutdown(ctx context.Context) {
 		m.subsClosed.Store(true)
 		m.subMu.Lock()
 		for id, ch := range m.subscribers {
-			close(ch)
+			ch.close()
 			delete(m.subscribers, id)
 		}
 		m.subSessions = make(map[string]string)
@@ -1354,28 +1358,13 @@ func (m *CodexAppServerManager) dispatchNotification(notif *JSONRPCNotification)
 
 // sendEnvelope delivers a single envelope to a subscriber channel with backpressure.
 // Delta events are dropped silently when full; critical events block with a 5s timeout.
-func (m *CodexAppServerManager) sendEnvelope(ch chan *events.Envelope, env *events.Envelope) {
-	// Recover from send on closed channel — release() may close ch
-	// concurrently with Unsubscribe+conn.Close after we released subMu.
-	defer func() {
-		if r := recover(); r != nil {
-			m.log.Debug("codex-app-server: send on closed channel, subscriber gone")
-		}
-	}()
+func (m *CodexAppServerManager) sendEnvelope(sub *codexSubscription, env *events.Envelope) {
 	if env.Event.Type == events.MessageDelta || env.Event.Type == events.Reasoning {
-		select {
-		case ch <- env:
-		default:
-		}
+		sub.gate.TrySend(sub.ch, env)
 		return
 	}
-	timer := time.NewTimer(criticalEventSendTimeout)
-	defer timer.Stop()
-	select {
-	case ch <- env:
-	case <-timer.C:
-		m.log.Warn("codex-app-server: critical event send timeout, dropping",
-			"event_type", env.Event.Type)
+	if !sub.gate.SendTimeout(sub.ch, env, criticalEventSendTimeout) {
+		m.log.Debug("codex-app-server: critical event not accepted by subscriber", "event_type", env.Event.Type)
 	}
 }
 
@@ -1429,7 +1418,7 @@ func (m *CodexAppServerManager) monitorProcess() {
 		m.subsClosed.Store(true)
 		m.subMu.Lock()
 		for id, ch := range m.subscribers {
-			close(ch)
+			ch.close()
 			delete(m.subscribers, id)
 		}
 		m.subSessions = make(map[string]string)
