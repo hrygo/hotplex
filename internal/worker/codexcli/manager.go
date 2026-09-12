@@ -30,6 +30,7 @@ const (
 	stateStarting                     // process launching, waiting for handshake
 	stateRunning                      // process serving JSON-RPC requests
 	stateStopped                      // gateway shutdown
+	stateRetiring                     // reclamation owns the current process
 )
 
 const (
@@ -429,7 +430,7 @@ func (m *CodexAppServerManager) startProcessLocked(ctx context.Context) error {
 	bgCtx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	go m.readNotifications(bgCtx, stdout)
-	go m.monitorProcess()
+	go m.monitorOwnedProcess(m.proc)
 
 	if err := m.handshake(ctx); err != nil {
 		cancel()
@@ -1379,50 +1380,51 @@ func (m *CodexAppServerManager) sendEnvelope(ch chan *events.Envelope, env *even
 	}
 }
 
-// monitorProcess waits for the process to exit and handles crash recovery.
+// monitorProcess preserves the internal compatibility entry point. Production
+// startup passes its process directly to monitorOwnedProcess before spawning.
 func (m *CodexAppServerManager) monitorProcess() {
 	m.mu.Lock()
-	pm := m.proc
+	owned := m.proc
 	m.mu.Unlock()
-	if pm == nil {
+	m.monitorOwnedProcess(owned)
+}
+
+func (m *CodexAppServerManager) monitorOwnedProcess(owned *proc.Manager) {
+	if owned == nil {
 		return
 	}
-	code, _ := pm.Wait()
+	code, _ := owned.Wait()
+	m.finishOwnedProcess(owned, code)
+}
 
+func (m *CodexAppServerManager) finishOwnedProcess(owned *proc.Manager, code int) {
 	m.mu.Lock()
-	wasRunning := m.state == stateRunning
-	refs := m.refs
-	// Guard against overwriting stateStopped set by Shutdown (mirrors OCS
-	// singleton.go): once stopped, monitorProcess must not flip the manager
-	// back to idle, which would let a post-Shutdown Acquire restart it.
-	if m.state != stateStopped {
-		m.state = stateIdle
+	defer m.mu.Unlock()
+	// A failed startup/replacement may already have installed another process.
+	// Neither its subscribers nor its transport belong to this exit callback.
+	if m.proc != owned {
+		return
 	}
-	m.proc = nil
-	m.pgid = 0
-	m.stdin = nil
-	m.stdout = nil
-
+	wasRunning := m.state == stateRunning || m.state == stateRetiring
+	unexpected := m.state == stateRunning && m.refs > 0
+	if m.state != stateStopped {
+		m.state = stateRetiring
+	}
 	if m.idleTimer != nil {
 		m.idleTimer.Stop()
 		m.idleTimer = nil
 	}
-
 	if m.cancel != nil {
 		m.cancel()
 		m.cancel = nil
 	}
-
-	if wasRunning && refs > 0 {
-		m.log.Warn("codex-app-server: process crashed", "exit_code", code, "refs", refs)
-		m.crashExitCode = code
-		close(m.crashCh)
-		m.crashCh = make(chan struct{})
+	if unexpected {
+		m.log.Warn("codex-app-server: process crashed", "exit_code", code, "refs", m.refs)
 	} else {
-		m.log.Info("codex-app-server: process exited", "exit_code", code, "refs", refs)
+		m.log.Info("codex-app-server: process exited", "exit_code", code, "refs", m.refs)
 	}
-	m.mu.Unlock()
-
+	// Keep the acquisition mutex until all old-generation metadata is retired.
+	// No Wait/Kill or blocking OS operation runs while this lock is held.
 	if wasRunning {
 		m.clearConverters()
 		m.clearAllServerRequests()
@@ -1435,77 +1437,68 @@ func (m *CodexAppServerManager) monitorProcess() {
 		m.subSessions = make(map[string]string)
 		m.subMu.Unlock()
 	}
+	m.proc = nil
+	m.pgid = 0
+	m.stdin = nil
+	m.stdout = nil
+	if unexpected {
+		m.crashExitCode = code
+		close(m.crashCh)
+		m.crashCh = make(chan struct{})
+	}
+	if m.state != stateStopped {
+		m.state = stateIdle
+	}
 }
 
-// startIdleDrainLocked starts a timer to kill the process when idle.
-// Caller must hold m.mu.
+// claimIdleProcessLocked linearizes zero-reference reclamation against Acquire.
+// The returned PGID belongs to owned; a later Acquire sees retiring, not running.
+func (m *CodexAppServerManager) claimIdleProcessLocked(owned *proc.Manager) (int, bool) {
+	if m.proc != owned || m.refs != 0 || m.state != stateRunning || m.pgid <= 0 {
+		return 0, false
+	}
+	m.state = stateRetiring
+	if m.idleTimer != nil {
+		m.idleTimer.Stop()
+		m.idleTimer = nil
+	}
+	return m.pgid, true
+}
+
 func (m *CodexAppServerManager) startIdleDrainLocked() {
-	m.log.Info("codex-app-server: starting idle drain timer",
-		"period", m.cfg.IdleDrainPeriod)
-	m.idleTimer = time.AfterFunc(m.cfg.IdleDrainPeriod, func() {
+	m.log.Info("codex-app-server: starting idle drain timer", "period", m.cfg.IdleDrainPeriod)
+	owned := m.proc
+	var timer *time.Timer
+	timer = time.AfterFunc(m.cfg.IdleDrainPeriod, func() {
 		m.mu.Lock()
-		if m.idleTimer == nil {
-			// Timer was already stopped (e.g. by KillIfIdle or Acquire).
+		if m.idleTimer != timer {
 			m.mu.Unlock()
 			return
 		}
-		shouldKill := m.refs == 0 && m.state == stateRunning && m.pgid > 0
-		pgid := m.pgid
+		pgid, claimed := m.claimIdleProcessLocked(owned)
 		m.mu.Unlock()
-
-		if shouldKill {
+		if claimed {
 			m.log.Info("codex-app-server: idle drain expired, killing process")
-			// Call package-level ForceKill + ForceKillTree directly instead
-			// of m.proc.Kill(). proc.Manager.Kill() is now async-safe (#838),
-			// but the direct call is defense-in-depth: it sends SIGKILL by
-			// PGID via syscall.Kill WITHOUT touching proc.mu, guaranteeing
-			// no interaction with monitorProcess's concurrent Wait() — which
-			// is what owns the singleton's post-exit cleanup. monitorProcess
-			// will observe the exit, set state to stateIdle, and clean up.
 			_ = proc.ForceKill(pgid)
 			proc.ForceKillTree(pgid, m.log)
 		}
-
-		m.mu.Lock()
-		m.idleTimer = nil
-		m.mu.Unlock()
 	})
+	m.idleTimer = timer
 }
 
-// KillIfIdle immediately kills the singleton process when no sessions hold
-// references (refs == 0). Used by both Kill() and Terminate() to avoid the
-// 30-minute idle drain wait.
-//
-// This skips the graceful SIGTERM→5s→SIGKILL protocol used by Shutdown()
-// because an idle process has no active sessions — there is nothing to
-// drain or notify.
-//
-// We call package-level ForceKill(pgid) directly instead of proc.Manager.Kill().
-// proc.Kill() is async-safe since #838 (cmd.Wait() moved off proc.mu), but
-// ForceKill here remains preferable: it sends SIGKILL by PGID via syscall.Kill
-// without ever acquiring proc.mu, guaranteeing zero interaction with the
-// monitorProcess goroutine's concurrent Wait() — which is the path that owns
-// the singleton's post-exit cleanup. This is defense-in-depth rather than a
-// required workaround.
-//
-// NOTE: There is a benign TOCTOU window between the shouldKill check (under
-// m.mu) and the ForceKill(pgid) call (after unlock). If the process exits
-// in this window, ForceKill returns ESRCH, which is harmless and ignored.
+// KillIfIdle claims retirement under m.mu, then performs process I/O unlocked.
 func (m *CodexAppServerManager) KillIfIdle() {
 	m.mu.Lock()
 	if m.idleTimer != nil {
 		m.idleTimer.Stop()
 		m.idleTimer = nil
 	}
-	shouldKill := m.refs == 0 && m.state == stateRunning && m.pgid > 0
-	pgid := m.pgid
+	pgid, claimed := m.claimIdleProcessLocked(m.proc)
 	m.mu.Unlock()
-
-	if shouldKill {
+	if claimed {
 		m.log.Info("codex-app-server: killing idle process immediately", "pgid", pgid)
 		_ = proc.ForceKill(pgid)
 		proc.ForceKillTree(pgid, m.log)
-		// monitorProcess will observe the exit, set state to stateIdle, and clean up.
 	}
 }
 
