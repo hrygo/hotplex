@@ -695,13 +695,7 @@ func TestAppServerWorker_StopThenTerminatePreservesSiblingWrapper(t *testing.T) 
 
 	mgr := NewCodexAppServerManager(slog.Default(), config.CodexCLIConfig{IdleDrainPeriod: time.Hour})
 	var output strings.Builder
-	mgr.stdin = struct {
-		io.Writer
-		io.Closer
-	}{
-		Writer: &output,
-		Closer: io.NopCloser(nil),
-	}
+	mgr.stdin = &deep1003ResponseWriter{manager: mgr, output: &output}
 	mgr.mu.Lock()
 	mgr.refs = 2
 	mgr.state = stateRunning
@@ -2030,7 +2024,7 @@ func TestClearWithActiveTurn(t *testing.T) {
 	t.Parallel()
 
 	// Clear with a turnID should attempt InterruptTurn before ResetContext.
-	// InterruptTurn's Notify needs a stdin writer. Provide a fake pipe.
+	// InterruptTurn requires a request/response peer. Preserve its real pipe.
 	mgr := NewCodexAppServerManager(slog.Default(), config.CodexCLIConfig{
 		IdleDrainPeriod: time.Minute,
 	})
@@ -2043,7 +2037,16 @@ func TestClearWithActiveTurn(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = io.Copy(io.Discard, r)
+		decoder := json.NewDecoder(r)
+		for {
+			var frame JSONRPCRequest
+			if err := decoder.Decode(&frame); err != nil {
+				return
+			}
+			if frame.Method == "turn/interrupt" && frame.ID != 0 {
+				mgr.dispatchFrame([]byte(fmt.Sprintf(`{"id":%d,"result":{}}`, frame.ID)))
+			}
+		}
 	}()
 	t.Cleanup(func() { _ = w.Close(); <-done })
 
