@@ -53,9 +53,10 @@ type pcEntry struct {
 // a one-shot completion channel. The channel is buffered so a caller that
 // times out cannot strand the write loop while it reports its eventual result.
 type platformWrite struct {
-	env    *events.Envelope
-	ctx    context.Context
-	result chan<- error
+	env        *events.Envelope
+	ctx        context.Context
+	result     chan<- error
+	completion *platformWriteCompletion
 }
 
 type pcEntryConfig struct {
@@ -176,35 +177,26 @@ func (e *pcEntry) EnqueueWrite(ctx context.Context, env *events.Envelope, result
 	write := platformWrite{env: env, ctx: ctx}
 	if isTerminalPlatformEvent(env.Event.Type) {
 		terminalCtx, cancel := context.WithTimeout(ctx, e.cfg.TerminalTimeout)
+		completion := &platformWriteCompletion{result: result, cancel: cancel, done: make(chan struct{})}
 		write.ctx = terminalCtx
-		write.result = result
+		write.completion = completion
 		ctx = terminalCtx
-		if result != nil {
-			// Budget guard: when the write loop cannot report within the
-			// terminal budget (e.g. a platform write that ignores its
-			// context), complete the caller here. cancel() is deferred to
-			// the guard so terminalCtx stays live for the write loop until
-			// the budget itself expires; the goroutine is bounded by
-			// TerminalTimeout, so it cannot leak. A result already delivered
-			// by the write loop is dropped by the buffered send.
-			go func() {
-				defer cancel()
-				select {
-				case <-terminalCtx.Done():
-					select {
-					case result <- fmt.Errorf("platform conn terminal write timeout: %w", terminalCtx.Err()):
-					default:
-					}
-				case <-e.done:
-					select {
-					case result <- errors.New("platform conn closed"):
-					default:
-					}
-				}
-			}()
-		} else {
-			cancel()
-		}
+		// Admission failure owns cleanup but is returned synchronously, not
+		// delivered as a second asynchronous receipt.
+		defer func() {
+			if err != nil {
+				completion.abandon()
+			}
+		}()
+		go func() {
+			select {
+			case <-completion.done:
+			case <-terminalCtx.Done():
+				completion.finish(fmt.Errorf("platform conn terminal write timeout: %w", terminalCtx.Err()))
+			case <-e.done:
+				completion.finish(errors.New("platform conn closed"))
+			}
+		}()
 	}
 
 	// The closed check and the enqueue are atomic with respect to the
@@ -419,7 +411,10 @@ func (e *pcEntry) writeOne(write platformWrite) {
 		defer cancel()
 	}
 	err := e.pc.WriteCtx(ctx, write.env)
-	if write.result != nil {
+	if write.completion != nil {
+		write.completion.finish(err)
+	} else if write.result != nil {
+		// Legacy internal test fixtures may provide an unguarded receipt.
 		select {
 		case write.result <- err:
 		default:
