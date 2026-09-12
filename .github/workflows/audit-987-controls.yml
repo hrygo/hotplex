@@ -1,0 +1,152 @@
+name: Audit 987 control cancellation
+on:
+  push:
+    branches: [chore/987-audit-bootstrap]
+    paths:
+      - .github/workflows/audit-987-controls.yml
+      - scripts/audit/987-controls.patch.b64
+permissions:
+  contents: write
+concurrency:
+  group: audit-987-controls
+  cancel-in-progress: true
+jobs:
+  verify-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Decode and verify the exact locally tested patch
+        run: |
+          python - <<'PY'
+          import base64, gzip, hashlib, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'audit987'
+          root.mkdir()
+          encoded = Path('scripts/audit/987-controls.patch.b64').read_text().strip()
+          # Correct two transcription errors in the bootstrap payload only.
+          # The full decoded patch must match the locally tested SHA-256.
+          encoded = encoded.replace('Fum3bb0t3Sxde2', 'Fum3bb0t3Sjde2')
+          encoded = encoded.replace('GUbByg9nySndvrJ54dA', 'GUbByg9nyndvrJ6dA')
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          digest = hashlib.sha256(patch).hexdigest()
+          assert digest == '106c1537d352caeb6b59c489846a77b931a5777e55abc37f0d7a089a1825c31d', digest
+          (root / 'controls.patch').write_bytes(patch)
+          (root / 'patch.sha256').write_text(digest + '\n')
+          print('Verified locally tested patch:', digest)
+          PY
+      - uses: actions/checkout@v6
+        with:
+          ref: 1887b9b932be307120483a91cb2ce5f1e864ea97
+          fetch-depth: 1
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+      - uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.4
+          install-only: true
+      - name: Install hooks and add only the regression tests
+        run: |
+          set -euo pipefail
+          echo "$HOME/golangci-lint-2.11.4-linux-amd64" >> "$GITHUB_PATH"
+          make hooks
+          test "$(git config --get core.hooksPath)" = scripts/git-hooks
+          git rev-parse HEAD | tee "$RUNNER_TEMP/audit987/base.txt"
+          go version | tee "$RUNNER_TEMP/audit987/go-version.txt"
+          git apply --check "$RUNNER_TEMP/audit987/controls.patch"
+          git apply --include='*_test.go' "$RUNNER_TEMP/audit987/controls.patch"
+      - name: Reproduce original cancellation defects
+        run: |
+          set +e
+          go test -json -race -count=1 -shuffle=on -timeout=2m -run '^TestAudit987' ./internal/worker/codexcli > "$RUNNER_TEMP/audit987/red.jsonl" 2>&1
+          echo $? > "$RUNNER_TEMP/audit987/red.exit"
+          exit 0
+      - name: Apply fixes and check formatting
+        run: |
+          set -euo pipefail
+          git apply --exclude='*_test.go' "$RUNNER_TEMP/audit987/controls.patch"
+          git add -N internal/worker/codexcli/control_context_audit_test.go internal/worker/codexcli/write_not_started_error.go
+          git diff --name-only -- '*.go' | xargs golangci-lint fmt
+          git diff --check
+          git diff --stat
+      - name: Verify repaired regressions five times
+        run: |
+          set -euo pipefail
+          go test -json -race -count=5 -shuffle=on -timeout=3m -run '^TestAudit987' ./internal/worker/codexcli > "$RUNNER_TEMP/audit987/green.jsonl" 2>&1
+      - name: Run related suites and the existing contract matrix
+        run: |
+          set -euo pipefail
+          go test -json -short -race -count=1 -shuffle=on -timeout=5m ./internal/worker/codexcli ./internal/worker/base > "$RUNNER_TEMP/audit987/broad.jsonl" 2>&1
+          make test-contract-matrix | tee "$RUNNER_TEMP/audit987/matrix.log"
+      - name: Validate evidence and add actual verification provenance
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'audit987'
+          summary = {}
+          for stage in ('red', 'green', 'broad'):
+              records = []
+              for line in (root / f'{stage}.jsonl').read_text().splitlines():
+                  try: records.append(json.loads(line))
+                  except json.JSONDecodeError: continue
+              summary[stage] = {a: [r['Test'] for r in records if r.get('Action') == a and r.get('Test')] for a in ('pass','fail','skip')}
+              print(stage, {k:len(v) for k,v in summary[stage].items()})
+              if stage != 'red':
+                  assert not any(r.get('Action') == 'fail' for r in records), stage
+          expected = {'TestAudit987ControlsPreCanceled','TestAudit987ControlsCancelResponseWait','TestAudit987TurnPreCanceledNotUnavailable','TestAudit987CanceledQueuedWriteNeverExecutes'}
+          assert expected <= set(summary['red']['fail']), summary['red']['fail']
+          assert len(summary['green']['pass']) == 140 and not summary['green']['skip']
+          assert '12 combinations, 96 core scenarios, 0 skipped, 0 failed' in (root / 'matrix.log').read_text()
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2))
+          url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          report = Path('docs/architecture/worker-channel-reliability-audit-20260912.md')
+          with report.open('a') as f:
+              f.write(f'\n### 本批隔离运行验证\n\n[Issue #987 A02/A07 验证运行]({url}) 校验了本地补丁 SHA-256，再执行原实现失败、修复后 5 轮 race 回归以及现有 12 组合 / 96 场景契约矩阵。')
+              for stage, title in [('red','原实现'),('green','修复后重复回归'),('broad','相关短测')]:
+                  s = summary[stage]
+                  f.write(f" {title}：{len(s['pass'])} 通过、{len(s['fail'])} 失败、{len(s['skip'])} 跳过。")
+              f.write(' 最终提交与推送使用仓库原始 hooks；是否完成发布以该运行最终状态及 PR 提交记录为准。\n')
+          PY
+      - name: Lint all configured rules and build documentation
+        run: |
+          set -euo pipefail
+          golangci-lint run --timeout=10m 2>&1 | tee "$RUNNER_TEMP/audit987/lint.log"
+          go run ./cmd/build-docs > "$RUNNER_TEMP/audit987/docs.log" 2>&1
+          git diff --check
+      - name: Append to the existing PR through the original hooks
+        run: |
+          set -euo pipefail
+          branch=fix/985-worker-channel-hardening
+          expected=1887b9b932be307120483a91cb2ce5f1e864ea97
+          test "$(git ls-remote origin refs/heads/$branch | cut -f1)" = "$expected"
+          test "$(git rev-parse HEAD)" = "$expected"
+          git checkout -b "$branch"
+          git config user.name 'HotPlex Audit'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          test "$(git config --get core.hooksPath)" = scripts/git-hooks
+          git add -- AGENTS.md docs/architecture/worker-channel-reliability-audit-20260912.md internal/worker/codexcli/commands.go internal/worker/codexcli/manager.go internal/worker/codexcli/worker.go internal/worker/codexcli/control_context_audit_test.go internal/worker/codexcli/write_not_started_error.go
+          git commit -m 'fix(codexcli): preserve control cancellation and fence unstarted writes' -m 'Refs #987; incrementally extends PR #986.' > "$RUNNER_TEMP/audit987/commit.log" 2>&1
+          cat "$RUNNER_TEMP/audit987/commit.log"
+          git push origin "HEAD:refs/heads/$branch" > "$RUNNER_TEMP/audit987/push.log" 2>&1
+          cat "$RUNNER_TEMP/audit987/push.log"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/audit987/product-commit.txt"
+          git status --short
+      - name: Preserve evidence even on failure
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/audit987"
+          git diff --binary 1887b9b932be307120483a91cb2ce5f1e864ea97 > "$RUNNER_TEMP/audit987/final.patch" || true
+          for log in lint.log commit.log push.log; do
+            echo "### $log"
+            tail -80 "$RUNNER_TEMP/audit987/$log" 2>/dev/null || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit987-controls-${{ github.run_number }}
+          path: ${{ runner.temp }}/audit987/
+          retention-days: 7
