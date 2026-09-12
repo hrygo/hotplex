@@ -18,7 +18,7 @@ description: "十份独立Issue文档与对应修复证据。"
 | D06 | [飞书Adapter关闭时丢失shutdown期限](D06-feishu-shutdown-deadline.md) | Test，修复通过；`fix/987-d06-feishu-shutdown-deadline` |
 | D07 | [Codex传输关闭后pending RPC仍等待完整超时](D07-codex-pending-on-disconnect.md) | Test，修复通过；`fix/987-d07-codex-pending-on-disconnect` |
 | D08 | [Codex停止命令作为单向通知缺乏协议确认](D08-codex-interrupt-rpc.md) | Test，修复通过；`fix/987-d08-codex-interrupt-rpc` |
-| D09 | [Codex启动接受缺少原生线程或轮次ID的响应](D09-codex-lifecycle-response-validation.md) | Source，已登记 |
+| D09 | [Codex启动接受缺少原生线程或轮次ID的响应](D09-codex-lifecycle-response-validation.md) | Test，修复通过；`fix/987-d09-codex-lifecycle-response-validation` |
 | D10 | [交互旧超时回调可能拒绝同ID的新请求](D10-interaction-timeout-generation.md) | Test，修复通过；`fix/987-d10-interaction-timeout-generation` |
 
 本台账文档先于实现提交。每个修复PR仅处理一个独立根因；有依赖时明确base，不重复计算PR #986已修复的问题。RTK不可用，使用原生make hooks。
