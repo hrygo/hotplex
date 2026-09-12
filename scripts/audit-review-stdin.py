@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep stdin pointer reads race-free without acquiring the I/O write mutex."""
+"""Keep metadata snapshots race-free without acquiring the I/O write mutex."""
 import argparse
 from hardening import write, replace
 
@@ -25,6 +25,7 @@ func TestAuditStdinSnapshotDoesNotWaitForPipeWriter(t *testing.T) {
     got := make(chan struct{})
     go func() {
         c.StdinUnlocked()
+        _ = c.SessionID()
         close(got)
     }()
     timely := false
@@ -35,7 +36,7 @@ func TestAuditStdinSnapshotDoesNotWaitForPipeWriter(t *testing.T) {
     // Release before asserting so a defective getter does not leak its goroutine.
     c.WriteMu().Unlock()
     <-got
-    require.True(t, timely, "pointer snapshot blocked before the context-guarded write could start")
+    require.True(t, timely, "metadata snapshot blocked before context-guarded I/O could start")
 }
 
 func TestAuditStdinSnapshotConcurrentCloseInput(t *testing.T) {
@@ -67,15 +68,33 @@ func TestAuditStdinSnapshotConcurrentCloseInput(t *testing.T) {
 
 def fixes() -> None:
     path = 'internal/worker/base/conn.go'
-    replace(path, '\tstdin     *os.File', '\tstdin     *os.File\n\t// stdinMu protects pointer snapshots, never pipe I/O. Pointer mutation\n\t// holds mu then stdinMu; readers using mu alone remain synchronized.\n\tstdinMu sync.RWMutex')
+    replace(path, '\tstdin     *os.File', '\tstdin     *os.File\n\t// stateMu protects sessionID and stdin pointer snapshots, never pipe I/O.\n\t// Pointer mutation holds mu then stateMu; readers using mu alone remain safe.\n\tstateMu sync.RWMutex')
     replace(path, '''func (c *Conn) StdinUnlocked() (*os.File, *sync.Mutex) {
 \tc.mu.Lock()
 \tdefer c.mu.Unlock()
 \treturn c.stdin, &c.mu
 }''', '''func (c *Conn) StdinUnlocked() (*os.File, *sync.Mutex) {
-    c.stdinMu.RLock()
-    defer c.stdinMu.RUnlock()
+    c.stateMu.RLock()
+    defer c.stateMu.RUnlock()
     return c.stdin, &c.mu
+}''')
+    replace(path, '''func (c *Conn) SessionID() string {
+\tc.mu.Lock()
+\tdefer c.mu.Unlock()
+\treturn c.sessionID
+}''', '''func (c *Conn) SessionID() string {
+    c.stateMu.RLock()
+    defer c.stateMu.RUnlock()
+    return c.sessionID
+}''')
+    replace(path, '''func (c *Conn) SetSessionID(id string) {
+\tc.mu.Lock()
+\tdefer c.mu.Unlock()
+\tc.sessionID = id
+}''', '''func (c *Conn) SetSessionID(id string) {
+    c.stateMu.Lock()
+    defer c.stateMu.Unlock()
+    c.sessionID = id
 }''')
     replace(path, '''func (c *Conn) CloseInput() error {
 \tc.mu.Lock()
@@ -89,10 +108,10 @@ def fixes() -> None:
 }''', '''func (c *Conn) CloseInput() error {
     c.mu.Lock()
     defer c.mu.Unlock()
-    c.stdinMu.Lock()
+    c.stateMu.Lock()
     stdin := c.stdin
     c.stdin = nil
-    c.stdinMu.Unlock()
+    c.stateMu.Unlock()
     if stdin != nil {
         return stdin.Close()
     }
