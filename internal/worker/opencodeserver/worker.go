@@ -674,7 +674,7 @@ func (w *Worker) ResetContext(ctx context.Context) (worker.ResetResult, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		return worker.ResetResult{}, fmt.Errorf("opencodeserver: reset: status %d: %s", resp.StatusCode, string(body))
 	}
