@@ -1,0 +1,58 @@
+name: Codex source audit bootstrap
+
+on:
+  push:
+    branches: [codex/source-audit-bootstrap-20260912]
+    paths: [.github/workflows/codex-source-audit.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 29a23f02fa2874b9e856f2c0c1529f537f5f4ba4
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Export pinned worktree and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/audit-source"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/audit-source/hotplex-source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/audit-source/COMMIT"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/audit-source/TREE"
+          git ls-files -s > "$RUNNER_TEMP/audit-source/FILES"
+          git cat-file commit HEAD > "$RUNNER_TEMP/audit-source/COMMIT_OBJECT"
+          sha256sum "$RUNNER_TEMP/audit-source/hotplex-source.tar.gz" > "$RUNNER_TEMP/audit-source/SHA256SUMS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hotplex-audit-source-29a23f0
+          path: ${{ runner.temp }}/audit-source/
+          retention-days: 3
+          compression-level: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Prepare offline toolchain and modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod download
+          if [ -f client/go.mod ]; then (cd client && go mod download); fi
+          mkdir -p "$RUNNER_TEMP/audit-runtime"
+          go version > "$RUNNER_TEMP/audit-runtime/GO_VERSION"
+          tar -C "$(go env GOROOT)" -czf "$RUNNER_TEMP/audit-runtime/go-toolchain.tar.gz" .
+          tar -C "$(go env GOMODCACHE)" -czf "$RUNNER_TEMP/audit-runtime/go-modules.tar.gz" .
+          sha256sum "$RUNNER_TEMP/audit-runtime/"*.tar.gz > "$RUNNER_TEMP/audit-runtime/SHA256SUMS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hotplex-audit-go-runtime
+          path: ${{ runner.temp }}/audit-runtime/
+          retention-days: 3
+          compression-level: 0
