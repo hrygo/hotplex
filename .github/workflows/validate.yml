@@ -461,6 +461,9 @@ jobs:
       - name: Run WebChat platform-worker matrix
         run: pnpm --dir webchat test:e2e:matrix
 
+      - name: Run WebChat execution console baseline
+        run: pnpm --dir webchat exec playwright test e2e/executions-console.spec.ts --project=chromium
+
       - name: Upload Playwright artifacts
         if: always()
         uses: actions/upload-artifact@v7
