@@ -74,6 +74,26 @@ type FenceActionRequest struct {
 	Decision             FenceDecision
 }
 
+// ListFilter bounds one operator-console query over execution records. Every
+// field is optional and they combine with AND.
+//
+// The zero value is NOT a valid unbounded query: Limit<=0 means "use the store
+// default", so a caller cannot accidentally ask for every execution ever
+// recorded. The cursor is (BeforeCreatedAt, BeforeExecutionID) so pagination
+// stays stable while new executions arrive.
+type ListFilter struct {
+	SessionID      string
+	DeliveryStatus Status
+	RuntimeStatus  RuntimeStatus
+	// SinceMs/UntilMs bound created_at (inclusive lower, exclusive upper).
+	SinceMs int64
+	UntilMs int64
+	// BeforeCreatedAt/BeforeExecutionID form the keyset cursor.
+	BeforeCreatedAt   int64
+	BeforeExecutionID string
+	Limit             int
+}
+
 var (
 	// ErrNotFound means the execution does not exist.
 	ErrNotFound = errors.New("execution: record not found")
@@ -246,6 +266,19 @@ type Store interface {
 	// (newest first), optionally filtered by session. limit<=0 uses the store
 	// default; offset supports pagination.
 	ListFences(ctx context.Context, sessionID string, limit, offset int) ([]*Record, error)
+
+	// ByID returns one execution record. The console's detail view needs a
+	// single historical run, and every session-scoped accessor here answers a
+	// question about "now" — which is exactly what a timeline must not do.
+	// Returns ErrNotFound when the execution does not exist.
+	ByID(ctx context.Context, executionID string) (*Record, error)
+
+	// ListRecent returns executions newest-first under a bounded filter, for
+	// the operator console's list view. Every field is optional; the caller is
+	// responsible for bounding Limit, because an unbounded list of every
+	// execution ever recorded is not something this method should be able to
+	// return by accident.
+	ListRecent(ctx context.Context, filter ListFilter) ([]*Record, error)
 
 	// RenewLeases batch-renews all pending/running executions owned by ownerID,
 	// extending lease_until to now + ttl. Returns the number of renewed records.

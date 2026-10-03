@@ -133,6 +133,12 @@ func (s *fakeExecutionStore) ApplyFenceDecision(_ context.Context, _ execution.F
 func (s *fakeExecutionStore) ListFences(context.Context, string, int, int) ([]*execution.Record, error) {
 	return nil, nil
 }
+func (s *fakeExecutionStore) ByID(context.Context, string) (*execution.Record, error) {
+	return nil, execution.ErrNotFound
+}
+func (s *fakeExecutionStore) ListRecent(context.Context, execution.ListFilter) ([]*execution.Record, error) {
+	return nil, nil
+}
 func (s *fakeExecutionStore) RenewLeases(context.Context, string, int64, []string) (int64, error) {
 	return 0, nil
 }

@@ -1816,6 +1816,100 @@
                 }
             }
         },
+        "/admin/executions": {
+            "get": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Returns a bounded, newest-first page of execution records for the operator console. Supports keyset pagination and optional session/status/time filters. Requires runtime:read scope.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin API"
+                ],
+                "summary": "List executions",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Filter by session",
+                        "name": "session_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by delivery status",
+                        "name": "delivery_status",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by runtime status",
+                        "name": "runtime_status",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Only executions created at or after this epoch ms",
+                        "name": "since_ms",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Only executions created before this epoch ms",
+                        "name": "until_ms",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Keyset cursor: created_at",
+                        "name": "before_created_at",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Keyset cursor: execution_id",
+                        "name": "before_execution_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 50, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Executions page",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid filter or pagination",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Insufficient scope: need runtime:read",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Execution store not configured",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/admin/executions/fences": {
             "get": {
                 "security": [
@@ -2015,6 +2109,76 @@
                     },
                     "503": {
                         "description": "Queue dispatcher not configured",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/executions/{id}/timeline": {
+            "get": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Returns a bounded, redacted projection of a single execution: its control facts, a capped window of session events, and the external deliveries planned for it. Reports explicitly when plan or effect evidence was never recorded for THIS run, and offers only the actions valid for the record's current state. Requires runtime:read scope.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin API"
+                ],
+                "summary": "Get one execution's timeline",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Execution ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Only events at or after this epoch ms",
+                        "name": "since_ms",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Only events before this epoch ms",
+                        "name": "until_ms",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ExecutionTimeline"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid time window",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Insufficient scope: need runtime:read",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Execution not found",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Execution console not configured",
                         "schema": {
                             "$ref": "#/definitions/admin.ErrorResponse"
                         }
@@ -3350,6 +3514,26 @@
                 }
             }
         },
+        "admin.AvailableAction": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "description": "Description is operator-facing text, bounded and free of user content.",
+                    "type": "string"
+                },
+                "kind": {
+                    "type": "string"
+                },
+                "requires_version": {
+                    "description": "RequiresVersion is the fencing token the action must carry.",
+                    "type": "integer"
+                },
+                "target": {
+                    "description": "Target names what the action applies to: \"execution\" or an effect ID.",
+                    "type": "string"
+                }
+            }
+        },
         "admin.BotConfigAttrs": {
             "type": "object",
             "properties": {
@@ -4051,6 +4235,95 @@
                 }
             }
         },
+        "admin.ExecutionSummary": {
+            "type": "object",
+            "properties": {
+                "created_at": {
+                    "type": "integer"
+                },
+                "delivery_status": {
+                    "type": "string"
+                },
+                "execution_id": {
+                    "type": "string"
+                },
+                "fence_created_at": {
+                    "type": "integer"
+                },
+                "fence_reason": {
+                    "type": "string"
+                },
+                "fence_version": {
+                    "type": "integer"
+                },
+                "finished_at": {
+                    "type": "integer"
+                },
+                "runtime_error_code": {
+                    "type": "string"
+                },
+                "runtime_status": {
+                    "type": "string"
+                },
+                "session_id": {
+                    "type": "string"
+                },
+                "started_at": {
+                    "type": "integer"
+                },
+                "updated_at": {
+                    "type": "integer"
+                },
+                "worker_run_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "admin.ExecutionTimeline": {
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/admin.AvailableAction"
+                    }
+                },
+                "effect_evidence": {
+                    "description": "EffectEvidence is \"not_recorded_for_this_run\" when the run never planned\nan external delivery, which is most runs.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/admin.evidenceState"
+                        }
+                    ]
+                },
+                "execution": {
+                    "$ref": "#/definitions/admin.ExecutionSummary"
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/admin.TimelineItem"
+                    }
+                },
+                "notes": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "plan_evidence": {
+                    "description": "PlanEvidence is explicit about absence: the launch plan is recorded per\nsession for the CURRENT run only, so a historical execution usually has\nnone. Substituting the session's present plan would rewrite history.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/admin.evidenceState"
+                        }
+                    ]
+                },
+                "truncated": {
+                    "type": "boolean"
+                }
+            }
+        },
         "admin.GatewayCreateSessionResponse": {
             "type": "object",
             "properties": {
@@ -4470,6 +4743,44 @@
                 }
             }
         },
+        "admin.TimelineItem": {
+            "type": "object",
+            "properties": {
+                "effect_id": {
+                    "type": "string"
+                },
+                "evidence": {
+                    "type": "string"
+                },
+                "evidence_state": {
+                    "$ref": "#/definitions/admin.evidenceState"
+                },
+                "execution_id": {
+                    "type": "string"
+                },
+                "fact_time": {
+                    "type": "integer"
+                },
+                "kind": {
+                    "type": "string"
+                },
+                "observed_at": {
+                    "type": "integer"
+                },
+                "phase": {
+                    "type": "string"
+                },
+                "source": {
+                    "type": "string"
+                },
+                "truncated": {
+                    "type": "boolean"
+                },
+                "worker_run_id": {
+                    "type": "string"
+                }
+            }
+        },
         "admin.WorkerHealthResponse": {
             "type": "object",
             "properties": {
@@ -4562,6 +4873,19 @@
                     "type": "string"
                 }
             }
+        },
+        "admin.evidenceState": {
+            "type": "string",
+            "enum": [
+                "recorded",
+                "not_recorded_for_this_run",
+                "unavailable"
+            ],
+            "x-enum-varnames": [
+                "evidenceRecorded",
+                "evidenceNotStored",
+                "evidenceNotQueried"
+            ]
         },
         "admin.fenceActionBody": {
             "type": "object",

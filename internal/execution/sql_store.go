@@ -73,6 +73,14 @@ const executionColumns = `execution_id, session_id, client_message_id, payload_h
 	runtime_status, runtime_error_code, started_at, finished_at, fence_reason,
 	fence_version, fence_created_at`
 
+// ListRecent bounds. A caller that passes no limit gets a page, not a table
+// dump: the operator console is a browsing surface, and "return everything"
+// is never a query this store should be able to answer.
+const (
+	defaultListLimit = 50
+	maxListLimit     = 200
+)
+
 func (s *SQLStore) scanRecord(sc interface {
 	Scan(dest ...any) error
 }) (*Record, error) {
@@ -530,6 +538,90 @@ func (s *SQLStore) FenceBySession(ctx context.Context, sessionID string) (*Recor
 		return nil, fmt.Errorf("execution: fence by session: %w", err)
 	}
 	return r, nil
+}
+
+func (s *SQLStore) ByID(ctx context.Context, executionID string) (*Record, error) {
+	if executionID == "" {
+		return nil, errors.New("execution: execution id is required")
+	}
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+
+	row := s.db.QueryRowContext(ctx, s.rebind(`
+		SELECT `+executionColumns+`
+		FROM execution_inputs
+		WHERE execution_id = ?`), executionID)
+	r, err := s.scanRecord(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("execution: by id: %w", err)
+	}
+	return r, nil
+}
+
+func (s *SQLStore) ListRecent(ctx context.Context, filter ListFilter) ([]*Record, error) {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+	if limit > maxListLimit {
+		limit = maxListLimit
+	}
+
+	query := `SELECT ` + executionColumns + ` FROM execution_inputs WHERE 1=1`
+	args := []any{}
+	if filter.SessionID != "" {
+		query += ` AND session_id = ?`
+		args = append(args, filter.SessionID)
+	}
+	if filter.DeliveryStatus != "" {
+		query += ` AND status = ?`
+		args = append(args, string(filter.DeliveryStatus))
+	}
+	if filter.RuntimeStatus != "" {
+		query += ` AND runtime_status = ?`
+		args = append(args, string(filter.RuntimeStatus))
+	}
+	if filter.SinceMs > 0 {
+		query += ` AND created_at >= ?`
+		args = append(args, filter.SinceMs)
+	}
+	if filter.UntilMs > 0 {
+		query += ` AND created_at < ?`
+		args = append(args, filter.UntilMs)
+	}
+	// Keyset pagination rather than OFFSET: rows arriving between pages would
+	// otherwise shift the window and make a console page silently skip or
+	// repeat executions.
+	if filter.BeforeCreatedAt > 0 {
+		query += ` AND (created_at < ? OR (created_at = ? AND execution_id < ?))`
+		args = append(args, filter.BeforeCreatedAt, filter.BeforeCreatedAt, filter.BeforeExecutionID)
+	}
+	query += ` ORDER BY created_at DESC, execution_id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, s.rebind(query), args...)
+	if err != nil {
+		return nil, fmt.Errorf("execution: list recent: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	records := make([]*Record, 0, limit)
+	for rows.Next() {
+		r, err := s.scanRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("execution: list recent scan: %w", err)
+		}
+		records = append(records, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("execution: list recent iterate: %w", err)
+	}
+	return records, nil
 }
 
 func (s *SQLStore) ClearFenceAfterFreshStart(ctx context.Context, executionID, reason, freshWorkerRunID string) error {

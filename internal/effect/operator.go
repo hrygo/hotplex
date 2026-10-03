@@ -49,8 +49,12 @@ type OperatorActionRequest struct {
 type OperatorListFilter struct {
 	// Status filters to one lifecycle state. Empty lists everything.
 	Status Status
-	Limit  int
-	Offset int
+	// ExecutionID filters to the external deliveries belonging to one run,
+	// which is how the console's timeline links a run to its delivery without
+	// loading every effect ever recorded.
+	ExecutionID string
+	Limit       int
+	Offset      int
 }
 
 const (
@@ -173,15 +177,6 @@ func (s *PGStore) ListForOperator(ctx context.Context, f OperatorListFilter) ([]
 	return listForOperator(ctx, s.db, s.db.Dialect(), f)
 }
 
-const operatorListSQL = `SELECT ` + effectColumns + ` FROM effects
-	ORDER BY created_at DESC, effect_id
-	LIMIT ? OFFSET ?`
-
-const operatorListFilteredSQL = `SELECT ` + effectColumns + ` FROM effects
-	WHERE status = ?
-	ORDER BY created_at DESC, effect_id
-	LIMIT ? OFFSET ?`
-
 func listForOperator(ctx context.Context, q queryer, dialect dbutil.Dialect, f OperatorListFilter) ([]*Effect, error) {
 	limit := f.Limit
 	if limit <= 0 {
@@ -194,12 +189,21 @@ func listForOperator(ctx context.Context, q queryer, dialect dbutil.Dialect, f O
 		f.Offset = 0
 	}
 
-	query := operatorListSQL
-	args := []any{limit, f.Offset}
+	// Assembled rather than selected between fixed variants: a third filter
+	// should not mean rewriting the SQL again, and the bound count has to
+	// follow the placeholders exactly.
+	query := `SELECT ` + effectColumns + ` FROM effects WHERE 1=1`
+	args := []any{}
 	if f.Status != "" {
-		query = operatorListFilteredSQL
-		args = []any{string(f.Status), limit, f.Offset}
+		query += ` AND status = ?`
+		args = append(args, string(f.Status))
 	}
+	if f.ExecutionID != "" {
+		query += ` AND execution_id = ?`
+		args = append(args, f.ExecutionID)
+	}
+	query += ` ORDER BY created_at DESC, effect_id LIMIT ? OFFSET ?`
+	args = append(args, limit, f.Offset)
 
 	rows, err := q.QueryContext(ctx, dialect.Rebind(query), args...)
 	if err != nil {

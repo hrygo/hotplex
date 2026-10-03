@@ -330,6 +330,7 @@ histogram_quantile(0.95, rate(hotplex_execution_delivery_latency_bucket[5m]))
 | `hotplex.execution.queue_depth` | UpDownCounter | 当前排队中的输入数（存量，非流量） |
 | `hotplex.execution.queue_wait_ms` | Histogram | 入队到派发的等待耗时（毫秒） |
 | `hotplex.runtime.queue_actions` | Counter | Admin API 上的队列 operator 决策，label: `action`（cancel / clear）、`result`（ok / error） |
+| `hotplex.runtime.console_queries` | Counter | 执行控制台读取次数，label: `view`（list / timeline） |
 
 标签集全部低基数：不含 execution ID、session ID、actor 或任何输入内容。
 
@@ -350,6 +351,9 @@ sum by (reason) (rate(hotplex_execution_queue_settled_total[1h]))
 
 # operator 取消量
 sum by (action) (rate(hotplex_runtime_queue_actions_total[1h]))
+
+# 控制台读取量：list 与 timeline 的比例变化通常意味着有人在排查
+sum by (view) (rate(hotplex_runtime_console_queries_total[5m]))
 ```
 
 ## Lease-Repair 指标

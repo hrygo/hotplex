@@ -54,7 +54,7 @@ admin:
 | `stats:read` | - | - | 🟢 Read | - | - | - | `GET /admin/stats`<br>`GET /admin/metrics`<br>`GET /admin/sessions/pool` |
 | `config:read` | - | - | - | 🟢 Read | - | - | `POST /admin/config/validate` |
 | `config:write` | - | - | - | 🟠 Write | - | - | `POST /admin/config/rollback` |
-| `runtime:read` | - | - | - | - | - | - | `GET /admin/executions/fences`<br>`GET /admin/effects`<br>`GET /admin/effects/{id}`<br>`GET /admin/sessions/{id}/runtime-plan`（需与 `session:read` 同时持有） |
+| `runtime:read` | - | - | - | - | - | - | `GET /admin/executions`<br>`GET /admin/executions/{id}/timeline`<br>`GET /admin/executions/fences`<br>`GET /admin/effects`<br>`GET /admin/effects/{id}`<br>`GET /admin/sessions/{id}/runtime-plan`（需与 `session:read` 同时持有） |
 | `runtime:write` | - | - | - | - | - | - | `POST /admin/executions/{id}/fence-action`<br>`POST /admin/executions/{id}/queue-cancel`<br>`POST /admin/sessions/{id}/queue-clear`<br>`POST /admin/effects/{id}/action` |
 | `admin:read` | - | - | - | - | 🟢 Read | 🟢 Read | `GET /admin/logs`<br>`GET /admin/debug/...`<br>`GET /admin/bots`<br>`GET /admin/cron/jobs` |
 | `admin:write` | - | - | - | - | - | 🟠 Write | `POST/PATCH/DELETE /admin/cron/jobs`<br>`POST /admin/cron/jobs/{id}/run` |
@@ -155,6 +155,8 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 | 方法 | 路径 | Scope | 说明 |
 |------|------|-------|------|
+| GET | `/admin/executions` | `runtime:read` | 执行控制台列表：按键集游标分页的有界 execution 页 |
+| GET | `/admin/executions/{id}/timeline` | `runtime:read` | 单次 execution 的有界、脱敏时间线与可用动作 |
 | GET | `/admin/executions/fences` | `runtime:read` | 列出阻塞新输入的 fenced executions |
 | POST | `/admin/executions/{id}/fence-action` | `runtime:write` | 应用 operator 决策（resolve/abandon），以 fence_version 为条件 |
 | POST | `/admin/executions/{id}/queue-cancel` | `runtime:write` | 撤销一条**尚未派发**的排队输入；已派发返回 `409` |
@@ -163,6 +165,37 @@ curl -H "Authorization: Bearer $TOKEN" \
 | GET | `/admin/effects` | `runtime:read` | 列出外部交付 effect 及其生命周期状态 |
 | GET | `/admin/effects/{id}` | `runtime:read` | 单个 effect 及其逐次发送尝试历史 |
 | POST | `/admin/effects/{id}/action` | `runtime:write` | 对不确定交付应用 operator 决策（abandon/mark_delivered/requeue），以 `expected_status` 为条件 |
+
+**执行控制台（#868）** — 两个只读端点，把一次运行的事实按阶段拼成一条时间线。它们**不做决策**：真正的动作仍在 fence、queue、effect 端点上，控制台只展示服务端按当前状态和版本计算出的可选项。
+
+**GET /admin/executions** — 按 `created_at DESC, execution_id DESC` 返回一页 execution。参数：`session_id`、`delivery_status`、`runtime_status`、`since_ms`、`until_ms`、`limit`（默认 50，上限 100）、`before_created_at` + `before_execution_id`（键集游标）。响应 `{"executions": [...], "next_cursor": {...} | null}`。
+
+分页使用**键集游标而非 OFFSET**：有新 execution 写入时，OFFSET 窗口会整体位移，导致某页静默跳过或重复记录。`limit` 超过上限返回 `400` 而不是静默截断——被悄悄削小的请求看起来和被满足了一样。列表项为无内容投影：`execution_id`、`session_id`、`delivery_status`、`runtime_status`、`runtime_error_code`、`worker_run_id`、`fence_reason`、`fence_version`、各类时间戳。
+
+**GET /admin/executions/{id}/timeline** — 一次 execution 的历史投影。参数：`since_ms`、`until_ms`（窗口上限 7 天，超出返回 `400`）。响应：
+
+| 字段 | 说明 |
+|------|------|
+| `execution` | 与列表同款的窄投影 |
+| `items[]` | 时间线条目：`phase`、`source`（`execution_store` / `event_store` / `effect_store`）、`kind`、`fact_time`、`observed_at`、`worker_run_id`、`effect_id`、`evidence`、`evidence_state`、`truncated` |
+| `actions[]` | **服务端**按当前状态计算出的可用动作，含 `requires_version` 条件令牌 |
+| `plan_evidence` | 启动计划的证据状态，见下 |
+| `effect_evidence` | 外部交付的证据状态 |
+| `truncated` / `notes[]` | 是否被截断，以及为什么 |
+
+三条硬约束：
+
+- **有界**：每个来源单次有界读取，事件上限 200、effect 上限 50；被截断时 `truncated=true` 并在 `notes` 中说明，而不是静默返回前 N 条。
+- **历史**：`plan_evidence` 通常是 `not_recorded_for_this_run`。启动计划按 session 记录**当前 run**，历史 execution 没有对应快照；用 session 现在的计划顶替等于改写历史，因此这里如实标注缺失。
+- **无内容**：事件只投影类型、方向、来源与时间，`Data` 永不过界——AEP 载荷可能携带 assistant 正文或 tool 参数。
+
+`fact_time` 与 `observed_at` 分开保留：延迟到达的事实（effect 回执、晚到的 done）两者本就不同，合并会掩盖 operator 正在排查的延迟。
+
+Agent 完成、提供方接受与外部可核验是**分开的条目**：一个 `runtime=completed` 的 execution 和一条 `status=unknown` 的交付在时间线上是两条独立事实。
+
+可用动作只有三类：`fence_resolve` / `fence_abandon`（带 `fence_version` 条件）、`queue_cancel`（仅 `runtime=queued`）、`effect_abandon` / `effect_mark_delivered` / `effect_requeue`（仅 `status=unknown` 的交付）。**任何状态都不提供「强制成功」**。UI 只渲染服务端返回的列表，不自行判断哪个可重试。
+
+错误码：`400 BAD_REQUEST`（筛选或窗口非法）/ `403 INSUFFICIENT_SCOPE` / `404 EXECUTION_NOT_FOUND` / `503 SERVICE_UNAVAILABLE`（控制台未接线）。
 
 **GET /admin/executions/fences** — 列出运行时结局不明（runtime unknown）并触发 fence 的 execution。fenced execution 会阻塞同 session 的新输入，直至 operator 决策。
 
@@ -597,6 +630,7 @@ zip 格式、文件类型白名单与安全约束同上方「Skill 管理（admi
 | 403 | `PERMISSION_DENIED` | 非 admin 试图在 workspace Create/Update 设置或修改 `permission_mode`（admin-only 字段，r3 #804） |
 | 404 | `NOT_FOUND` | Session/Cron Job/Invitation 未找到 |
 | 404 | `WORKSPACE_NOT_FOUND` | workspace id 不存在 |
+| 404 | `EXECUTION_NOT_FOUND` | 控制台时间线目标 execution 不存在 |
 | 404 | `FENCE_NOT_FOUND` | fence-action 目标 execution 不存在 |
 | 404 | `EFFECT_NOT_FOUND` | effect 端点目标 effect 不存在 |
 | 409 | `CONFLICT` | 资源状态冲突 |
@@ -652,6 +686,14 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"decision":"abandon","expected_fence_version":3,"reason":"worker host lost, verified via run log","evidence_ref":"OPS-1234"}' \
   http://localhost:9999/admin/executions/exec-abc/fence-action
+
+# 列出 execution（键集分页；limit 上限 100）
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9999/admin/executions?limit=50&runtime_status=unknown"
+
+# 打开一次 execution 的时间线（含服务端计算出的可用动作）
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9999/admin/executions/exec-abc/timeline
 
 # 查看会话的 effective runtime plan（#946）
 curl -H "Authorization: Bearer $TOKEN" \

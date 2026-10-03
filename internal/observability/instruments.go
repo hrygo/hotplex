@@ -1090,6 +1090,9 @@ var (
 	runtimeQueueOperatorActions     metric.Int64Counter
 	runtimeQueueOperatorActionsInit sync.Once
 
+	runtimeConsoleQueries     metric.Int64Counter
+	runtimeConsoleQueriesInit sync.Once
+
 	executionDeliveryOutcome     metric.Int64Counter
 	executionDeliveryOutcomeInit sync.Once
 
@@ -1339,6 +1342,24 @@ func ExecutionQueueWaitMs() metric.Float64Histogram {
 		}
 	})
 	return executionQueueWaitMs
+}
+
+// RuntimeConsoleQueries counts execution-console reads. Labels: view
+// (list|timeline). Low-cardinality only — no execution IDs, no session IDs, no
+// actor. A console that answered from cache or from the session's current state
+// would show up here as a drop, which is the point of having it.
+func RuntimeConsoleQueries() metric.Int64Counter {
+	runtimeConsoleQueriesInit.Do(func() {
+		var err error
+		runtimeConsoleQueries, err = Meter().Int64Counter(
+			"hotplex.runtime.console_queries",
+			metric.WithDescription("Execution console reads. Labels: view (list|timeline)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.runtime.console_queries", err)
+		}
+	})
+	return runtimeConsoleQueries
 }
 
 // RuntimeQueueOperatorActions counts operator decisions applied to the durable

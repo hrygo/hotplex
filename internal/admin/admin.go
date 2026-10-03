@@ -204,6 +204,11 @@ type AdminAPI struct {
 	runtimeNotifier  RuntimeEventNotifier     // Optional: emits runtime.execution.failed on abandon (#877)
 	runtimeEffects   RuntimeEffectProvider    // Optional: enables /admin/effect endpoints; nil → 503
 	runtimeQueue     RuntimeQueueProvider     // Optional: enables /admin input-queue endpoints; nil → 503
+	// Execution console (#868). Each view is optional and degrades its own
+	// section to "unavailable" rather than failing the whole projection.
+	consoleExecutions ExecutionReader       // Optional: execution list + detail lookup
+	consoleEvents     SessionEventReader    // Optional: bounded session events for a timeline
+	consoleEffects    ExecutionEffectReader // Optional: bounded deliveries for a run
 	// launchPlans reports the plan each session's current run was ACTUALLY
 	// launched under (#946 D3). nil → the runtime-plan diagnostic re-resolves
 	// against the live config and marks the answer as not-from-launch.
