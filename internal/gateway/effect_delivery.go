@@ -42,6 +42,10 @@ type EffectDeliverer struct {
 	effects   effect.Store
 	extract   FinalOutputExtractor
 	senderFor func(platform string) (messaging.ControlledSender, bool)
+	// resolveTarget re-authorizes a stored effect against current job
+	// configuration. Recovery uses it; first delivery does not, because it
+	// already holds the live configuration.
+	resolveTarget TargetResolver
 	// ownerInstanceID fences sends: two instances recovering the same
 	// occurrence cannot both claim the effect.
 	ownerInstanceID string
@@ -54,10 +58,14 @@ type EffectDeliverer struct {
 
 // EffectDelivererConfig wires the deliverer.
 type EffectDelivererConfig struct {
-	Log             *slog.Logger
-	Effects         effect.Store
-	Extract         FinalOutputExtractor
-	SenderFor       func(platform string) (messaging.ControlledSender, bool)
+	Log       *slog.Logger
+	Effects   effect.Store
+	Extract   FinalOutputExtractor
+	SenderFor func(platform string) (messaging.ControlledSender, bool)
+	// ResolveTarget is required for recovery. Without it a restarted process
+	// could only deliver from what it stored at plan time, which is exactly
+	// the stale authorization the plan forbids.
+	ResolveTarget   TargetResolver
 	OwnerInstanceID string
 	// Lease bounds how long this instance is trusted with a send. Zero uses a
 	// conservative default.
@@ -86,6 +94,7 @@ func NewEffectDeliverer(cfg EffectDelivererConfig) *EffectDeliverer {
 		effects:         cfg.Effects,
 		extract:         cfg.Extract,
 		senderFor:       cfg.SenderFor,
+		resolveTarget:   cfg.ResolveTarget,
 		ownerInstanceID: cfg.OwnerInstanceID,
 		lease:           lease,
 		budget:          budget,
@@ -175,12 +184,28 @@ func (d *EffectDeliverer) DeliverEffect(ctx context.Context, req cron.EffectDeli
 		}
 		return fmt.Errorf("effect delivery: claim: %w", err)
 	}
+	return d.sendClaimed(ctx, claim, content, req.PlatformKey, sender, req.OccurrenceID)
+}
 
+// sendClaimed performs one send attempt under an existing claim and records
+// what it established.
+//
+// It is shared by first delivery and recovery on purpose: both must classify
+// outcomes identically, or a restart would quietly change what a duplicate
+// means.
+func (d *EffectDeliverer) sendClaimed(
+	ctx context.Context,
+	claim *effect.Claim,
+	content string,
+	platformKey map[string]string,
+	sender messaging.ControlledSender,
+	occurrenceID string,
+) error {
 	// The send happens OUTSIDE the transaction on purpose: a transaction held
 	// across a network call would pin the database for the duration of a
 	// provider timeout, and the lease — not the lock — is what protects the
 	// effect while we are in flight.
-	result, sendErr := sender.SendWithReceipt(ctx, content, req.PlatformKey)
+	result, sendErr := sender.SendWithReceipt(ctx, content, platformKey)
 	completion := effect.Completion{
 		EffectID:     claim.Effect.EffectID,
 		Attempt:      claim.Attempt,
@@ -225,13 +250,13 @@ func (d *EffectDeliverer) DeliverEffect(ctx context.Context, req cron.EffectDeli
 		// rather than retried, because retrying the send is what would
 		// actually cause the duplicate this ledger exists to prevent.
 		d.log.Error("effect delivery: could not record send outcome",
-			"effect_id", claim.Effect.EffectID, "occurrence_id", req.OccurrenceID,
+			"effect_id", claim.Effect.EffectID, "occurrence_id", occurrenceID,
 			"outcome", completion.Outcome, "err", err)
 		return fmt.Errorf("effect delivery: record outcome: %w", err)
 	}
 
 	d.log.Info("effect delivery: recorded",
-		"effect_id", claim.Effect.EffectID, "occurrence_id", req.OccurrenceID,
+		"effect_id", claim.Effect.EffectID, "occurrence_id", occurrenceID,
 		"outcome", completion.Outcome)
 	return nil
 }

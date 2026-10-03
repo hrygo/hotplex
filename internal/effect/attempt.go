@@ -109,6 +109,60 @@ const listAttemptsSQL = `SELECT ` + attemptColumns + ` FROM effect_attempts
 	WHERE effect_id = ?
 	ORDER BY attempt`
 
+const listDueRetriesSQL = `SELECT ` + effectColumns + ` FROM effects
+	WHERE status = 'started'
+	  AND next_attempt_at IS NOT NULL
+	  AND next_attempt_at <= ?
+	  AND attempt + 1 < ?
+	ORDER BY next_attempt_at
+	LIMIT ?`
+
+// ListDueRetries returns effects waiting behind a backoff whose next attempt
+// may now open.
+//
+// The attempt cap is applied here as well as in the retry claim, so a caller
+// scanning for work never picks up an effect it would only be refused.
+func (s *SQLiteStore) ListDueRetries(
+	ctx context.Context, now time.Time, maxAttempts int64, limit int,
+) ([]*Effect, error) {
+	return listDueRetries(ctx, s.db, dbutil.DialectSQLite, now, maxAttempts, limit)
+}
+
+// ListDueRetries returns effects whose backoff has elapsed.
+func (s *PGStore) ListDueRetries(
+	ctx context.Context, now time.Time, maxAttempts int64, limit int,
+) ([]*Effect, error) {
+	return listDueRetries(ctx, s.db, s.db.Dialect(), now, maxAttempts, limit)
+}
+
+func listDueRetries(
+	ctx context.Context, q queryer, dialect dbutil.Dialect,
+	now time.Time, maxAttempts int64, limit int,
+) ([]*Effect, error) {
+	if limit <= 0 || maxAttempts <= 0 {
+		return nil, nil
+	}
+	rows, err := q.QueryContext(ctx, dialect.Rebind(listDueRetriesSQL),
+		now.UnixMilli(), maxAttempts, limit)
+	if err != nil {
+		return nil, fmt.Errorf("effect: list due retries: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []*Effect
+	for rows.Next() {
+		e, err := scanEffect(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("effect: scan due retries: %w", err)
+	}
+	return out, nil
+}
+
 // ListAttempts returns the per-attempt facts for an effect, oldest first.
 func (s *SQLiteStore) ListAttempts(ctx context.Context, effectID string) ([]*Attempt, error) {
 	rows, err := s.db.QueryContext(ctx, listAttemptsSQL, effectID)

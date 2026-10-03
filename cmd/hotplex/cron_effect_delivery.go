@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -55,6 +56,8 @@ func newCronEffectDelivery(
 	stores *gatewayStores,
 	ownerInstanceID string,
 	owners *adapterLookup,
+	occurrences cron.OccurrenceStore,
+	jobs cron.Store,
 ) cron.EffectDelivery {
 	store := effectStoreFor(log, stores)
 	if store == nil {
@@ -75,6 +78,11 @@ func newCronEffectDelivery(
 		SenderFor: func(platform string) (messaging.ControlledSender, bool) {
 			return owners.senderFor(platform)
 		},
+		ResolveTarget: func(
+			ctx context.Context, occurrenceID string,
+		) (string, map[string]string, error) {
+			return resolveDeliveryTarget(ctx, occurrences, jobs, occurrenceID)
+		},
 		OwnerInstanceID: ownerInstanceID,
 		Extract: func(ctx context.Context, sessionID, executionID string) (string, error) {
 			if stores.turnQuerier == nil {
@@ -92,6 +100,40 @@ func newCronEffectDelivery(
 			return gateway.SelectFinalAssistantOutput(turns)
 		},
 	})
+}
+
+// resolveDeliveryTarget re-authorizes an effect against the job as it exists
+// now.
+//
+// Recovery must not deliver on the strength of what was true when the intent
+// was planned. A deleted job, a job switched back to the legacy owner, or a
+// disabled job all mean the delivery is no longer authorized, and the effect
+// stays owed and visible instead of being sent or silently dropped.
+func resolveDeliveryTarget(
+	ctx context.Context,
+	occurrences cron.OccurrenceStore,
+	jobs cron.Store,
+	occurrenceID string,
+) (string, map[string]string, error) {
+	if occurrences == nil || jobs == nil {
+		return "", nil, fmt.Errorf("%w: delivery state unavailable", gateway.ErrTargetUnauthorized)
+	}
+	occ, err := occurrences.GetByID(ctx, occurrenceID)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: occurrence %s", gateway.ErrTargetUnauthorized, occurrenceID)
+	}
+	job, err := jobs.Get(ctx, occ.JobID)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: job %s", gateway.ErrTargetUnauthorized, occ.JobID)
+	}
+	if cron.ResolveDeliveryMode(job.DeliveryMode) != cron.DeliveryModeGateway {
+		return "", nil, fmt.Errorf("%w: job %s is no longer gateway-owned",
+			gateway.ErrTargetUnauthorized, job.ID)
+	}
+	if job.Silent {
+		return "", nil, fmt.Errorf("%w: job %s is silent", gateway.ErrTargetUnauthorized, job.ID)
+	}
+	return job.Platform, job.PlatformKey, nil
 }
 
 // effectStoreFor returns the effect ledger for the active dialect, sharing the

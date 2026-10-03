@@ -693,7 +693,6 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 
 	// Cron scheduler: init after Bridge, before messaging adapters.
 	if cfg.Cron.Enabled {
-		cronEffectDelivery = newCronEffectDelivery(log, stores, ownerInstanceID, cronEffectOwners)
 		var cronStore cron.Store
 		if stores.cron != nil {
 			cronStore = stores.cron
@@ -707,6 +706,15 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 			occurrenceStore = stores.occurrences
 		} else {
 			occurrenceStore = cron.NewSQLiteOccurrenceStore(stores.sqlDB, log, stores.writeMu)
+		}
+		cronEffectDelivery = newCronEffectDelivery(
+			log, stores, ownerInstanceID, cronEffectOwners, occurrenceStore, cronStore)
+		// Unfinished deliveries converge without an operator: the loop fences
+		// lapsed leases into unknown first, then finishes what is provably
+		// owed. Its first tick is deliberately late so messaging adapters are
+		// up before anything can be sent.
+		if deliverer, ok := cronEffectDelivery.(*gateway.EffectDeliverer); ok {
+			deliverer.StartRecoveryLoop(ctx, 10*time.Second, 50)
 		}
 		cronDelivery = cron.NewDelivery(log,
 			func(ctx context.Context, sessionID string) (string, error) {

@@ -58,6 +58,9 @@ type Store interface {
 	// ListRecoverable returns effects that are durably owed a send and are not
 	// currently owned by anyone.
 	ListRecoverable(ctx context.Context, limit int) ([]*Effect, error)
+	// ListDueRetries returns effects waiting behind a backoff whose next
+	// attempt may now open, excluding any that have reached the attempt cap.
+	ListDueRetries(ctx context.Context, now time.Time, maxAttempts int64, limit int) ([]*Effect, error)
 	// ListAttempts returns the per-attempt facts for an effect, oldest first.
 	ListAttempts(ctx context.Context, effectID string) ([]*Attempt, error)
 }

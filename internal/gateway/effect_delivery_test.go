@@ -22,6 +22,12 @@ type fakeEffectStore struct {
 	planned   []*effect.Plan
 	claims    []effect.ClaimRequest
 	completes []effect.Completion
+	retries   []effect.RetryRequest
+
+	expired     []*effect.Effect
+	recoverable []*effect.Effect
+	dueRetries  []*effect.Effect
+	payload     *effect.Payload
 
 	planErr      error
 	claimErr     error
@@ -89,6 +95,9 @@ func (f *fakeEffectStore) GetByID(context.Context, string) (*effect.Effect, erro
 }
 
 func (f *fakeEffectStore) GetPayload(context.Context, string) (*effect.Payload, error) {
+	if f.payload != nil {
+		return f.payload, nil
+	}
 	return nil, effect.ErrPayloadNotFound
 }
 
@@ -99,25 +108,45 @@ func (f *fakeEffectStore) GetPayloadForExecution(
 }
 
 func (f *fakeEffectStore) ClaimRetry(
-	context.Context, effect.RetryRequest,
+	_ context.Context, req effect.RetryRequest,
 ) (*effect.Claim, error) {
-	return nil, effect.ErrLeaseLost
+	f.retries = append(f.retries, req)
+	if f.claimErr != nil {
+		return nil, f.claimErr
+	}
+	return &effect.Claim{
+		Effect: &effect.Effect{
+			EffectID:     req.EffectID,
+			Attempt:      req.ExpectedAttempt + 1,
+			LeaseVersion: 2,
+			Status:       effect.StatusStarted,
+		},
+		Attempt:      req.ExpectedAttempt + 1,
+		LeaseVersion: 2,
+		LeaseToken:   "ltk-retry",
+	}, nil
 }
 
 func (f *fakeEffectStore) ExpireLeases(
 	context.Context, time.Time, int,
 ) ([]*effect.Effect, error) {
-	return nil, nil
+	return f.expired, nil
 }
 
 func (f *fakeEffectStore) ListRecoverable(context.Context, int) ([]*effect.Effect, error) {
-	return nil, nil
+	return f.recoverable, nil
 }
 
 func (f *fakeEffectStore) ListAttempts(
 	context.Context, string,
 ) ([]*effect.Attempt, error) {
 	return nil, nil
+}
+
+func (f *fakeEffectStore) ListDueRetries(
+	context.Context, time.Time, int64, int,
+) ([]*effect.Effect, error) {
+	return f.dueRetries, nil
 }
 
 // recordingSender captures the sends that actually reached the provider.
