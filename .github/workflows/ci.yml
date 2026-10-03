@@ -168,72 +168,64 @@ jobs:
         with:
           build-webchat: 'false'
 
+      - name: Test Go package selector
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+
       - name: Determine test scope
         id: scope
         env:
           EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          set -euo pipefail
+
           if [ "$EVENT_NAME" = "push" ]; then
-            echo "pkgs=." >> "$GITHUB_OUTPUT"
+            python3 scripts/ci/select_go_tests.py \
+              --repo-root . \
+              --full \
+              --github-output "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          CHANGED=$(git diff --name-only origin/main... | grep '\.go$' || true)
-          if [ -z "$CHANGED" ]; then
-            echo "pkgs=." >> "$GITHUB_OUTPUT"
-            exit 0
+          if ! git cat-file -e "$BASE_SHA^{commit}"; then
+            echo "::error::Pull request base commit $BASE_SHA is unavailable"
+            exit 1
           fi
 
-          AFFECTED=""
-          for f in $CHANGED; do
-            dir=$(dirname "$f")
-            full_pkg="github.com/hrygo/hotplex/$dir"
-            AFFECTED="$AFFECTED $full_pkg"
-          done
+          git diff --name-only -z "$BASE_SHA" "$GITHUB_SHA" |
+            python3 scripts/ci/select_go_tests.py \
+              --repo-root . \
+              --github-output "$GITHUB_OUTPUT"
 
-          AFFECTED=$(echo "$AFFECTED" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
-          if [ -n "$AFFECTED" ]; then
-            echo "pkgs=$AFFECTED" >> "$GITHUB_OUTPUT"
-            echo "Testing affected packages: $AFFECTED"
-          else
-            echo "pkgs=." >> "$GITHUB_OUTPUT"
-          fi
+      - name: Summarize test scope
+        env:
+          SCOPE_MODE: ${{ steps.scope.outputs.mode }}
+          SCOPE_REASON: ${{ steps.scope.outputs.fallback_reason }}
+          SCOPE_PACKAGES: ${{ steps.scope.outputs.test_packages }}
+          SCOPE_EXCLUDED: ${{ steps.scope.outputs.excluded_test_packages }}
+        run: |
+          {
+            echo "mode=$SCOPE_MODE"
+            echo "reason=$SCOPE_REASON"
+            echo "affected packages:"
+            printf '%s\n' "$SCOPE_PACKAGES"
+            echo "dedicated excluded packages:"
+            printf '%s\n' "$SCOPE_EXCLUDED"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run tests with race detector + coverage
         env:
-          SCOPE: ${{ steps.scope.outputs.pkgs }}
+          MODE: ${{ steps.scope.outputs.mode }}
+          SELECTED: ${{ steps.scope.outputs.test_packages }}
           SHARD: ${{ matrix.shard }}
         run: |
-          ALL_PKGS=$(go list ./... | grep -v \
-            -e 'internal/worker/proc' \
-            -e 'internal/worker/pi' \
-            -e 'cmd/hotplex' \
-            -e 'e2e')
-
-          if [ "$SCOPE" = "." ]; then
-            TEST_PKGS="$ALL_PKGS"
-          else
-            TEST_PKGS=""
-            for pkg in $ALL_PKGS; do
-              for changed in $SCOPE; do
-                if [ "$pkg" = "$changed" ]; then
-                  TEST_PKGS="$TEST_PKGS $pkg"
-                  break
-                fi
-                # Include packages that import the changed package
-                if go list -f '{{range .Imports}}{{if eq . "'"$changed"'"}}{{.}} {{end}}{{end}}' "$pkg" 2>/dev/null | grep -q "'"$changed"'"; then
-                  TEST_PKGS="$TEST_PKGS $pkg"
-                  break
-                fi
-              done
-            done
-          fi
-
-          if [ -z "$TEST_PKGS" ]; then
-            echo "No test packages affected by this change"
+          if [ "$MODE" = "empty" ]; then
+            echo "No Go packages affected by this change"
             printf 'mode: atomic\n' > coverage.out
             exit 0
           fi
+
+          TEST_PKGS=$(printf '%s\n' "$SELECTED" | sed '/^$/d' | tr '\n' ' ')
 
           # Shard: partition packages round-robin across N shards (push-to-main only)
           if [ -n "$SHARD" ]; then
@@ -253,6 +245,22 @@ jobs:
           # shellcheck disable=SC2086,SC2046
           go test -short -race -count=1 -shuffle=on -timeout=10m \
             -coverprofile="$COVERAGE_FILE" -covermode=atomic $TEST_PKGS
+
+      - name: Run dedicated excluded-package tests
+        env:
+          EXCLUDED: ${{ steps.scope.outputs.excluded_test_packages }}
+        run: |
+          set -euo pipefail
+          EXCLUDED_PKGS=$(printf '%s\n' "$EXCLUDED" | sed '/^$/d' | tr '\n' ' ')
+          if [ -z "$EXCLUDED_PKGS" ]; then
+            echo "No excluded packages affected by this change"
+            exit 0
+          fi
+          echo "Running dedicated excluded-package tests: $EXCLUDED_PKGS"
+          # These packages stay outside coverage/sharding to preserve the
+          # existing thresholds, but a scoped Test job must not skip them.
+          # shellcheck disable=SC2086
+          go test -short -race -count=1 -shuffle=on -timeout=10m $EXCLUDED_PKGS
 
       - name: Display coverage
         if: always()
