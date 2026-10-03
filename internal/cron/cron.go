@@ -61,6 +61,7 @@ type Deps struct {
 	Log            *slog.Logger
 	Store          Store
 	Occurrences    OccurrenceStore
+	Dispatcher     SystemInputDispatcher
 	Bridge         BridgeStarter
 	SessionMgr     SessionStateChecker
 	Delivery       *Delivery
@@ -94,7 +95,7 @@ func New(deps Deps) *Scheduler {
 		defaultTimeout = time.Duration(deps.Cfg.DefaultTimeoutSec) * time.Second
 	}
 	s.defaultTimeout = defaultTimeout
-	s.executor = NewExecutor(deps.Log, deps.Bridge, deps.SessionMgr, deps.Cfg.DefaultSandbox, deps.Occurrences)
+	s.executor = NewExecutor(deps.Log, deps.Bridge, deps.SessionMgr, deps.Cfg.DefaultSandbox, deps.Occurrences, deps.Dispatcher)
 	if deps.AttachedRouter != nil {
 		s.attachedHandler = NewAttachedSessionHandler(deps.Log, deps.AttachedRouter)
 	}

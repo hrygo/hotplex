@@ -717,9 +717,13 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 		)
 		cronAttRouter = &cronAttachedRouter{bridge: bridge, sm: sm}
 		cronScheduler = cron.New(cron.Deps{
-			Log:            log,
-			Store:          cronStore,
-			Occurrences:    occurrenceStore,
+			Log:         log,
+			Store:       cronStore,
+			Occurrences: occurrenceStore,
+			// Cron prompts go through the gateway's durable input path
+			// (execution ledger, owner lease, execution-correlated completion)
+			// rather than calling Worker.Input directly.
+			Dispatcher:     handler,
 			Bridge:         bridge,
 			SessionMgr:     sm,
 			Delivery:       cronDelivery,

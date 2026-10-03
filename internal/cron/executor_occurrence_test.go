@@ -51,7 +51,7 @@ func newOccurrenceExecutor(
 	t *testing.T, store OccurrenceStore, bridge *mockBridge, sm SessionStateChecker,
 ) *Executor {
 	t.Helper()
-	return NewExecutor(slog.Default(), bridge, sm, "", store)
+	return NewExecutor(slog.Default(), bridge, sm, "", store, &mockSystemDispatcher{sm: sm})
 }
 
 func testScheduledTrigger(jobID string) TriggerIdentity {

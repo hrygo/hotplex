@@ -23,7 +23,7 @@ func newTestScheduler(t *testing.T) *Scheduler {
 	return &Scheduler{
 		log:            slog.Default(),
 		store:          store,
-		executor:       NewExecutor(slog.Default(), bridge, sm, "", nil),
+		executor:       NewExecutor(slog.Default(), bridge, sm, "", nil, &mockSystemDispatcher{sm: sm}),
 		maxConcurrent:  3,
 		maxJobs:        50,
 		defaultTimeout: 5 * time.Minute,

@@ -2,6 +2,7 @@ package cron
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -20,6 +21,42 @@ type BridgeStarter interface {
 	StartSession(ctx context.Context, p worker.SessionStartParams) error
 }
 
+// SystemInputRequest is an internal, trusted input that did not arrive over a
+// client connection (a cron firing, a system event).
+type SystemInputRequest struct {
+	SessionID string
+	// OccurrenceID makes the input identity stable per firing, so a retry
+	// resolves to the same durable execution instead of starting a second run.
+	OccurrenceID string
+	Content      string
+}
+
+// SystemInputResult reports the durable execution that owns the input.
+type SystemInputResult struct {
+	ExecutionID string
+	// Duplicate is true when the input was already accepted, so no Worker
+	// dispatch happened for this call.
+	Duplicate bool
+}
+
+// SystemInputDispatcher accepts an internal system-originated input through the
+// same durable accept, owner-lease and terminal-correlation path as a client
+// input. Cron must go through this rather than calling Worker.Input directly,
+// which would bypass the execution ledger entirely.
+type SystemInputDispatcher interface {
+	DispatchSystemInput(ctx context.Context, req SystemInputRequest) (SystemInputResult, error)
+	// WaitForExecution blocks until the given execution reaches a terminal
+	// runtime state. It correlates on the execution rather than on the
+	// session's global IDLE state, because a session can look idle while the
+	// run this caller owns is still executing.
+	WaitForExecution(ctx context.Context, sessionID, executionID string, timeout time.Duration) error
+}
+
+// ErrSystemInputDispatcherUnavailable is returned when no dispatcher is wired.
+// Cron must never fall back to calling Worker.Input directly: that would
+// bypass the execution ledger and leave the run unattributable.
+var ErrSystemInputDispatcherUnavailable = errors.New("cron executor: system input dispatcher unavailable")
+
 // SessionStateChecker polls session state for completion detection.
 type SessionStateChecker interface {
 	Get(ctx context.Context, id string) (*session.SessionInfo, error)
@@ -34,6 +71,10 @@ type Executor struct {
 	sm          SessionStateChecker
 	sandbox     string
 	occurrences OccurrenceStore
+	// dispatcher routes the prompt through the gateway's durable input path.
+	// It is required: dispatching straight to Worker.Input would bypass the
+	// execution ledger and leave the run unattributable.
+	dispatcher SystemInputDispatcher
 	// now is injectable so occurrence timestamps and schedule keys are
 	// deterministic under test.
 	now func() time.Time
@@ -46,6 +87,7 @@ func NewExecutor(
 	sm SessionStateChecker,
 	sandbox string,
 	occurrences OccurrenceStore,
+	dispatcher SystemInputDispatcher,
 ) *Executor {
 	return &Executor{
 		log:         log.With("component", "cron_executor"),
@@ -53,6 +95,7 @@ func NewExecutor(
 		sm:          sm,
 		sandbox:     sandbox,
 		occurrences: occurrences,
+		dispatcher:  dispatcher,
 		now:         time.Now,
 	}
 }
@@ -185,9 +228,27 @@ func (e *Executor) Execute(
 	prompt := buildWebhookPrefix(job) + formatJobPrompt(job, e.now())
 	prompt += buildDeliverySuffix(job)
 
-	if err := w.Input(ctx, prompt, nil); err != nil {
+	if e.dispatcher == nil {
+		e.markOccurrence(ctx, occ, OccurrenceFailed, "DISPATCHER_UNAVAILABLE")
+		return out, fmt.Errorf("cron executor: system input dispatcher unavailable: %w",
+			ErrSystemInputDispatcherUnavailable)
+	}
+	dispatch, err := e.dispatcher.DispatchSystemInput(ctx, SystemInputRequest{
+		SessionID:    sessionKey,
+		OccurrenceID: occ.OccurrenceID,
+		Content:      prompt,
+	})
+	if err != nil {
 		e.markOccurrence(ctx, occ, OccurrenceFailed, "WORKER_INPUT_FAILED")
-		return out, fmt.Errorf("cron executor: input prompt: %w", err)
+		return out, fmt.Errorf("cron executor: dispatch system input: %w", err)
+	}
+	if dispatch.Duplicate {
+		// The occurrence is new but the execution ledger already owns this
+		// identity, so no second dispatch happens and the run is already
+		// accounted for.
+		e.markOccurrence(ctx, occ, OccurrenceCompleted, "")
+		e.terminateSession(sessionKey)
+		return out, nil
 	}
 
 	// Signal EOF so --print mode workers exit after processing instead of
@@ -196,7 +257,9 @@ func (e *Executor) Execute(
 		_ = ci.CloseInput()
 	}
 
-	err = e.waitForCompletion(ctx, sessionKey, timeout)
+	// Wait on the execution this dispatch created, not on the session's global
+	// IDLE state: a session can read idle while the run we own is still going.
+	err = e.dispatcher.WaitForExecution(ctx, sessionKey, dispatch.ExecutionID, timeout)
 
 	if err != nil {
 		e.log.Error("cron executor: session execution failed",
@@ -208,16 +271,20 @@ func (e *Executor) Execute(
 		e.markOccurrence(ctx, occ, OccurrenceCompleted, "")
 	}
 
-	// Explicitly terminate the session to ensure the worker process exits immediately.
-	// We use context.Background() with a short timeout to ensure termination happens
-	// even if the original context is canceled.
+	e.terminateSession(sessionKey)
+
+	return out, err
+}
+
+// terminateSession ensures the worker process exits immediately. It uses a
+// background context with a short timeout so termination still happens even
+// when the original context is canceled.
+func (e *Executor) terminateSession(sessionKey string) {
 	termCtx, cancel := context.WithTimeout(context.Background(), base.GracefulShutdownTimeout)
 	defer cancel()
 	if termErr := e.sm.Transition(termCtx, sessionKey, events.StateTerminated); termErr != nil {
 		e.log.Warn("cron executor: failed to terminate session", "session_id", sessionKey, "err", termErr)
 	}
-
-	return out, err
 }
 
 // occurrenceEpoch derives a stable per-occurrence epoch for the session key.
@@ -254,39 +321,6 @@ func (e *Executor) resolveWorkDir(job *CronJob) string {
 			fmt.Sprintf("pr-review-%s/pr-%s", time.Now().Format("20060102"), prNum))
 	}
 	return job.WorkDir
-}
-
-func (e *Executor) waitForCompletion(ctx context.Context, sessionID string, timeout time.Duration) error {
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	// Initial check to avoid waiting for the first ticker tick if the task is near-instant.
-	si, err := e.sm.Get(timeoutCtx, sessionID)
-	if err == nil && si.State != events.StateRunning && si.State != events.StateCreated {
-		return nil
-	}
-
-	// 500ms provides a good balance between responsiveness and system overhead.
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeoutCtx.Done():
-			return fmt.Errorf("cron executor: timeout waiting for session %s: %w", sessionID, timeoutCtx.Err())
-		case <-ticker.C:
-			si, err := e.sm.Get(timeoutCtx, sessionID)
-			if err != nil {
-				e.log.Warn("cron executor: failed to check session state", "session_id", sessionID, "err", err)
-				continue
-			}
-			// IDLE means the worker finished this turn and is waiting.
-			// TERMINATED means the worker exited.
-			if si.State != events.StateRunning && si.State != events.StateCreated {
-				return nil
-			}
-		}
-	}
 }
 
 // HasCLIDelivery returns true if the job has sufficient platform info
