@@ -25,6 +25,7 @@ import (
 	"sync"
 
 	"github.com/hrygo/hotplex/internal/agentspec"
+	"github.com/hrygo/hotplex/internal/config"
 	"github.com/hrygo/hotplex/internal/worker"
 )
 
@@ -99,4 +100,36 @@ func (g *sharedRuntimeGuard) checkAndRecord(wt worker.WorkerType, profile string
 // passed through untouched (the mapper's ownership table).
 func applyAuthoritativePlan(spec agentspec.AgentSpec, info worker.SessionInfo) worker.SessionInfo {
 	return agentspec.MapToSessionInfo(spec, info)
+}
+
+// isolationShortfall names the required isolation dimensions the Worker's own
+// report does not prove.
+//
+// The bar is IsolationEnforced and nothing else. "Declared" means we asked;
+// "observed" means the backend described itself; "partial" means part of the
+// dimension is bounded. All three are weaker than a configuration that says
+// this dimension is required, and proceeding anyway would hand the operator a
+// guarantee they did not get.
+func isolationShortfall(
+	req config.IsolationRequirementConfig, report worker.IsolationReport,
+) []worker.IsolationDimension {
+	var missing []worker.IsolationDimension
+	if req.Filesystem && report.State(worker.IsolationFilesystem) != worker.IsolationEnforced {
+		missing = append(missing, worker.IsolationFilesystem)
+	}
+	if req.Network && report.State(worker.IsolationNetwork) != worker.IsolationEnforced {
+		missing = append(missing, worker.IsolationNetwork)
+	}
+	return missing
+}
+
+// isolationRefusal renders the bounded reason a launch was refused. It names
+// DIMENSIONS and their states only — never the evidence string, which is
+// backend-controlled text.
+func isolationRefusal(missing []worker.IsolationDimension, report worker.IsolationReport) string {
+	parts := make([]string, 0, len(missing))
+	for _, d := range missing {
+		parts = append(parts, string(d)+"="+string(report.State(d)))
+	}
+	return "required isolation not enforced: " + strings.Join(parts, ",")
 }

@@ -537,6 +537,21 @@ type WorkerConfig struct {
 	// any session — reporting a per-session env for those would be fiction.
 	EnvProfile   string   `mapstructure:"env_profile"`
 	EnvAllowKeys []string `mapstructure:"env_allow_keys"`
+	// RequireIsolation makes the gateway REFUSE a launch whose Worker cannot
+	// prove the named isolation dimensions (#946 E2).
+	//
+	// The bar is deliberately "enforced", not "declared". A configuration
+	// that asks for filesystem or network isolation and gets a Worker that can
+	// only claim it was requested has been given a weaker guarantee than it
+	// asked for, and quietly proceeding is how that becomes an incident.
+	RequireIsolation IsolationRequirementConfig `mapstructure:"require_isolation"`
+}
+
+// IsolationRequirementConfig names the isolation dimensions a Worker must be
+// able to prove before it may launch. An empty/false dimension is not required.
+type IsolationRequirementConfig struct {
+	Filesystem bool `mapstructure:"filesystem"`
+	Network    bool `mapstructure:"network"`
 }
 
 // RuntimePlanConfig controls how far the EffectiveRuntimePlan is trusted at

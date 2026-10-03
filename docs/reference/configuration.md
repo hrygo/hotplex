@@ -265,10 +265,14 @@ Worker 进程生命周期和环境配置。
 | `env_allow_keys` | string[] | `[]` | — | strict 模式下额外允许从宿主继承的变量名。这是**运维配置，不是客户端输入**：请求不得据此扩大宿主环境向 Worker 的泄漏面。blocklist 优先级更高，显式 block 不会被 allow 覆盖 |
 | `codex_cli.env_profile` / `codex_cli.env_allow_keys` | string / string[] | `compat` / `[]` | — | 同上，但作用于 **共享的 codex app-server 进程**。该进程服务多个会话，环境属于**进程**而非会话，因此配置挂在 Worker 自己的段上 |
 | `opencode_server.env_profile` / `opencode_server.env_allow_keys` | string / string[] | `compat` / `[]` | — | 同上，作用于共享的 `opencode serve` 进程 |
-
+| `require_isolation.filesystem` | bool | `false` | — | 要求 Worker 在启动前**证明**文件系统隔离，否则拒绝启动（#946 E2）。判定门槛是 `enforced`，不是 `declared`：`declared` 只说明「我们请求过」，`observed` 只说明「后端自述」，`partial` 说明只约束了一部分——都比要求的保证弱 |
+| `require_isolation.network` | bool | `false` | — | 同上，针对网络隔离。默认关闭：**不要求隔离时，未知（unknown）不会阻止启动**，因此仅启用 strict env 即可在没有 OS 隔离后端的主机上正常运行 |
 > 💡 **两个白名单都必须命中**：`authoritative` 需要「入口」与「Worker」同时在各自白名单内才生效。只配一侧的 rollout 会整体停留在 `shadow`，因此部分上线永远不会自称已完整上线。默认两个白名单都是空的，即使把 `mode` 写成 `authoritative`，也不会有任何组合真正切换。
 
 > ⚠️ **strict 环境不是隔离**。它只收窄**环境变量**，不提供文件系统或网络隔离。`strict` 下传入 `HOME` 也**不**意味着目录被隔离——那只是一个变量，Worker 仍可读取 OS 允许它读取的任何路径。隔离结论必须来自隔离能力报告（`declared` / `observed` / `enforced` / `partial` / `unavailable` / `unknown`），由实际后端证据产生，不能由 permission mode 或 env profile 推断。
+
+
+> 💡 **未知是合法答案**。Worker 通过可选接口 `IsolationReporter` 上报隔离能力；未实现该接口的 Worker 报告 `unknown`，而不是被推断为安全。空报告等同于「无法回答」，同样按 `unknown` 处理。`scope=process` 表示该边界属于共享进程——同一进程上的所有会话看到的是同一条边界，报告成 per-session 属于编造。
 
 **默认 environment**：
 

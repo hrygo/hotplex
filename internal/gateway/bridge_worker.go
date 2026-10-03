@@ -131,6 +131,29 @@ func (b *Bridge) createAndLaunchWorker(params workerLaunchParams, startFn worker
 		plan.Applied = true
 	}
 
+	// Isolation is asked of the WORKER, never inferred from what we requested.
+	// A configuration that requires a boundary the Worker cannot prove gets a
+	// refusal, not a launch with weaker guarantees than were asked for.
+	plan.Isolation = worker.ReportIsolation(params.ctx, w, params.workerInfo)
+	// The generic default report is scope-agnostic, so correct it here where
+	// the shared-process knowledge actually lives. For these Workers every
+	// session sits on the same process and therefore the same boundary; a
+	// per-session scope would be a claim about an environment that does not
+	// exist.
+	if _, shared := sharedProcessWorkers[params.wt]; shared {
+		plan.Isolation.Scope = worker.IsolationScopeProcess
+	}
+	if cfg := b.currentConfig(); cfg != nil {
+		if missing := isolationShortfall(cfg.Worker.RequireIsolation, plan.Isolation); len(missing) > 0 {
+			reason := isolationRefusal(missing, plan.Isolation)
+			_ = w.Terminate(context.Background())
+			if attachErrFn != nil {
+				attachErrFn(w, fmt.Errorf("%w: %s", ErrPlanLaunchRefused, reason))
+			}
+			return nil, fmt.Errorf("%w: %s", ErrPlanLaunchRefused, reason)
+		}
+	}
+
 	if err := b.sm.AttachWorker(params.ctx, sid, w); err != nil {
 		if attachErrFn != nil {
 			attachErrFn(w, err)

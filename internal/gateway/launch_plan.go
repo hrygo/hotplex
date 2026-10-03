@@ -81,6 +81,11 @@ type launchPlan struct {
 	// honest way for a caller to tell "the plan matched what launched anyway"
 	// from "the plan drove the launch".
 	Applied bool
+
+	// Isolation is what the Worker itself reported about its boundaries
+	// (#946 E2). It is evidence, not intent: nothing here is derived from the
+	// requested permission tier or from the env profile.
+	Isolation worker.IsolationReport
 }
 
 // Blocked reports whether the plan failed closed.
