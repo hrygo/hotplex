@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -962,6 +963,61 @@ func TestResetSession_ClearsPendingSupplements(t *testing.T) {
 	require.NoError(t, b.ResetSession(context.Background(), sid))
 	_, _, ok := b.pending.DrainAndMerge(sid)
 	require.False(t, ok, "reset must discard supplements from the old context")
+}
+
+// recordingQueueDispatcher records what the Bridge asks of the durable queue.
+type recordingQueueDispatcher struct {
+	mu         sync.Mutex
+	cleared    []string
+	dispatched []string
+	clearErr   error
+}
+
+func (d *recordingQueueDispatcher) DispatchQueued(_ context.Context, sessionID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.dispatched = append(d.dispatched, sessionID)
+}
+
+func (d *recordingQueueDispatcher) ClearSessionQueue(
+	_ context.Context, sessionID string,
+) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.cleared = append(d.cleared, sessionID)
+	return 1, d.clearErr
+}
+
+func (d *recordingQueueDispatcher) clearedSessions() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.cleared...)
+}
+
+// A reset establishes a NEW conversation context under the same session id.
+// An input still sitting undispatched belongs to the abandoned context and must
+// never be dispatched into the new one.
+//
+// This is asserted through ResetSession rather than against ClearSessionQueue
+// directly: the unit tests of the queue all invoke the store method themselves,
+// so nothing else would notice if the reset path stopped calling it at all.
+func TestResetSession_SettlesTheUndispatchedQueue(t *testing.T) {
+	t.Parallel()
+
+	sid := "session-reset-queue"
+	hub := newTestHub(t)
+	sm := new(mockBridgeSM)
+	w := &mockBridgeWorker{}
+	sm.On("GetWorker", sid).Return(w)
+	sm.On("Get", sid).Return(&session.SessionInfo{ID: sid, Platform: "webchat"}, nil)
+	b := NewBridge(BridgeDeps{Log: testLogger(t), Hub: hub, SM: sm})
+
+	dispatcher := &recordingQueueDispatcher{}
+	b.SetQueueDispatcher(dispatcher)
+
+	require.NoError(t, b.ResetSession(context.Background(), sid))
+	require.Equal(t, []string{sid}, dispatcher.clearedSessions(),
+		"reset must settle the undispatched queue, or an old input dispatches into the new context")
 }
 
 func TestResetSession_ReloadsAgentConfig(t *testing.T) {
