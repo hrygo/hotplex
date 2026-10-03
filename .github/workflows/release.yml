@@ -381,6 +381,12 @@ jobs:
           # parser — silently saw a workflow with no publish job.
           $config = "gateway:`n  addr: `"127.0.0.1:$env:PORT`""
           Set-Content -Path "$env:HOTPLEX_HOME\config.yaml" -Value $config -Encoding utf8
+          # Seed a database from BEFORE the bounded input queue existed, so
+          # startup runs the real upgrade instead of a fresh migration chain. A
+          # fresh database only proves the first-start path.
+          New-Item -ItemType Directory -Force -Path "$env:HOTPLEX_HOME\data" | Out-Null
+          Copy-Item -Path 'internal/session/testdata/pre-queue-036.db' `
+                     -Destination "$env:HOTPLEX_HOME\data\hotplex.db"
 
           $proc = Start-Process -FilePath $env:BINARY `
             -ArgumentList @('gateway', 'start', '--config', "$env:HOTPLEX_HOME\config.yaml") `
@@ -436,6 +442,13 @@ jobs:
           mkdir -p "$HOTPLEX_HOME"
           # An explicit config keeps the port off whatever the default is.
           printf 'gateway:\n  addr: "127.0.0.1:%s"\n' "$PORT" > "$HOTPLEX_HOME/config.yaml"
+          # Seed a database from BEFORE the bounded input queue existed, so
+          # startup runs the real upgrade instead of a fresh migration chain.
+          # A fresh database only ever proves the first-start path; this is the
+          # path an existing installation actually takes, and it is the reason
+          # the pre-migration fixture is committed.
+          mkdir -p "$HOTPLEX_HOME/data"
+          cp internal/session/testdata/pre-queue-036.db "$HOTPLEX_HOME/data/hotplex.db"
 
           "$BINARY" gateway start --config "$HOTPLEX_HOME/config.yaml" \
             >"$RUNNER_TEMP/out.log" 2>"$RUNNER_TEMP/err.log" &
