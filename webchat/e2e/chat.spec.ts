@@ -5,6 +5,7 @@ import {
     sentInputs,
     emitGatewayEvent,
     emitDone,
+    type InputOutcome,
     type MockGatewayWindow,
 } from "./fixtures/mock-gateway";
 
@@ -27,7 +28,7 @@ function sendButton(page: Page) {
 
 async function setNextInputOutcome(
     page: Page,
-    outcome: "delivered" | "unknown" | "failed",
+    outcome: InputOutcome,
 ) {
     await page.evaluate((nextOutcome) => {
         (window as unknown as MockGatewayWindow).__mockAEP.setNextInputOutcome(
@@ -168,6 +169,102 @@ test.describe("Chat Page", () => {
         await expect.poll(async () => (await sentInputs(page)).length).toBe(3);
         expect((await sentInputs(page))[2]?.event.data.content).toContain(
             "must stay behind the unknown turn",
+        );
+    });
+
+    test("keeps a durably accepted queue head in flight until delivered arrives", async ({
+        page,
+    }) => {
+        const input = composerInput(page);
+        await input.fill("first");
+        await input.press("Enter");
+        await expect.poll(async () => (await sentInputs(page)).length).toBe(1);
+
+        await input.fill("durable supplement");
+        await input.press("Enter");
+        const panel = page.getByRole("region", { name: "后续消息队列" });
+        await expect(panel).toContainText("durable supplement");
+        const assistantBodies = page.locator(".msg-assistant-body");
+        const bodiesBefore = await assistantBodies.count();
+
+        // The gateway durably accepted the drained follow-up but has NOT handed
+        // it to the Worker yet: `delivered` is still owed, so acceptance alone
+        // must not settle the turn.
+        await setNextInputOutcome(page, "queued");
+        await emitDone(page, "done-before-durable-ack");
+        await expect.poll(async () => (await sentInputs(page)).length).toBe(2);
+
+        // The turn keeps running: a new input queues behind it and no
+        // completion was invented for the merely accepted input.
+        await input.fill("behind a durable acceptance");
+        await input.press("Enter");
+        await expect(panel).toContainText("behind a durable acceptance");
+        await expect
+            .poll(async () => (await sentInputs(page)).length, {
+                timeout: 1_000,
+            })
+            .toBe(2);
+        expect(await assistantBodies.count()).toBe(bodiesBefore);
+
+        // The real terminal envelope still completes the turn and drains what
+        // followed — the intermediate acceptance did not wedge anything.
+        await emitDone(page, "done-after-durable-ack");
+        await expect.poll(async () => (await sentInputs(page)).length).toBe(3);
+        expect((await sentInputs(page))[2]?.event.data.content).toContain(
+            "behind a durable acceptance",
+        );
+        await expect(panel).toHaveCount(0);
+    });
+
+    test("releases a volatile supplement acceptance without faking a completion", async ({
+        page,
+    }) => {
+        const input = composerInput(page);
+        await input.fill("first");
+        await input.press("Enter");
+        await expect.poll(async () => (await sentInputs(page)).length).toBe(1);
+
+        await input.fill("buffered supplement");
+        await input.press("Enter");
+        const panel = page.getByRole("region", { name: "后续消息队列" });
+        await expect(panel).toContainText("buffered supplement");
+
+        const assistantBodies = page.locator(".msg-assistant-body");
+        const bodiesBefore = await assistantBodies.count();
+
+        // The gateway staged the drained follow-up in process memory: one
+        // volatile accepted receipt and NO delivered ever follows.
+        await setNextInputOutcome(page, "volatile");
+        await emitDone(page, "done-before-volatile-ack");
+        await expect.poll(async () => (await sentInputs(page)).length).toBe(2);
+
+        // The head-of-line item is released rather than left "sending"
+        // forever, and the receipt does not conjure another input.
+        await expect(panel).toHaveCount(0);
+        await expect
+            .poll(async () => (await sentInputs(page)).length, {
+                timeout: 1_000,
+            })
+            .toBe(2);
+
+        // Buffering is not a finished turn: the parent stays active, so a new
+        // input queues instead of dispatching, the transcript still shows the
+        // user message exactly once, and no assistant turn was invented.
+        await input.fill("after volatile accept");
+        await input.press("Enter");
+        await expect(panel).toContainText("after volatile accept");
+        expect(await sentInputs(page)).toHaveLength(2);
+        await expect(
+            page.getByText("buffered supplement", { exact: true }),
+        ).toHaveCount(1);
+        expect(await assistantBodies.count()).toBe(bodiesBefore);
+
+        // The real terminal envelope still ends the turn and drains what
+        // followed — the release did not wedge the queue.
+        await emitDone(page, "done-after-volatile-ack");
+        await expect.poll(async () => (await sentInputs(page)).length).toBe(3);
+        expect((await sentInputs(page))[2]?.event.data.content).toContain(
+            "after volatile accept",
         );
     });
 
