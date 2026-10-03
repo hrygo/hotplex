@@ -338,3 +338,22 @@ Tests: TestWebhookHandler_DeliveryIdentity (6 cases: uuid accepted, absent heade
 FLAKE FOUND AND FIXED IN MY OWN TEST, worth recording because the first full `make quality` run caught it: TestWebhookHandler_OneDeliverySeveralPRsGetDistinctIdentities originally asserted require.Equal on []string{"delivery-abc#7","delivery-abc#9"}. The two triggers are spawned as concurrent goroutines, so arrival order is undefined and the assertion failed roughly half the time. Changed to require.ElementsMatch. Verified with -count=25 -race on the two new specs (clean) and then a full `rtk proxy make quality` (exit 0, 61 packages ok).
 Note for future sessions: the pre-push hook is `make fmt && git diff --quiet`, so ANY uncommitted working-tree change fails it -- including this ledger file, which is tracked and force-added. Commit ledger edits before pushing.
 Verification: gofmt clean; go vet clean; golangci-lint 0 issues; full `rtk proxy make quality` exit 0; pre-push gate green.
+
+Task (2026-10-04, later still): fault-injection matrix audit (acceptance criterion 5, "故障注入...验证通过").
+Method: took the 10-row failure matrix in plan §7 and searched the suite for a test that actually exercises each window, rather than assuming the units that built the code also proved it. Nine rows mapped to existing tests. One did not.
+GAP FOUND AND CLOSED: "provider 回执成功、DB 写失败 -> 不重复send；reconcile原effect". The gateway half had no test at all, and the evidence that it was intended-but-never-written was sitting in the fake itself: fakeEffectStore had a completeErr injection field that no test ever set.
+What was already covered on this row: the store half. An effect left in-flight by a lost write-back is turned to unknown by expiry and is never returned as fresh work -- TestExpireLeases_BecomeUnknownNotSendable asserts recoverable is empty and the attempt is no longer in flight.
+What was added: TestDeliverEffect_LostWriteBackAfterSendSurfacesAndDoesNotResend (internal/gateway/effect_delivery_test.go) -- with the write-back failing, the provider is called exactly once, the error surfaces to the caller instead of being swallowed, no completion is persisted, and one occurrence still yields one effect.
+Ruling: verified the new test is not vacuous rather than trusting a green run. Temporarily mutated effect_delivery.go to swallow the CompleteSend error; the test failed immediately on "An error is expected but got nil"; the file was restored and git diff confirmed clean. This is the second time in this branch that an assertion I wrote was wrong (the first was the concurrent-arrival-order one) -- both were caught by running, not by reading.
+Full matrix, current mapping:
+1. crash before durable accept commits -> TestAcceptQueued_FailedTransactionLeavesNoReservation, TestPlanWithPayload_RollbackLeavesNeitherRow
+2. queued accepted, crash before dispatch -> TestQueuedExecution_SurvivesRestart, TestQueuedInputs_SurviveGatewayShutdown
+3. dispatch claimed, Worker response lost -> TestFaultInjection_LeaseExpiryConvergesToUnknownThenLateDoneRefines, TestExpireLeases_BecomeUnknownNotSendable
+4. effect planned committed, crash before send -> TestRecoverOnce_SendsWorkLeftBehindByARestart, TestListRecoverable_ReturnsOnlyUnsentWork
+5. provider succeeded, response lost -> TestDeliverEffect_UnprovableOutcomeIsRecordedAsUnknown, TestCompleteSend_RefusesUnknownOutcomes
+6. receipt succeeded, DB write failed -> TestDeliverEffect_LostWriteBackAfterSendSurfacesAndDoesNotResend (new) + TestExpireLeases_BecomeUnknownNotSendable
+7. stale owner write-back / replay after reset -> TestFaultInjection_StaleWorkerRunIDRejected, TestCompleteSend_ForgedTokenCannotWrite, TestFenceActionStaleVersionConflicts
+8. new owner races a late receipt -> TestFenceDecision_LateDoneAfterResolveConverges, TestPGMultiInstance_AbandonSurvivesLateDone
+9. queue/effect expiry races content GC -> TestQueuePayload_DiesWithItsControlFact, TestQueuePayload_ReportsMissingContentSeparately, TestQueuePayload_SessionDeleteRemovesContent, TestExpireQueued_SettlesPastTTLOnly
+10. strict singleton with an incompatible env -> TestSharedRuntimeGuard_RefusesIncompatibleProcessProfile, TestProcessScopedProfile_ExcludesPerSessionDecisions
+Verification: gofmt clean; `rtk proxy make quality` exit 0, 61 packages ok.

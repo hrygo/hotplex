@@ -546,3 +546,41 @@ func TestSelectFinalAssistantOutput(t *testing.T) {
 		})
 	}
 }
+
+// Fault window from the plan's failure matrix: the provider accepted the
+// message, but writing the receipt back failed. The message exists; the ledger
+// does not say so.
+//
+// This is the one window where the ledger's own write is what broke, so it is
+// the one place a retry would turn an honest unknown into a duplicate delivery.
+// The failure must surface to the caller, and the send must be treated as spent:
+// the store is left with the effect in-flight, which expiry turns to unknown and
+// never back to unsent work (internal/effect TestExpireLeases_BecomeUnknownNotSendable).
+func TestDeliverEffect_LostWriteBackAfterSendSurfacesAndDoesNotResend(t *testing.T) {
+	t.Parallel()
+
+	writeBackErr := errors.New("ledger write failed")
+	store := &fakeEffectStore{completeErr: writeBackErr}
+	sender := &recordingSender{result: messaging.SendResult{
+		Outcome:     messaging.SendAccepted,
+		ProviderRef: "C123.1700000000.001",
+	}}
+	d := newTestDeliverer(store, sender, "answer", nil)
+
+	err := d.DeliverEffect(context.Background(), testRequest())
+
+	// The caller is told the outcome could not be recorded. Swallowing this
+	// would let a scheduler treat the delivery as finished.
+	require.Error(t, err, "a lost write-back must surface, not be swallowed")
+	require.ErrorIs(t, err, writeBackErr)
+
+	// Exactly one send. Nothing in this path may re-enter the sender.
+	require.Len(t, sender.texts, 1, "the provider was called once and must stay called once")
+	require.Equal(t, []string{"answer"}, sender.texts)
+
+	// And nothing was recorded, which is precisely why it must not be read as
+	// delivered: the effect is still in-flight, not accepted.
+	require.Empty(t, store.completes,
+		"no completion was persisted; the effect must remain in-flight for expiry to fence")
+	require.Len(t, store.planned, 1, "one occurrence produces one effect, not a second one")
+}
