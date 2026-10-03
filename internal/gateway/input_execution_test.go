@@ -164,6 +164,28 @@ func (s *fakeExecutionStore) QueueDepth(context.Context) (int64, error) {
 	return 0, errFakeQueueUnsupported
 }
 
+func (s *fakeExecutionStore) ClaimQueued(
+	context.Context, execution.ClaimQueuedRequest,
+) (*execution.Record, *execution.QueueEntry, error) {
+	return nil, nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) CancelQueued(context.Context, string, string) (*execution.Record, error) {
+	return nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) ClearQueue(context.Context, string, string) (int64, error) {
+	return 0, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) ExpireQueued(context.Context, time.Time, int) ([]*execution.Record, error) {
+	return nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) QueueDepthBySession(context.Context, string) (int64, error) {
+	return 0, errFakeQueueUnsupported
+}
+
 func (s *fakeExecutionStore) snapshot() (execution.Status, string, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

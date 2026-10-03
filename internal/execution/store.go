@@ -6,6 +6,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // Status is the durable delivery state of an input execution.
@@ -105,6 +106,19 @@ var (
 	// bound. It is reported separately from ErrQueueFull because the fix is to
 	// send less, not to retry later.
 	ErrQueuePayloadTooLarge = errors.New("execution: queued payload exceeds the size limit")
+	// ErrQueueNotQueued means the execution is not an undispatched queue item,
+	// so a queued cancel cannot apply. It is a conflict, not a failure: the
+	// input already crossed the dispatch boundary and is governed by the
+	// unknown / fence rules instead.
+	ErrQueueNotQueued = errors.New("execution: execution is not queued")
+	// ErrQueueLifecycleStale means the queue entry belongs to an older session
+	// lifecycle than the dispatcher holds. Dispatching it would resurrect a
+	// turn from before a /reset or a delete.
+	ErrQueueLifecycleStale = errors.New("execution: queue entry is from an older session lifecycle")
+	// ErrQueueHeadMoved means another dispatcher claimed or settled the queue
+	// head between the caller reading it and claiming it. The caller must
+	// re-read and re-validate rather than dispatching an item it never checked.
+	ErrQueueHeadMoved = errors.New("execution: queue head changed since it was read")
 )
 
 // Record is the secret-free durable representation of an input delivery.
@@ -268,4 +282,35 @@ type Store interface {
 	// It is read from the queue itself rather than from a maintained counter,
 	// so no delete path can leak capacity by forgetting to report.
 	QueueDepth(ctx context.Context) (int64, error)
+
+	// ClaimQueued promotes the session's queue head to pending and takes the
+	// owner lease, in one transaction. That transition is the dispatch
+	// boundary: past it, a lost response is unknown plus a fence, never a
+	// silent resend.
+	//
+	// ErrNotFound means the queue is empty, ErrSessionBusy means the single
+	// active slot is taken (the item stays queued for a later attempt), and
+	// ErrQueueLifecycleStale means the item belongs to a superseded lifecycle.
+	ClaimQueued(ctx context.Context, request ClaimQueuedRequest) (*Record, *QueueEntry, error)
+
+	// CancelQueued settles one undispatched input as failed with the given
+	// bounded reason (QUEUE_CANCELLED, QUEUE_EXPIRED, ...). It refuses with
+	// ErrQueueNotQueued once the item has been dispatched: pretending a running
+	// input never ran would be a lie, so the caller must use the ordinary stop
+	// path instead.
+	CancelQueued(ctx context.Context, executionID, reason string) (*Record, error)
+
+	// ClearQueue settles every undispatched input for a session. It is what
+	// /reset and session delete call: a queue belonging to a turn the user
+	// abandoned must not dispatch afterwards. Returns the number settled.
+	ClearQueue(ctx context.Context, sessionID, reason string) (int64, error)
+
+	// ExpireQueued settles undispatched inputs whose TTL has elapsed, oldest
+	// first, up to limit. A queued input that waited longer than its bound is
+	// no longer what the user asked for, so it is settled rather than sent.
+	ExpireQueued(ctx context.Context, now time.Time, limit int) ([]*Record, error)
+
+	// QueueDepthBySession returns the number of undispatched inputs for one
+	// session.
+	QueueDepthBySession(ctx context.Context, sessionID string) (int64, error)
 }

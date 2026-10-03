@@ -105,6 +105,35 @@ type QueueEntry struct {
 	PayloadBytes      int64
 }
 
+// Bounded reasons a queued input can be settled without ever reaching a
+// worker. They are deliberately distinct from any runtime failure code: an
+// input that was cancelled or expired never ran, and a console that reports it
+// as "the worker failed" is describing an event that did not happen.
+const (
+	QueueReasonCancelled = "QUEUE_CANCELLED"
+	QueueReasonExpired   = "QUEUE_EXPIRED"
+)
+
+// ClaimQueuedRequest promotes one queued input to the dispatch boundary.
+type ClaimQueuedRequest struct {
+	SessionID       string
+	OwnerInstanceID string
+	// WorkerRunID is the run that will carry the input. It is recorded at the
+	// same moment as the pending transition so a terminal event can be
+	// correlated to the run that produced it.
+	WorkerRunID string
+	// LifecycleRevision, when positive, must equal the queue entry's revision.
+	// Zero skips the check for callers that already validated it.
+	LifecycleRevision int64
+	// ExpectedExecutionID, when set, must still be the queue head. A
+	// dispatcher validates an item BEFORE claiming it (permission, skill
+	// capability, session ownership); without this the atomic claim could
+	// promote a different item than the one that was actually checked.
+	ExpectedExecutionID string
+	// LeaseTTLSeconds overrides LeaseTTL when positive.
+	LeaseTTLSeconds int64
+}
+
 // IsQueued reports whether a record is durably accepted and awaiting dispatch.
 // It is deliberately not "not yet running": an accepted record that already
 // crossed the dispatch boundary is pending and is governed by the unknown /
