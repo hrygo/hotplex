@@ -39,6 +39,13 @@ type Store interface {
 	// while the effect intent was not, and the text to send is recovered from
 	// here rather than by running the Agent again.
 	GetPayloadForExecution(ctx context.Context, occurrenceID, executionID string) (*Payload, error)
+	// ClaimSend makes one caller the owner of the next send attempt. Exactly
+	// one caller can win it, which is what stops two instances recovering the
+	// same occurrence from both sending.
+	ClaimSend(ctx context.Context, req ClaimRequest) (*Effect, error)
+	// CompleteSend records the typed outcome of an attempt the caller owns. A
+	// caller that no longer owns it gets ErrLeaseLost and must re-read.
+	CompleteSend(ctx context.Context, c Completion) error
 }
 
 const effectColumns = `effect_id, occurrence_id, delivery_ordinal, target_revision, attempt,

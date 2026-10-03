@@ -175,16 +175,25 @@ type Occurrence struct {
 	SourceID      string
 	SessionID     string
 	ExecutionID   string
-	Status        OccurrenceStatus
-	ErrorCode     string
-	CreatedAtMs   int64
-	UpdatedAtMs   int64
-	StartedAtMs   *int64
-	FinishedAtMs  *int64
+	// DeliveryMode is the owner recorded when this occurrence was claimed.
+	// It is a fact about THIS firing: changing the job's mode later cannot
+	// retroactively hand an in-flight run to a different owner.
+	DeliveryMode DeliveryMode
+	Status       OccurrenceStatus
+	ErrorCode    string
+	CreatedAtMs  int64
+	UpdatedAtMs  int64
+	StartedAtMs  *int64
+	FinishedAtMs *int64
 }
 
-// NewOccurrence builds an accepted occurrence from a trigger identity.
-func NewOccurrence(identity TriggerIdentity, now time.Time) (*Occurrence, error) {
+// NewOccurrence builds an accepted occurrence from a trigger identity and the
+// delivery owner resolved for this firing.
+//
+// The mode is resolved by the caller and recorded here, so the occurrence
+// carries the owner this run actually started under rather than whatever the
+// job says later.
+func NewOccurrence(identity TriggerIdentity, mode DeliveryMode, now time.Time) (*Occurrence, error) {
 	key, err := identity.Key()
 	if err != nil {
 		return nil, err
@@ -199,6 +208,7 @@ func NewOccurrence(identity TriggerIdentity, now time.Time) (*Occurrence, error)
 		ScheduledAtMs: identity.ScheduledAtMs,
 		Nonce:         identity.Nonce,
 		SourceID:      identity.SourceID,
+		DeliveryMode:  ResolveDeliveryMode(mode),
 		Status:        OccurrenceAccepted,
 		CreatedAtMs:   now.UnixMilli(),
 		UpdatedAtMs:   now.UnixMilli(),
@@ -227,7 +237,7 @@ type OccurrenceStore interface {
 
 const occurrenceColumns = `occurrence_id, trigger_key, generation, job_id, trigger_kind,
 		schedule_rev, scheduled_at_ms, nonce, source_id, session_id, execution_id,
-		status, error_code, created_at, updated_at, started_at, finished_at`
+		delivery_mode, status, error_code, created_at, updated_at, started_at, finished_at`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -242,7 +252,7 @@ func scanOccurrence(row rowScanner) (*Occurrence, error) {
 	err := row.Scan(
 		&occ.OccurrenceID, &occ.TriggerKey, &occ.Generation, &occ.JobID, &occ.TriggerKind,
 		&occ.ScheduleRev, &occ.ScheduledAtMs, &occ.Nonce, &occ.SourceID,
-		&occ.SessionID, &occ.ExecutionID, &occ.Status, &occ.ErrorCode,
+		&occ.SessionID, &occ.ExecutionID, &occ.DeliveryMode, &occ.Status, &occ.ErrorCode,
 		&occ.CreatedAtMs, &occ.UpdatedAtMs, &startedAt, &doneAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -286,6 +296,7 @@ func (s *SQLiteOccurrenceStore) Claim(
 ) (*Occurrence, bool, error) {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()
+	normalizeOccurrenceMode(occ)
 
 	var (
 		stored  *Occurrence
@@ -293,11 +304,11 @@ func (s *SQLiteOccurrenceStore) Claim(
 	)
 	err := s.writeMu.WithLock(func() error {
 		res, err := s.db.ExecContext(ctx, `INSERT INTO cron_occurrences (`+occurrenceColumns+`)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(trigger_key, generation) DO NOTHING`,
 			occ.OccurrenceID, occ.TriggerKey, occ.Generation, occ.JobID, occ.TriggerKind,
 			occ.ScheduleRev, occ.ScheduledAtMs, occ.Nonce, occ.SourceID,
-			occ.SessionID, occ.ExecutionID, occ.Status, occ.ErrorCode,
+			occ.SessionID, occ.ExecutionID, occ.DeliveryMode, occ.Status, occ.ErrorCode,
 			occ.CreatedAtMs, occ.UpdatedAtMs, occ.StartedAtMs, occ.FinishedAtMs,
 		)
 		if err != nil {
@@ -318,6 +329,19 @@ func (s *SQLiteOccurrenceStore) Claim(
 		return nil, false, err
 	}
 	return stored, created, nil
+}
+
+// normalizeOccurrenceMode resolves the delivery owner at the persistence
+// boundary.
+//
+// The column is constrained, and a zero-valued Occurrence built by hand would
+// otherwise fail the write with a bare constraint error. Normalizing here
+// means the stored fact is always one the rest of the pipeline can read,
+// whoever constructed the value.
+func normalizeOccurrenceMode(occ *Occurrence) {
+	if occ != nil {
+		occ.DeliveryMode = ResolveDeliveryMode(occ.DeliveryMode)
+	}
 }
 
 func (s *SQLiteOccurrenceStore) Get(

@@ -28,7 +28,7 @@ func newOccurrenceStore(t *testing.T) *SQLiteOccurrenceStore {
 	_, err = db.Exec(`PRAGMA busy_timeout=5000`)
 	require.NoError(t, err)
 
-	// Mirrors goose migration 033 (SQLite dialect).
+	// Mirrors goose migrations 033 + 035 (SQLite dialect).
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS cron_occurrences (
 			occurrence_id   TEXT PRIMARY KEY,
@@ -42,6 +42,8 @@ func newOccurrenceStore(t *testing.T) *SQLiteOccurrenceStore {
 			source_id       TEXT NOT NULL DEFAULT '',
 			session_id      TEXT NOT NULL DEFAULT '',
 			execution_id    TEXT NOT NULL DEFAULT '',
+			delivery_mode   TEXT NOT NULL DEFAULT 'legacy_cli'
+			                CHECK(delivery_mode IN ('legacy_cli', 'gateway')),
 			status          TEXT NOT NULL CHECK(status IN ('accepted', 'started', 'completed', 'failed', 'unknown')),
 			error_code      TEXT NOT NULL DEFAULT '',
 			created_at      INTEGER NOT NULL,
@@ -172,7 +174,7 @@ func TestOccurrenceClaimDeduplicatesSameTrigger(t *testing.T) {
 		ScheduledAtMs: 1_700_000_000_000,
 	}
 
-	first, err := NewOccurrence(identity, time.UnixMilli(1_700_000_000_000))
+	first, err := NewOccurrence(identity, DeliveryModeLegacyCLI, time.UnixMilli(1_700_000_000_000))
 	require.NoError(t, err)
 	stored, created, err := store.Claim(ctx, first)
 	require.NoError(t, err)
@@ -181,7 +183,7 @@ func TestOccurrenceClaimDeduplicatesSameTrigger(t *testing.T) {
 
 	// A repeated trigger of the same firing resolves to the same occurrence
 	// instead of producing a second run.
-	second, err := NewOccurrence(identity, time.UnixMilli(1_700_000_000_500))
+	second, err := NewOccurrence(identity, DeliveryModeLegacyCLI, time.UnixMilli(1_700_000_000_500))
 	require.NoError(t, err)
 	stored2, created2, err := store.Claim(ctx, second)
 	require.NoError(t, err)
@@ -199,7 +201,7 @@ func TestOccurrenceRerunUsesExplicitGeneration(t *testing.T) {
 		ScheduledAtMs: 1_700_000_000_000,
 	}
 
-	original, err := NewOccurrence(identity, time.Now())
+	original, err := NewOccurrence(identity, DeliveryModeLegacyCLI, time.Now())
 	require.NoError(t, err)
 	_, created, err := store.Claim(ctx, original)
 	require.NoError(t, err)
@@ -207,7 +209,7 @@ func TestOccurrenceRerunUsesExplicitGeneration(t *testing.T) {
 
 	// An operator rerun keeps the trigger key but advances the generation, so
 	// it is an explicit new run rather than a mutated idempotency key.
-	rerun, err := NewOccurrence(identity, time.Now())
+	rerun, err := NewOccurrence(identity, DeliveryModeLegacyCLI, time.Now())
 	require.NoError(t, err)
 	rerun.Generation = 1
 	stored, created, err := store.Claim(ctx, rerun)
@@ -239,7 +241,7 @@ func TestOccurrenceClaimIsAtomicUnderConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			occ, err := NewOccurrence(identity, time.Now())
+			occ, err := NewOccurrence(identity, DeliveryModeLegacyCLI, time.Now())
 			if err != nil {
 				mu.Lock()
 				claimErrs = append(claimErrs, err)
@@ -274,7 +276,7 @@ func TestOccurrenceUpdateStatusStampsLifecycle(t *testing.T) {
 	identity := TriggerIdentity{
 		Kind: TriggerWebhook, JobID: "job-1", SourceID: "evt-1",
 	}
-	occ, err := NewOccurrence(identity, time.UnixMilli(1_700_000_000_000))
+	occ, err := NewOccurrence(identity, DeliveryModeLegacyCLI, time.UnixMilli(1_700_000_000_000))
 	require.NoError(t, err)
 	_, created, err := store.Claim(ctx, occ)
 	require.NoError(t, err)
@@ -327,7 +329,7 @@ func TestOccurrenceListByJobNewestFirst(t *testing.T) {
 		occ, err := NewOccurrence(TriggerIdentity{
 			Kind: TriggerScheduled, JobID: "job-1", ScheduleRev: "rev1",
 			ScheduledAtMs: instant,
-		}, time.UnixMilli(instant))
+		}, DeliveryModeLegacyCLI, time.UnixMilli(instant))
 		require.NoError(t, err)
 		_ = i
 		_, _, err = store.Claim(ctx, occ)
@@ -338,7 +340,7 @@ func TestOccurrenceListByJobNewestFirst(t *testing.T) {
 	other, err := NewOccurrence(TriggerIdentity{
 		Kind: TriggerScheduled, JobID: "job-2", ScheduleRev: "rev1",
 		ScheduledAtMs: 1_700_000_999_000,
-	}, time.UnixMilli(1_700_000_999_000))
+	}, DeliveryModeLegacyCLI, time.UnixMilli(1_700_000_999_000))
 	require.NoError(t, err)
 	_, _, err = store.Claim(ctx, other)
 	require.NoError(t, err)
@@ -355,7 +357,8 @@ func TestOccurrenceClaimRejectsIncompleteIdentity(t *testing.T) {
 
 	// An incomplete identity must fail before it can reach the store, so no
 	// weak key is ever persisted.
-	_, err := NewOccurrence(TriggerIdentity{Kind: TriggerWebhook, JobID: "job-1"},
+	_, err := NewOccurrence(TriggerIdentity{Kind: TriggerWebhook, JobID: "job-1"}, DeliveryModeLegacyCLI,
 		time.Now())
+
 	require.ErrorIs(t, err, ErrTriggerIdentityIncomplete)
 }

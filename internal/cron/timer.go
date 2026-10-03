@@ -225,11 +225,53 @@ func (s *Scheduler) executeJob(job *CronJob, trigger TriggerIdentity) {
 		return
 	}
 
-	// Deliver results for successful isolated_session runs.
-	if s.delivery != nil && !job.Silent && !HasCLIDelivery(job) {
+	s.routeDelivery(job, result)
+	s.applyLifecycle(job)
+}
+
+// routeDelivery hands a completed run's result to exactly one owner.
+//
+// The owner comes from the occurrence, not from the job's current field: a
+// mode edited mid-run must not move an in-flight result to a different owner,
+// and the two owners are mutually exclusive so a result is never delivered
+// twice.
+func (s *Scheduler) routeDelivery(job *CronJob, result ExecuteResult) {
+	if job.Silent {
+		return
+	}
+
+	if result.DeliveryMode == DeliveryModeGateway {
+		if s.effectDelivery == nil {
+			// Refusing loudly is the point: silently falling back to the
+			// legacy path would drop the guarantee the operator asked for.
+			s.log.Error("cron: gateway delivery mode without a delivery owner",
+				"job_id", job.ID, "name", job.Name, "occurrence_id", result.OccurrenceID)
+			observability.CronDeliveryRetry().Add(s.ctx, 1,
+				metric.WithAttributes(
+					attribute.String("status", "no_owner"),
+					attribute.String("platform", job.Platform),
+				))
+			return
+		}
+		if err := s.effectDelivery.DeliverEffect(s.ctx, EffectDeliveryRequest{
+			JobID:        job.ID,
+			JobName:      job.Name,
+			OccurrenceID: result.OccurrenceID,
+			SessionID:    result.SessionID,
+			ExecutionID:  result.ExecutionID,
+			Platform:     job.Platform,
+			PlatformKey:  job.PlatformKey,
+		}); err != nil {
+			s.log.Error("cron: gateway delivery failed",
+				"job_id", job.ID, "name", job.Name,
+				"occurrence_id", result.OccurrenceID, "err", err)
+		}
+		return
+	}
+
+	if s.delivery != nil && !HasCLIDelivery(job) {
 		s.delivery.Deliver(s.ctx, job, result.SessionID)
 	}
-	s.applyLifecycle(job)
 }
 
 // executeAttached handles attached_session payload jobs.

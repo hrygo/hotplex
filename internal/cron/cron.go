@@ -18,10 +18,13 @@ var ErrJobDisabled = errors.New("cron: job is disabled")
 
 // Scheduler manages cron job lifecycle: loading, scheduling, execution, and shutdown.
 type Scheduler struct {
-	log             *slog.Logger
-	store           Store
-	executor        *Executor
-	delivery        *Delivery
+	log      *slog.Logger
+	store    Store
+	executor *Executor
+	delivery *Delivery
+	// effectDelivery is the gateway-owned delivery path. It is used only for
+	// jobs whose occurrence recorded DeliveryModeGateway.
+	effectDelivery  EffectDelivery
 	attachedHandler *AttachedSessionHandler
 	maxConcurrent   int
 	maxJobs         int
@@ -65,6 +68,7 @@ type Deps struct {
 	Bridge         BridgeStarter
 	SessionMgr     SessionStateChecker
 	Delivery       *Delivery
+	EffectDelivery EffectDelivery
 	AttachedRouter AttachedSessionRouter
 	YAMLDefs       []YAMLJobDef
 	Cfg            Config
@@ -83,12 +87,13 @@ func New(deps Deps) *Scheduler {
 	}
 
 	s := &Scheduler{
-		log:           deps.Log.With("component", "cron"),
-		store:         deps.Store,
-		maxConcurrent: maxConcurrent,
-		maxJobs:       maxJobs,
-		delivery:      deps.Delivery,
-		jobs:          make(map[string]*CronJob),
+		log:            deps.Log.With("component", "cron"),
+		store:          deps.Store,
+		maxConcurrent:  maxConcurrent,
+		maxJobs:        maxJobs,
+		delivery:       deps.Delivery,
+		effectDelivery: deps.EffectDelivery,
+		jobs:           make(map[string]*CronJob),
 	}
 	defaultTimeout := 5 * time.Minute
 	if deps.Cfg.DefaultTimeoutSec > 0 {

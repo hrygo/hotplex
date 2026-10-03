@@ -107,6 +107,12 @@ type ExecuteResult struct {
 	SessionID string
 	// OccurrenceID is the durable occurrence for this firing.
 	OccurrenceID string
+	// ExecutionID is the durable execution that ran this prompt. It is empty
+	// when no dispatch happened.
+	ExecutionID string
+	// DeliveryMode is the owner recorded on the occurrence. The scheduler
+	// routes delivery by this fact, not by the job's current setting.
+	DeliveryMode DeliveryMode
 	// Duplicate is true when the trigger had already been claimed, so no new
 	// Agent run was started.
 	Duplicate bool
@@ -129,11 +135,16 @@ func (e *Executor) Execute(
 	var out ExecuteResult
 
 	now := e.now()
-	occ, err := NewOccurrence(trigger, now)
+	// The delivery owner is resolved once, here, and recorded on the
+	// occurrence. Everything downstream — whether the prompt carries a CLI
+	// send instruction, and who sends the answer — follows that one fact.
+	mode := ResolveDeliveryMode(job.DeliveryMode)
+	occ, err := NewOccurrence(trigger, mode, now)
 	if err != nil {
 		return out, fmt.Errorf("cron executor: build occurrence: %w", err)
 	}
 	out.OccurrenceID = occ.OccurrenceID
+	out.DeliveryMode = occ.DeliveryMode
 
 	if e.occurrences != nil {
 		stored, created, err := e.occurrences.Claim(ctx, occ)
@@ -145,6 +156,7 @@ func (e *Executor) Execute(
 		}
 		occ = stored
 		out.OccurrenceID = stored.OccurrenceID
+		out.DeliveryMode = stored.DeliveryMode
 		if !created {
 			// Already claimed. Returning the recorded identity lets the caller
 			// report the original run instead of executing a second one.
@@ -226,7 +238,12 @@ func (e *Executor) Execute(
 	}
 
 	prompt := buildWebhookPrefix(job) + formatJobPrompt(job, e.now())
-	prompt += buildDeliverySuffix(job)
+	if mode == DeliveryModeLegacyCLI {
+		// In gateway mode the Agent must NOT be told to send the result: the
+		// gateway owns delivery, and leaving the instruction in place would
+		// create exactly the double delivery this mode exists to prevent.
+		prompt += buildDeliverySuffix(job)
+	}
 
 	if e.dispatcher == nil {
 		e.markOccurrence(ctx, occ, OccurrenceFailed, "DISPATCHER_UNAVAILABLE")
@@ -242,6 +259,7 @@ func (e *Executor) Execute(
 		e.markOccurrence(ctx, occ, OccurrenceFailed, "WORKER_INPUT_FAILED")
 		return out, fmt.Errorf("cron executor: dispatch system input: %w", err)
 	}
+	out.ExecutionID = dispatch.ExecutionID
 	if dispatch.Duplicate {
 		// The occurrence is new but the execution ledger already owns this
 		// identity, so no second dispatch happens and the run is already

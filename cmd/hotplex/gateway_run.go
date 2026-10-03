@@ -344,6 +344,11 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 	var cronScheduler *cron.Scheduler
 	var cronDelivery *cron.Delivery
 	var cronAttRouter *cronAttachedRouter
+	// cronEffectOwners resolves the delivery owner for gateway-mode cron jobs.
+	// It is created before the adapters start and populated afterwards, because
+	// the scheduler is wired earlier than the messaging adapters.
+	cronEffectOwners := &adapterLookup{}
+	var cronEffectDelivery cron.EffectDelivery
 	// bridge is forward-declared (and assigned later at NewBridge) so this
 	// closure can clear busy-supplement buffers on session end. Mirrors the
 	// existing cronScheduler pattern. Nil before assignment — ClearPending is
@@ -688,6 +693,7 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 
 	// Cron scheduler: init after Bridge, before messaging adapters.
 	if cfg.Cron.Enabled {
+		cronEffectDelivery = newCronEffectDelivery(log, stores, ownerInstanceID, cronEffectOwners)
 		var cronStore cron.Store
 		if stores.cron != nil {
 			cronStore = stores.cron
@@ -727,6 +733,7 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 			Bridge:         bridge,
 			SessionMgr:     sm,
 			Delivery:       cronDelivery,
+			EffectDelivery: cronEffectDelivery,
 			AttachedRouter: cronAttRouter,
 			YAMLDefs:       cronConfigToYAMLDefs(cfg.Cron.Jobs),
 			Cfg: cron.Config{
@@ -860,6 +867,7 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 
 	msgAdapters, adapterStatuses := startMessagingAdapters(ctx, deps)
 	lifecycleBroadcaster := newLifecycleBroadcaster(deps)
+	cronEffectOwners.set(msgAdapters...)
 
 	// Wire cron delivery to platform adapters.
 	if cronDelivery != nil {

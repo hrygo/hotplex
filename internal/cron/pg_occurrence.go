@@ -30,14 +30,15 @@ func (s *pgOccurrenceStore) Claim(
 ) (*Occurrence, bool, error) {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()
+	normalizeOccurrenceMode(occ)
 
 	query := s.dialect.Rebind(`INSERT INTO cron_occurrences (` + occurrenceColumns + `)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(trigger_key, generation) DO NOTHING`)
 	res, err := s.db.ExecContext(ctx, query,
 		occ.OccurrenceID, occ.TriggerKey, occ.Generation, occ.JobID, occ.TriggerKind,
 		occ.ScheduleRev, occ.ScheduledAtMs, occ.Nonce, occ.SourceID,
-		occ.SessionID, occ.ExecutionID, occ.Status, occ.ErrorCode,
+		occ.SessionID, occ.ExecutionID, occ.DeliveryMode, occ.Status, occ.ErrorCode,
 		occ.CreatedAtMs, occ.UpdatedAtMs, occ.StartedAtMs, occ.FinishedAtMs,
 	)
 	if err != nil {
