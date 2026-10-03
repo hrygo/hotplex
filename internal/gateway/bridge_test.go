@@ -994,6 +994,12 @@ func (d *recordingQueueDispatcher) clearedSessions() []string {
 	return append([]string(nil), d.cleared...)
 }
 
+func (d *recordingQueueDispatcher) dispatchedSessions() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.dispatched...)
+}
+
 // A reset establishes a NEW conversation context under the same session id.
 // An input still sitting undispatched belongs to the abandoned context and must
 // never be dispatched into the new one.

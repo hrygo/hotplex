@@ -368,3 +368,13 @@ Added TestResetSession_SettlesTheUndispatchedQueue plus a recordingQueueDispatch
 Ruling: verified the new test is not vacuous, same as last time. Deleted the ClearSessionQueue call from ResetSession; the test failed immediately; bridge.go restored and git diff confirmed clean. That is three consecutive times on this branch that a green run did not mean the assertion was correct -- checking by mutation is now the habit, not the exception.
 Noted for later: DispatchQueued (bridge.go:428) is the other half of the same seam and is also untested at the bridge level. Left alone deliberately -- proving it needs a real execution store and a released gate, which is a larger harness than this seam warranted. Flagged rather than silently skipped.
 Verification: gofmt clean; `rtk proxy make quality` exit 0, 61 packages ok; TestResetSession_* green under -race.
+
+Task (2026-10-04, same session, continued): closed the OTHER half of the Bridge-to-queue seam that the previous entry flagged rather than skipped.
+Both trigger points of dispatchQueued were untested at the bridge level:
+- bridge_forward.go:696 -- the normal path, a terminal runtime event releasing the active gate.
+- bridge.go:519 HandleRepairSuccess -- the gate released later, after a failed durable terminal write is repaired.
+Added TestTerminalTurnWakesTheDurableQueue with two subtests, one per call site, plus a dispatchedSessions() accessor on the recording mock.
+Ruling: the repair subtest asserts the negative first (require.Never: with the durable write failed, nothing may be promoted), then the positive after HandleRepairSuccess. Asserting only the positive would pass just as well if the gate had never been held in the first place.
+Ruling: verified by mutation again, and this time the mutation discriminated. Removing the bridge_forward.go:696 call failed subtest 1 ("Condition never satisfied") while subtest 2 stayed green, because it reaches a different call site -- which is the evidence that the two cases really do cover two distinct paths rather than one path twice. File restored, git diff clean, both cases green at -count=3.
+Closing note on this seam: with this commit, every production call site of SetQueueDispatcher's two methods has a test that fails when the call is removed. That is the bar the fault-matrix audit and the criterion-2 audit were both missing.
+Verification: gofmt clean; `rtk proxy make quality` exit 0, 61 packages ok.
