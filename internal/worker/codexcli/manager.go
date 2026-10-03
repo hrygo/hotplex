@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/hrygo/hotplex/internal/config"
-	"github.com/hrygo/hotplex/internal/worker"
 	"github.com/hrygo/hotplex/internal/worker/base"
 	"github.com/hrygo/hotplex/internal/worker/proc"
 	"github.com/hrygo/hotplex/pkg/events"
@@ -1512,7 +1511,10 @@ func (m *CodexAppServerManager) KillIfIdle() {
 }
 
 func (m *CodexAppServerManager) buildEnv() []string {
-	return base.BuildEnv(worker.SessionInfo{}, EnvBlocklist, "codex-app-server")
+	// Process-scoped: one app-server serves every codex_cli session, so the
+	// profile comes from the worker config rather than from any session.
+	return base.BuildProcessEnv(
+		m.cfg.EnvProfile, m.cfg.EnvAllowKeys, EnvBlocklist, "codex-app-server")
 }
 
 var _ interface{ IsRunning() bool } = (*CodexAppServerManager)(nil)

@@ -261,8 +261,14 @@ Worker 进程生命周期和环境配置。
 | `runtime_plan.mode` | string | `shadow` | — | EffectiveRuntimePlan 在启动路径上的信任级别（#946 D2/D3）。`shadow` = 解析计划、绑定到本次 Worker run 并与实际启动参数做字段级 parity 对比，但**不改变任何启动行为**；`authoritative` = 由计划驱动启动，且仅对下面两个白名单同时命中的「入口 × Worker」组合生效。任何其他值（含缺省）一律按 `shadow` 处理，绝不解读为 authoritative |
 | `runtime_plan.authoritative_entries` | string[] | `[]` | — | 允许由计划驱动启动的入口类型：`webchat` / `messaging` / `cron`。为空表示**没有任何入口**处于 authoritative |
 | `runtime_plan.authoritative_workers` | string[] | `[]` | — | 允许由计划驱动启动的 Worker 类型：`claude_code` / `codex_cli` / `opencode_server` / `acp`。为空表示**没有任何 Worker**处于 authoritative |
+| `env_profile` | string | `compat` | — | Worker 子进程环境的构建方式（#946 E）。`compat` = 沿用现状：继承宿主环境并减去 blocklist（denylist 只能拦住已被枚举的变量）。`strict` = 反转：从**按 OS 的最小系统白名单**开始，只接受显式注入的变量。任何其他取值（含缺省）一律按 `compat` 处理，绝不解读为 strict |
+| `env_allow_keys` | string[] | `[]` | — | strict 模式下额外允许从宿主继承的变量名。这是**运维配置，不是客户端输入**：请求不得据此扩大宿主环境向 Worker 的泄漏面。blocklist 优先级更高，显式 block 不会被 allow 覆盖 |
+| `codex_cli.env_profile` / `codex_cli.env_allow_keys` | string / string[] | `compat` / `[]` | — | 同上，但作用于 **共享的 codex app-server 进程**。该进程服务多个会话，环境属于**进程**而非会话，因此配置挂在 Worker 自己的段上 |
+| `opencode_server.env_profile` / `opencode_server.env_allow_keys` | string / string[] | `compat` / `[]` | — | 同上，作用于共享的 `opencode serve` 进程 |
 
 > 💡 **两个白名单都必须命中**：`authoritative` 需要「入口」与「Worker」同时在各自白名单内才生效。只配一侧的 rollout 会整体停留在 `shadow`，因此部分上线永远不会自称已完整上线。默认两个白名单都是空的，即使把 `mode` 写成 `authoritative`，也不会有任何组合真正切换。
+
+> ⚠️ **strict 环境不是隔离**。它只收窄**环境变量**，不提供文件系统或网络隔离。`strict` 下传入 `HOME` 也**不**意味着目录被隔离——那只是一个变量，Worker 仍可读取 OS 允许它读取的任何路径。隔离结论必须来自隔离能力报告（`declared` / `observed` / `enforced` / `partial` / `unavailable` / `unknown`），由实际后端证据产生，不能由 permission mode 或 env profile 推断。
 
 **默认 environment**：
 

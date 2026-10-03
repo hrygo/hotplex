@@ -1575,6 +1575,15 @@ func (b *Bridge) buildWorkerInfo(sessionID, userID, workDir string, si *session.
 		// into PlatformKey for this wiring to take effect; tracked in UX follow-up.
 	}
 
+	// Environment profile (#946 E). Read from the LIVE config on every launch
+	// so a hot-reload takes effect at the next start rather than being frozen
+	// at gateway boot. Shared-process Workers take their profile from their own
+	// worker config instead — there is no per-session environment to describe.
+	if cfg := b.currentConfig(); cfg != nil {
+		info.EnvProfile = cfg.Worker.EnvProfile
+		info.EnvAllowKeys = cfg.Worker.EnvAllowKeys
+	}
+
 	// MCP config injection — 3 scenarios:
 	// 1. Cron platform: suppress all MCP to save ~600 MB per worker
 	// 2. Configured MCP servers: restrict workers to declared servers only

@@ -531,6 +531,12 @@ type WorkerConfig struct {
 	DefaultPermissionMode string                    `mapstructure:"default_permission_mode"` // r3 (#804): bridge injects this for workspaces with no explicit override; seeded "workspace" by Default()
 	PermissionDenyDedup   PermissionDenyDedupConfig `mapstructure:"permission_deny_dedup"`
 	RuntimePlan           RuntimePlanConfig         `mapstructure:"runtime_plan"`
+	// EnvProfile / EnvAllowKeys apply to Workers that run ONE PROCESS PER
+	// SESSION. Shared-process Workers carry their own copy on their own config
+	// struct, because there the environment belongs to the process and not to
+	// any session — reporting a per-session env for those would be fiction.
+	EnvProfile   string   `mapstructure:"env_profile"`
+	EnvAllowKeys []string `mapstructure:"env_allow_keys"`
 }
 
 // RuntimePlanConfig controls how far the EffectiveRuntimePlan is trusted at
@@ -629,6 +635,11 @@ type CodexCLIConfig struct {
 	LocalProvider    bool          `mapstructure:"local_provider"`      // force local model provider (--local-provider)
 	ConfigProfile    string        `mapstructure:"config_profile"`      // codex config profile (--profile)
 	BypassHookTrust  bool          `mapstructure:"bypass_hook_trust"`   // bypass hook trust (--dangerously-bypass-hook-trust)
+	// EnvProfile / EnvAllowKeys describe the SHARED app-server process
+	// environment (#946 E). One process serves many sessions, so these are
+	// process-scoped by construction — there is no per-session env to report.
+	EnvProfile   string   `mapstructure:"env_profile"`
+	EnvAllowKeys []string `mapstructure:"env_allow_keys"`
 }
 
 // OpenCodeServerConfig holds OpenCode Server singleton process settings.
@@ -640,6 +651,11 @@ type OpenCodeServerConfig struct {
 	ReadyPollInterval time.Duration `mapstructure:"ready_poll_interval"`
 	HTTPTimeout       time.Duration `mapstructure:"http_timeout"`
 	ContextWindow     int64         `mapstructure:"context_window"` // fallback context window size; OCS HTTP API does not expose the real value
+	// EnvProfile / EnvAllowKeys describe the SHARED serve process environment
+	// (#946 E). One process serves many sessions, so these are process-scoped
+	// by construction — there is no per-session env to report.
+	EnvProfile   string   `mapstructure:"env_profile"`
+	EnvAllowKeys []string `mapstructure:"env_allow_keys"`
 }
 
 // ACPConfig holds ACP (Agent Client Protocol) worker settings.
