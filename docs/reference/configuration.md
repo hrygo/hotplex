@@ -258,6 +258,11 @@ Worker 进程生命周期和环境配置。
 | `default_permission_mode` | string | `workspace` | — | workspace 无显式 override 时 bridge 注入的默认权限模式（r3 #804）。合法值 `read-only`/`workspace`/`auto-edit`/`bypass`/空，空与缺省均归一化为 `workspace`；非法值在启动与热重载时拒绝（防 typo fail-open）。仅 config.yaml 可配置，无 env 绑定 |
 | `permission_deny_dedup.enabled` | bool | `true` | `HOTPLEX_WORKER_PERMISSION_DENY_DEDUP_ENABLED` | 用户拒绝权限后，在 `window` 窗口内对相同 owner+fingerprint 的重复权限请求本地自动拒绝，不再转发新卡片给客户端——关闭「拒绝 → Agent 秒级重试同一工具 → 新卡片」循环。详见 `docs/specs/Permission-Deny-Dedup-Spec.md` |
 | `permission_deny_dedup.window` | duration | `60s` | `HOTPLEX_WORKER_PERMISSION_DENY_DEDUP_WINDOW` | 拒绝去重窗口长度。`enabled=true` 时必须 > 0，否则启动拒绝 |
+| `runtime_plan.mode` | string | `shadow` | — | EffectiveRuntimePlan 在启动路径上的信任级别（#946 D2/D3）。`shadow` = 解析计划、绑定到本次 Worker run 并与实际启动参数做字段级 parity 对比，但**不改变任何启动行为**；`authoritative` = 由计划驱动启动，且仅对下面两个白名单同时命中的「入口 × Worker」组合生效。任何其他值（含缺省）一律按 `shadow` 处理，绝不解读为 authoritative |
+| `runtime_plan.authoritative_entries` | string[] | `[]` | — | 允许由计划驱动启动的入口类型：`webchat` / `messaging` / `cron`。为空表示**没有任何入口**处于 authoritative |
+| `runtime_plan.authoritative_workers` | string[] | `[]` | — | 允许由计划驱动启动的 Worker 类型：`claude_code` / `codex_cli` / `opencode_server` / `acp`。为空表示**没有任何 Worker**处于 authoritative |
+
+> 💡 **两个白名单都必须命中**：`authoritative` 需要「入口」与「Worker」同时在各自白名单内才生效。只配一侧的 rollout 会整体停留在 `shadow`，因此部分上线永远不会自称已完整上线。默认两个白名单都是空的，即使把 `mode` 写成 `authoritative`，也不会有任何组合真正切换。
 
 **默认 environment**：
 

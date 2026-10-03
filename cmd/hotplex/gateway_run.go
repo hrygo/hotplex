@@ -604,6 +604,10 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 	bridge.SetAuditCollector(auditCollector)                // tool.call audit (issue #833 P2)
 	bridge.SetPendingReplayer(handler)                      // SESSION_BUSY mid-turn replay (done-time fallback)
 	bridge.SetCatalogInvalidator(handler.InvalidateCatalog) // worker attach → session command catalog refresh (spec §5.2)
+	// Runtime-plan resolution reads the LIVE config through the store, so a
+	// hot-reload is visible to the next launch instead of being frozen at
+	// gateway start (#946 D2).
+	bridge.SetConfigProvider(cfgStore.Load)
 
 	if cfg.Worker.AutoRetry.Enabled {
 		log.Info("gateway: LLM auto-retry enabled", "max_retries", cfg.Worker.AutoRetry.MaxRetries, "base_delay", cfg.Worker.AutoRetry.BaseDelay)

@@ -121,6 +121,13 @@ type Bridge struct {
 	workerRuns     sync.Map            // sessionID -> workerRunBinding; updated on each successful attach
 	turnTTFT       *turnTTFTTracker
 
+	// cfgProvider returns the live config snapshot for runtime-plan resolution
+	// (#946 D2). Nil means plan resolution runs with no config snapshot, which
+	// the plan's coverage flags record honestly rather than treating as a
+	// complete plan. Injected because the Bridge is built before the config
+	// store hot-reload machinery is wired.
+	cfgProvider func() *config.Config
+
 	// catalogInvalidate is invoked on every Worker attach so the session's
 	// command catalog is refreshed (spec §5.2, §8.7). Late-injected via
 	// SetCatalogInvalidator because the Handler (which owns the catalog
@@ -135,6 +142,17 @@ type workerRunBinding struct {
 	worker    worker.Worker
 	id        string
 	lifecycle *workerRunLifecycle
+	// launchPlan is the plan this run was actually launched under (#946 D2).
+	// It is captured at bind time and never recomputed, so a diagnostic can
+	// report the run's historical plan instead of re-resolving against the
+	// current config and passing the result off as what actually ran.
+	//
+	// It is a POINTER on purpose: workerRunBinding values are stored in a
+	// sync.Map and removed with CompareAndDelete, which compares the whole
+	// struct. An embedded launchPlan would carry slices and make the binding
+	// uncomparable, so every run teardown would panic at runtime. The pointer
+	// also avoids copying the plan on each store.
+	launchPlan *launchPlan
 }
 
 // workerRunLifecycle is private to one local Worker wrapper/process run. It
@@ -364,6 +382,12 @@ type PendingReplayer interface {
 // SetPendingReplayer late-injects the replay target (Handler). Optional: nil
 // leaves done-time replay disabled (supplements buffered but not replayed).
 func (b *Bridge) SetPendingReplayer(r PendingReplayer) { b.replayer = r }
+
+// SetConfigProvider wires the live config snapshot used to resolve the runtime
+// plan at launch (#946 D2). Called once during gateway init, after the config
+// store exists. Nil clears the provider; plan resolution then runs with no
+// config snapshot and reports the resulting coverage gap honestly.
+func (b *Bridge) SetConfigProvider(fn func() *config.Config) { b.cfgProvider = fn }
 
 // SetCatalogInvalidator registers the callback invoked on every Worker attach
 // (StartSession / ResumeSession / StartFreshWorker / crash-recovery fresh
@@ -625,6 +649,7 @@ func (b *Bridge) startPreparedSession(ctx context.Context, p worker.SessionStart
 		forwardOpts:        &forwardOpts{workDir: p.WorkDir},
 		injectExclude:      p.InjectExclude,
 		workspaceOverrides: b.resolveWorkspaceOverrides(ctx, p.WorkspaceID),
+		facts:              launchFactsForStart(&p),
 	},
 		func(ctx context.Context, w worker.Worker, info worker.SessionInfo) error {
 			if err := w.Start(ctx, info); err != nil {
@@ -743,6 +768,7 @@ func (b *Bridge) StartFreshWorker(ctx context.Context, sessionID string) (string
 		botName:            si.BotName,
 		forwardOpts:        &opts,
 		workspaceOverrides: b.resolveWorkspaceOverrides(ctx, si.WorkspaceID),
+		facts:              launchFactsFor(si),
 	}, func(ctx context.Context, w worker.Worker, info worker.SessionInfo) error {
 		if err := w.Start(ctx, info); err != nil {
 			return fmt.Errorf("bridge: start fresh worker: %w", err)
@@ -827,6 +853,7 @@ func (b *Bridge) resumeWithOpts(ctx context.Context, id, workDir string, opts fo
 		botName:            si.BotName,
 		forwardOpts:        &opts,
 		workspaceOverrides: b.resolveWorkspaceOverrides(ctx, si.WorkspaceID),
+		facts:              launchFactsFor(si),
 	},
 		func(ctx context.Context, w worker.Worker, info worker.SessionInfo) error {
 			if si.State != events.StateRunning {
@@ -1057,7 +1084,27 @@ func (b *Bridge) ResetSession(ctx context.Context, sessionID string) error {
 		if b.sm.GetWorker(sessionID) != w {
 			return fmt.Errorf("bridge: reset worker changed before run binding")
 		}
-		replacementBinding = b.bindWorkerRun(sessionID, w, "")
+		// A reset replaces the CONNECTION, not the process: no new Worker was
+		// launched, so re-resolving the plan here would claim this run was
+		// launched under a config it never saw. The previous run's plan is
+		// carried forward as the historical fact, and the carry is logged so a
+		// later diagnostic does not mistake it for a fresh resolution.
+		carried := launchPlan{SessionID: sessionID}
+		if suspendedBinding.launchPlan != nil {
+			carried = *suspendedBinding.launchPlan
+		}
+		if carried.Fingerprint == "" {
+			// The previous run predates plan capture (or was bound before this
+			// code shipped, e.g. a binding made by a test). Drop the partial
+			// value rather than keeping a half-populated plan that would read
+			// like "resolved and empty".
+			carried = launchPlan{SessionID: sessionID}
+		}
+		replacementBinding = b.bindWorkerRun(sessionID, w, "", carried)
+		b.log.Debug("bridge: reset carried the previous launch plan forward",
+			"session_id", sessionID,
+			"plan_fingerprint", carried.Fingerprint,
+			"worker_type", carried.WorkerType)
 		workerRunID = replacementBinding.id
 	} else if bindingSuspended {
 		b.restoreWorkerRun(sessionID, suspendedBinding)

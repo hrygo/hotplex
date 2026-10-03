@@ -493,7 +493,7 @@ func TestHandleControl_Stop_Success(t *testing.T) {
 	mgr.AttachWorker(context.Background(), sid, w)
 	bridge := NewBridge(BridgeDeps{Log: slog.Default(), Hub: hub, SM: mgr})
 	handler.bridge = bridge
-	runBinding := bridge.bindWorkerRun(sid, w, "run-stop-success")
+	runBinding := bridge.bindWorkerRun(sid, w, "run-stop-success", launchPlan{})
 	bridge.fwdWg.Add(1)
 	go func() {
 		defer bridge.fwdWg.Done()
@@ -563,7 +563,7 @@ func TestHandleControl_Stop_AfterNaturalTerminalIsSilent(t *testing.T) {
 
 	bridge := NewBridge(BridgeDeps{Log: slog.Default(), Hub: hub, SM: mgr})
 	handler.bridge = bridge
-	binding := bridge.bindWorkerRun(sid, w, "run-stop-after-natural-terminal")
+	binding := bridge.bindWorkerRun(sid, w, "run-stop-after-natural-terminal", launchPlan{})
 	binding.lifecycle.terminalCommitted.Store(true)
 
 	env := controlEnvelope(sid, string(events.ControlActionStop))
@@ -593,7 +593,7 @@ func TestHandleControl_Stop_LedgerLookupFailureFailsClosed(t *testing.T) {
 
 	bridge := NewBridge(BridgeDeps{Log: slog.Default(), Hub: hub, SM: mgr})
 	handler.bridge = bridge
-	bridge.bindWorkerRun(sid, w, "run-stop-ledger-failure")
+	bridge.bindWorkerRun(sid, w, "run-stop-ledger-failure", launchPlan{})
 	handler.executionStore = &fakeExecutionStore{latestErr: errors.New("injected ledger outage")}
 
 	env := controlEnvelope(sid, string(events.ControlActionStop))

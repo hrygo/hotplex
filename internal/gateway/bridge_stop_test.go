@@ -38,7 +38,7 @@ func TestBridge_StopAndDisposeCurrentRun_NaturalTerminalSkipsProviderStop(t *tes
 	mgr.AttachWorker(context.Background(), sid, w)
 
 	bridge := NewBridge(BridgeDeps{Log: slog.Default(), Hub: hub, SM: mgr})
-	binding := bridge.bindWorkerRun(sid, w, "run-natural-terminal")
+	binding := bridge.bindWorkerRun(sid, w, "run-natural-terminal", launchPlan{})
 	binding.lifecycle.terminalCommitted.Store(true)
 	close(binding.lifecycle.done)
 
@@ -67,7 +67,7 @@ func TestBridge_BeginWorkerRunTurn_DrainsPriorEventBeforeReopen(t *testing.T) {
 	mgr.AttachWorker(context.Background(), sid, w)
 
 	bridge := NewBridge(BridgeDeps{Log: slog.Default(), Hub: hub, SM: mgr})
-	binding := bridge.bindWorkerRun(sid, w, "run-begin-turn-barrier")
+	binding := bridge.bindWorkerRun(sid, w, "run-begin-turn-barrier", launchPlan{})
 	releaseEvent, admitted := binding.lifecycle.beginEvent()
 	require.True(t, admitted)
 	binding.lifecycle.terminalCommitted.Store(true)
@@ -130,7 +130,7 @@ func TestBridge_StopAndDisposeCurrentRun_EventBarrierHonorsTeardownTimeout(t *te
 		StopTeardownTimeout:  50 * time.Millisecond,
 		StopForwarderTimeout: 50 * time.Millisecond,
 	})
-	binding := bridge.bindWorkerRun(sid, w, "run-event-barrier-timeout")
+	binding := bridge.bindWorkerRun(sid, w, "run-event-barrier-timeout", launchPlan{})
 	releaseEvent, admitted := binding.lifecycle.beginEvent()
 	require.True(t, admitted)
 
@@ -181,7 +181,7 @@ func TestBridge_StopAndDisposeCurrentRun_StopPanicReleasesBarrier(t *testing.T) 
 		StopTeardownTimeout:  50 * time.Millisecond,
 		StopForwarderTimeout: 50 * time.Millisecond,
 	})
-	binding := bridge.bindWorkerRun(sid, w, "run-stop-panic")
+	binding := bridge.bindWorkerRun(sid, w, "run-stop-panic", launchPlan{})
 
 	stopErr := bridge.StopAndDisposeCurrentRun(context.Background(), sid, binding.id)
 	require.ErrorIs(t, stopErr, errWorkerStopNotApplied)
@@ -234,7 +234,7 @@ func TestBridge_StopAndDisposeCurrentRun_TerminatePanicFallsBackAndFailsClosed(t
 		StopTeardownTimeout:  50 * time.Millisecond,
 		StopForwarderTimeout: 50 * time.Millisecond,
 	})
-	binding := bridge.bindWorkerRun(sid, w, "run-terminate-panic")
+	binding := bridge.bindWorkerRun(sid, w, "run-terminate-panic", launchPlan{})
 	close(binding.lifecycle.done)
 
 	stopErr := bridge.StopAndDisposeCurrentRun(context.Background(), sid, binding.id)

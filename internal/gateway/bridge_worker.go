@@ -43,6 +43,22 @@ type workerLaunchParams struct {
 	forwardOpts        *forwardOpts
 	injectExclude      []string          // per-session agent config files to skip; nil = use platform default
 	workspaceOverrides map[string]string // WebChat per-workspace config overrides (spec ②); nil = Message Channel track → Load
+	// facts carries the session-level authority facts the runtime plan needs
+	// but worker.SessionInfo deliberately does not carry: a Worker adapter has
+	// no use for a workspace id or a captured ceiling, and adding them would
+	// widen the Worker contract for a gateway-only concern.
+	facts launchFacts
+}
+
+// launchFacts are the session-scoped inputs to the runtime plan that do not
+// travel on worker.SessionInfo.
+type launchFacts struct {
+	workspaceID string
+	// sessionCeiling is the permission tier captured when the session started.
+	// It is immutable for the life of the session, so a later config edit
+	// cannot widen what this session may do.
+	sessionCeiling string
+	platformKey    map[string]string
 }
 
 // workerStartFunc is called after AttachWorker and injectAgentConfig.
@@ -91,6 +107,13 @@ func (b *Bridge) createAndLaunchWorker(params workerLaunchParams, startFn worker
 	facts := buildRuntimeFacts(w, params.workerInfo, params.platform, params.scope)
 	b.injectAgentConfig(&params.workerInfo, facts, params.platform, params.botName, params.botID, params.injectExclude, params.workspaceOverrides)
 
+	// The plan is resolved ONCE here, at the single chokepoint every launch
+	// passes through, and bound to the run below. Resolving it later — from a
+	// diagnostic, or after a config hot-reload — would describe a config the
+	// run never saw. In D2 this is shadow: it is prepared and compared, but it
+	// changes nothing about what launches.
+	plan := b.prepareLaunchPlan(params)
+
 	if err := startFn(params.ctx, w, params.workerInfo); err != nil {
 		b.sm.DetachWorker(sid)
 		return nil, err
@@ -103,7 +126,7 @@ func (b *Bridge) createAndLaunchWorker(params workerLaunchParams, startFn worker
 		}
 		return nil, err
 	}
-	runBinding := b.bindWorkerRun(sid, w, params.forwardOpts.workerRunID)
+	runBinding := b.bindWorkerRun(sid, w, params.forwardOpts.workerRunID, plan)
 
 	// A new Worker (or a resumed/replaced one) is now the session's command
 	// authority: drop the session's cached catalog so the next assembly picks
@@ -206,14 +229,26 @@ func (b *Bridge) launchForwarderLocked(binding workerRunBinding, sessionID strin
 	b.forwardEvents(fb, sessionID, opts)
 }
 
-func (b *Bridge) bindWorkerRun(sessionID string, w worker.Worker, runID string) workerRunBinding {
+// bindWorkerRun binds a launched Worker to its run identity AND to the plan
+// that described the launch (#946 D2).
+//
+// Keeping the launch fingerprint on the run is what lets a diagnostic answer
+// "which plan was this run launched under" from history, instead of re-resolving
+// the plan against the CURRENT config and presenting the result as if it were
+// a historical fact.
+func (b *Bridge) bindWorkerRun(sessionID string, w worker.Worker, runID string, plan launchPlan) workerRunBinding {
 	if runID == "" {
 		runID = "run_" + uuid.NewString()
 	}
+	// plan is copied so the binding owns an immutable snapshot: the caller may
+	// keep mutating its own copy without changing what the run is recorded as
+	// having launched under.
+	planSnapshot := plan
 	binding := workerRunBinding{
-		worker:    w,
-		id:        runID,
-		lifecycle: newWorkerRunLifecycle(w.Conn()),
+		worker:     w,
+		id:         runID,
+		lifecycle:  newWorkerRunLifecycle(w.Conn()),
+		launchPlan: &planSnapshot,
 	}
 	b.workerRuns.Store(sessionID, binding)
 	return binding
@@ -405,6 +440,7 @@ func (b *Bridge) attemptResumeFallback(p fallbackParams) bool {
 		forwardOpts:        &forwardOpts{workDir: p.workDir},
 		injectExclude:      nil, // resolved by injectAgentConfig
 		workspaceOverrides: b.resolveWorkspaceOverrides(context.Background(), si.WorkspaceID),
+		facts:              launchFactsFor(si),
 	},
 		func(ctx context.Context, w worker.Worker, info worker.SessionInfo) error {
 			if si.State != events.StateRunning {

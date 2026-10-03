@@ -85,6 +85,16 @@ func Default() *Config {
 				Enabled: true,
 				Window:  60 * time.Second,
 			},
+			// Shadow is the only safe default: the plan is resolved, bound to
+			// the Worker run and compared against the legacy parameters, but
+			// nothing it says changes what actually launches. Both allowlists
+			// stay EMPTY, so even an "authoritative" mode line cannot turn the
+			// plan live for an unnamed entry or Worker.
+			RuntimePlan: RuntimePlanConfig{
+				Mode:                 RuntimePlanModeShadow,
+				AuthoritativeEntries: nil,
+				AuthoritativeWorkers: nil,
+			},
 		},
 		Security: SecurityConfig{
 			APIKeyHeader:    "X-API-Key",

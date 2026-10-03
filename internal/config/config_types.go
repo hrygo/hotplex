@@ -530,7 +530,45 @@ type WorkerConfig struct {
 	Environment           []string                  `mapstructure:"environment"`
 	DefaultPermissionMode string                    `mapstructure:"default_permission_mode"` // r3 (#804): bridge injects this for workspaces with no explicit override; seeded "workspace" by Default()
 	PermissionDenyDedup   PermissionDenyDedupConfig `mapstructure:"permission_deny_dedup"`
+	RuntimePlan           RuntimePlanConfig         `mapstructure:"runtime_plan"`
 }
+
+// RuntimePlanConfig controls how far the EffectiveRuntimePlan is trusted at
+// launch (#946 plan unit D2). The default is SHADOW: the plan is resolved,
+// bound to the Worker run and compared against the legacy parameters, but
+// nothing it says changes what actually launches.
+//
+// Mode is deliberately two-valued. "authoritative" is not a global switch —
+// it applies ONLY to the entry×Worker combinations named in AuthoritativeEntries
+// and AuthoritativeWorkers, and every other combination stays explicitly in
+// shadow. A partially rolled-out rollout must report itself as partial, never
+// as fully live.
+type RuntimePlanConfig struct {
+	// Mode is "shadow" (default) or "authoritative".
+	Mode string `mapstructure:"mode"`
+	// AuthoritativeEntries lists entry kinds allowed to launch from the plan:
+	// "webchat", "messaging", "cron". Empty = none, so "authoritative" alone
+	// never turns the plan live by accident.
+	AuthoritativeEntries []string `mapstructure:"authoritative_entries"`
+	// AuthoritativeWorkers lists worker types allowed to launch from the plan:
+	// "claude_code", "codex_cli", "opencode_server", "acp".
+	AuthoritativeWorkers []string `mapstructure:"authoritative_workers"`
+}
+
+// NormalizePlanRolloutMode maps an absent or unrecognized mode onto the safe
+// default. An unknown value must never be read as "authoritative".
+func (c RuntimePlanConfig) NormalizePlanRolloutMode() string {
+	if c.Mode == RuntimePlanModeAuthoritative {
+		return RuntimePlanModeAuthoritative
+	}
+	return RuntimePlanModeShadow
+}
+
+// Runtime plan rollout modes.
+const (
+	RuntimePlanModeShadow        = "shadow"
+	RuntimePlanModeAuthoritative = "authoritative"
+)
 
 // PermissionDenyDedupConfig controls suppression of repeated permission cards
 // after a user denial. Within Window after a deny, the same owner+fingerprint is
