@@ -96,13 +96,14 @@ type Bridge struct {
 	// for workers that lack mid-turn support (acp/ocs fallback). PendingBuffer
 	// has its own internal mu, so no separate guard here. Initialized in
 	// NewBridge; nil-safe proxy methods (BufferPending/ClearPending/...).
-	pending        *PendingBuffer
-	replayer       PendingReplayer // late-injected (Bridge built before Handler)
-	replayMu       sync.Mutex
-	replayWG       sync.WaitGroup
-	replayClosed   bool
-	supplementGate sync.RWMutex
-	replayFences   [64]sync.RWMutex // fixed stripes; serialize replay/supplement with reset/terminate
+	pending         *PendingBuffer
+	replayer        PendingReplayer // late-injected (Bridge built before Handler)
+	queueDispatcher QueueDispatcher // late-injected durable queue dispatcher
+	replayMu        sync.Mutex
+	replayWG        sync.WaitGroup
+	replayClosed    bool
+	supplementGate  sync.RWMutex
+	replayFences    [64]sync.RWMutex // fixed stripes; serialize replay/supplement with reset/terminate
 
 	crashTracker   map[string]*crashHistory // per-session crash loop detection
 	crashTrackerMu sync.Mutex
@@ -389,6 +390,45 @@ type PendingReplayer interface {
 // leaves done-time replay disabled (supplements buffered but not replayed).
 func (b *Bridge) SetPendingReplayer(r PendingReplayer) { b.replayer = r }
 
+// QueueDispatcher promotes a session's durable input queue once the active gate
+// releases. It is late-injected for the same reason as the replayer: the
+// Bridge is built before the Handler.
+type QueueDispatcher interface {
+	DispatchQueued(ctx context.Context, sessionID string)
+	// ClearSessionQueue settles every undispatched input for a session. /reset
+	// calls it because a reset establishes a new conversation context: a queue
+	// belonging to the abandoned one must never dispatch into the new one.
+	ClearSessionQueue(ctx context.Context, sessionID string) (int64, error)
+}
+
+// SetQueueDispatcher late-injects the durable queue dispatcher. Nil leaves the
+// queue undispatched, which is one reason the queue itself is off by default.
+func (b *Bridge) SetQueueDispatcher(d QueueDispatcher) { b.queueDispatcher = d }
+
+// dispatchQueued wakes the durable queue for one session. It runs ASYNC for
+// the same reason replayPending does: it is called while the forwarding path
+// holds a seq lease, and the delivery path re-enters that barrier.
+func (b *Bridge) dispatchQueued(ctx context.Context, sessionID string) {
+	if b.queueDispatcher == nil || b.closed.Load() || sessionID == "" {
+		return
+	}
+	b.replayMu.Lock()
+	if b.replayClosed {
+		b.replayMu.Unlock()
+		return
+	}
+	b.replayWG.Add(1)
+	b.replayMu.Unlock()
+
+	go func() {
+		defer b.replayWG.Done()
+		fence := b.replayFence(sessionID)
+		fence.RLock()
+		defer fence.RUnlock()
+		b.queueDispatcher.DispatchQueued(ctx, sessionID)
+	}()
+}
+
 // SetConfigProvider wires the live config snapshot used to resolve the runtime
 // plan at launch (#946 D2). Called once during gateway init, after the config
 // store exists. Nil clears the provider; plan resolution then runs with no
@@ -476,6 +516,7 @@ func (b *Bridge) ClearAllPending() {
 func (b *Bridge) HandleRepairSuccess(intent execution.RepairIntent) {
 	if intent.Kind == execution.RepairRuntime && intent.SessionID != "" {
 		b.replayPending(intent.SessionID)
+		b.dispatchQueued(context.Background(), intent.SessionID)
 	}
 }
 
@@ -1083,6 +1124,12 @@ func (b *Bridge) ResetSession(ctx context.Context, sessionID string) error {
 	// the old context before the replacement forwarder can emit events.
 	if b.pending != nil {
 		b.pending.Clear(sessionID)
+	}
+	if b.queueDispatcher != nil {
+		if _, err := b.queueDispatcher.ClearSessionQueue(context.WithoutCancel(ctx), sessionID); err != nil {
+			b.log.Warn("gateway: reset could not clear queued inputs",
+				"session_id", sessionID, "err", err)
+		}
 	}
 	workerRunID := ""
 	var replacementBinding workerRunBinding

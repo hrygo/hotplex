@@ -358,6 +358,9 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 	// nil-safe via b.pending guard, but the bridge pointer itself is checked
 	// here to keep the test path (no gateway_run wiring) honest.
 	var bridge *gateway.Bridge
+	// handler is declared alongside the bridge for the same reason: session end
+	// must also settle the session's durable input queue. Nil before assignment.
+	var handler *gateway.Handler
 
 	sm.OnTerminate = func(sessionID string) {
 		log.Info("gateway: session terminated", "session_id", sessionID)
@@ -368,6 +371,15 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 		// HTTP DELETE) through a single hook instead of patching each call site.
 		if bridge != nil {
 			bridge.ClearPending(sessionID)
+		}
+		// The durable queue is the other half of the same obligation: a queued
+		// input belonging to a session that is gone must be settled, not left
+		// claiming to be dispatchable.
+		if handler != nil {
+			if _, err := handler.ClearSessionQueue(context.Background(), sessionID); err != nil {
+				log.Warn("gateway: session end could not settle queued inputs",
+					"session_id", sessionID, "err", err)
+			}
 		}
 		if cronScheduler != nil {
 			cronScheduler.CleanupForSession(sessionID)
@@ -403,8 +415,6 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 	if stores.collector != nil {
 		hub.SetSeqFlusher(stores.collector)
 	}
-	var handler *gateway.Handler // set later in DI; prunes session catalog state on release
-
 	sm.OnRuntimeRelease = func(ctx context.Context, sessionID string) {
 		// Prune per-session command-catalog state so deleted sessions do not
 		// accumulate one catalogGen/entries entry for the gateway lifetime
@@ -603,11 +613,19 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 	hub.SetAuditCollector(auditCollector)
 	bridge.SetAuditCollector(auditCollector)                // tool.call audit (issue #833 P2)
 	bridge.SetPendingReplayer(handler)                      // SESSION_BUSY mid-turn replay (done-time fallback)
+	bridge.SetQueueDispatcher(handler)                      // durable input queue dispatch on gate release
 	bridge.SetCatalogInvalidator(handler.InvalidateCatalog) // worker attach → session command catalog refresh (spec §5.2)
 	// Runtime-plan resolution reads the LIVE config through the store, so a
 	// hot-reload is visible to the next launch instead of being frozen at
 	// gateway start (#946 D2).
 	bridge.SetConfigProvider(cfgStore.Load)
+	// The input queue reads the LIVE config too, so hot-reload of its bounds
+	// applies to the next enqueue instead of being frozen at gateway start.
+	handler.SetConfigProvider(cfgStore.Load)
+	// TTL expiry for the durable input queue. Its context is the gateway's, so
+	// it stops claiming work during shutdown while queued inputs stay on disk
+	// for the next process to dispatch.
+	handler.StartQueueSweeper(ctx)
 
 	if cfg.Worker.AutoRetry.Enabled {
 		log.Info("gateway: LLM auto-retry enabled", "max_retries", cfg.Worker.AutoRetry.MaxRetries, "base_delay", cfg.Worker.AutoRetry.BaseDelay)

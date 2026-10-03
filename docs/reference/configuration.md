@@ -33,6 +33,7 @@ description: "HotPlex Worker Gateway 所有配置项的权威参考，覆盖配�
    - [oauth — WebChat 企业 SSO（OIDC）](#314-oauth--webchat--ssooidc)
    - [inherits — 配置继承](#315-inherits--)
    - [events 和 audit — 事件与审计留存](#316-events-和-audit--事件与审计留存)
+   - [execution.queue — 持久输入队列](#317-executionqueue--)
 4. [热重载](#4-热重载)
 5. [环境变量速查](#5-环境变量速查)
 
@@ -806,6 +807,24 @@ log:
 | `audit.full_content_retention` | duration | `2160h` (90天) | `HOTPLEX_AUDIT_FULL_CONTENT_RETENTION` | 审计原文的兼容配置字段；不再影响 event store 或 turns 留存 |
 
 > 网关 INFO 日志不会记录消息正文、prompt 或 `Envelope.Event.Data`。为支持关联排障，日志仅包含事件类型、session、seq、`data_size` 与 `data_sha256`（SHA-256 的短指纹）。
+
+### 3.17 execution.queue — 持久输入队列
+
+当一个 session 正在执行时到达的补充输入，可以进入一个**有界持久队列**，等待当前轮次结束后按 FIFO 派发。这个队列兑现的是网关对客户端的承诺："这条输入已经存下来了，稍后会被派发"，而不是"已进入内存暂存，重启可能丢失"。
+
+| 字段 | 类型 | 默认值 | 环境变量 | 说明 |
+|------|------|--------|----------|------|
+| `execution.queue.enabled` | bool | `false` | `HOTPLEX_EXECUTION_QUEUE_ENABLED` | 队列总开关。**默认关闭**，见下方说明 |
+| `execution.queue.per_session` | int | `20` | `HOTPLEX_EXECUTION_QUEUE_PER_SESSION` | 单个 session 允许的未派发输入条数上限 |
+| `execution.queue.global` | int | `1000` | `HOTPLEX_EXECUTION_QUEUE_GLOBAL` | 整个实例允许的未派发输入条数上限 |
+| `execution.queue.max_payload_bytes` | int | `65536` (64 KiB) | `HOTPLEX_EXECUTION_QUEUE_MAX_PAYLOAD_BYTES` | 单条输入的正文上限；原生命令的 invocation 参数一并计入 |
+| `execution.queue.ttl` | duration | `24h` | `HOTPLEX_EXECUTION_QUEUE_TTL` | 未派发输入保持可派发状态的最长时间，超时后按 `QUEUE_EXPIRED` 结算 |
+| `execution.queue.sweep_interval` | duration | `1m` | `HOTPLEX_EXECUTION_QUEUE_SWEEP_INTERVAL` | 过期扫描间隔；设为 `0` 关闭后台扫描 |
+| `execution.queue.sweep_batch` | int | `100` | `HOTPLEX_EXECUTION_QUEUE_SWEEP_BATCH` | 单次扫描处理的最大条数，避免大积压长时间占用写锁 |
+
+> **`enabled` 默认为 `false`**：只有派发、取消与过期三条路径都接通之后，接收才成为一件有意义的事。在派发未接通的情况下开启队列，会静默堆积无人发送的输入——这比直接拒绝输入更糟。容量已满、载荷过大等情况下，网关不会挤掉已被ACK 的输入，而是回落到内存暂存并如实标注为 volatile。
+
+队列只覆盖**尚未派发**的输入。一旦某条输入跨过派发边界（进入 pending 并取得 owner lease），它的失败与重试语义与其他 execution 完全一致：响应丢失即 `unknown` + fence，不会自动重投。`/stop` 只停止当前轮次，不影响队列；要撤销一条已入队输入，使用 Admin API `POST /admin/executions/{id}/queue-cancel`，已派发的输入返回 `409`。
 
 ---
 

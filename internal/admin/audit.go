@@ -51,6 +51,8 @@ const (
 	AuditRuntimeEffectAbandon          = "runtime.effect.abandon"
 	AuditRuntimeEffectMarkDelivered    = "runtime.effect.mark_delivered"
 	AuditRuntimeEffectRequeue          = "runtime.effect.requeue"
+	AuditRuntimeQueueCancel            = "runtime.queue.cancel" // withdraw one undispatched input
+	AuditRuntimeQueueClear             = "runtime.queue.clear"  // withdraw a session's undispatched inputs
 
 	// AuditResult* — stable "result" field values. Reuse instead of literals so
 	// dashboard filters stay correct (issue #788 review P3).
@@ -120,6 +122,13 @@ func adminActionFor(method, path string) string {
 		return AuditCronTrigger
 	case strings.Contains(path, "/fence-action"):
 		return AuditRuntimeFenceAction
+	// Queue actions must precede the /sessions and /effects cases below:
+	// /admin/sessions/{id}/queue-clear contains "/sessions", and a generic
+	// session.delete row would claim an action that never deleted a session.
+	case strings.Contains(path, "/queue-cancel"):
+		return AuditRuntimeQueueCancel
+	case strings.Contains(path, "/queue-clear"):
+		return AuditRuntimeQueueClear
 	case strings.Contains(path, "/effects/"):
 		// GET /admin/effects/{id} is a read; only the write verb reaches the
 		// audit table, and it stays decision-agnostic here — the

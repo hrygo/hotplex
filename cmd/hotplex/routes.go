@@ -160,6 +160,11 @@ func setupRoutes(
 	if deps.EffectStore != nil {
 		adminAPI.SetRuntimeEffects(&effectProviderAdapter{store: deps.EffectStore})
 	}
+	// Durable input queue operator actions. The gateway Handler owns queue
+	// dispatch, so it is the provider; nil → 503 rather than a fake success.
+	if handler != nil {
+		adminAPI.SetRuntimeQueue(handler)
+	}
 	// Runtime-plan diagnostics report what a session's current run was ACTUALLY
 	// launched under, not a re-resolution against the live config (#946 D3).
 	// Nil bridge → the diagnostic falls back and marks the answer as such.
@@ -217,6 +222,13 @@ func setupRoutes(
 	// a fencing token. GET needs runtime:read, POST needs runtime:write.
 	adminMux.HandleFunc("GET /admin/executions/fences", adminAPI.HandleListFences)
 	adminMux.HandleFunc("POST /admin/executions/{id}/fence-action", adminAPI.HandleFenceAction)
+
+	// Durable input queue operator actions: withdraw promises that have not
+	// been dispatched yet. Separate from the fence endpoints because a queued
+	// input is not a broken run — cancelling one must never be reported as
+	// having unblocked or failed an execution.
+	adminMux.HandleFunc("POST /admin/executions/{id}/queue-cancel", adminAPI.HandleCancelQueuedInput)
+	adminMux.HandleFunc("POST /admin/sessions/{id}/queue-clear", adminAPI.HandleClearSessionQueue)
 
 	// Delivery effect API: inspect external deliveries and their attempts, and
 	// decide an uncertain one. Separate from the fence endpoints on purpose —

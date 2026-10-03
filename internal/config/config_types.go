@@ -27,11 +27,44 @@ type Config struct {
 	OAuth       OAuthConfig     `mapstructure:"oauth"`
 	Events      EventsConfig    `mapstructure:"events"`
 	Audit       AuditConfig     `mapstructure:"audit"`
+	Execution   ExecutionConfig `mapstructure:"execution"`
 	Inherits    string          `mapstructure:"inherits"` // path to parent config file; "" = no inheritance
 
 	// ResolvedAPIKeyUsers is the runtime map of expanded API key value → userID.
 	// Populated by resolveAPIKeyUsers() during load. Nil when no mapping configured.
 	ResolvedAPIKeyUsers map[string]string `mapstructure:"-"`
+}
+
+// ExecutionConfig holds gateway-level settings for the durable input
+// execution ledger and its bounded input queue.
+type ExecutionConfig struct {
+	Queue ExecutionQueueConfig `mapstructure:"queue"`
+}
+
+// ExecutionQueueConfig bounds the persistent queue of inputs that arrive while
+// a session is busy.
+//
+// Enabled defaults to FALSE on purpose. Accepting into a queue whose dispatch
+// path is not wired would silently accumulate inputs nobody ever sends, which
+// is a worse failure than refusing the input outright. Turning it on is a
+// statement that dispatch, cancellation and expiry are all live.
+type ExecutionQueueConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// PerSession caps undispatched inputs for one session.
+	PerSession int `mapstructure:"per_session"`
+	// Global caps undispatched inputs across the instance.
+	Global int `mapstructure:"global"`
+	// MaxPayloadBytes caps one queued input's content, including a native
+	// command invocation's serialized arguments.
+	MaxPayloadBytes int `mapstructure:"max_payload_bytes"`
+	// TTL is how long an undispatched input stays dispatchable.
+	TTL time.Duration `mapstructure:"ttl"`
+	// SweepInterval is how often expired inputs are settled. Zero disables the
+	// sweeper; expired inputs then wait for the next enqueue or dispatch.
+	SweepInterval time.Duration `mapstructure:"sweep_interval"`
+	// SweepBatch bounds one sweep so a large backlog cannot hold the write
+	// lock long enough to stall live input.
+	SweepBatch int `mapstructure:"sweep_batch"`
 }
 
 // MessagingConfig holds messaging platform adapter settings.

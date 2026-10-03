@@ -359,6 +359,31 @@ func (s *SQLStore) QueueByExecution(ctx context.Context, executionID string) (*Q
 	return s.queueEntryByExecution(ctx, s.db, executionID)
 }
 
+// QueuedByClientMessage returns the execution record for one queued input
+// identified by the client's own message ID.
+func (s *SQLStore) QueuedByClientMessage(
+	ctx context.Context, sessionID, clientMessageID string,
+) (*Record, error) {
+	if sessionID == "" || clientMessageID == "" {
+		return nil, errors.New("execution: session id and client message id are required")
+	}
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+
+	record, err := s.getByClientMessage(ctx, sessionID, clientMessageID)
+	if err != nil {
+		return nil, err
+	}
+	// Only a genuinely undispatched input answers here. Once an input crossed
+	// the dispatch boundary its record stays queryable by execution ID, but
+	// reporting it as "queued" would restart the wait for a turn already under
+	// way.
+	if !record.IsQueued() {
+		return nil, ErrNotFound
+	}
+	return record, nil
+}
+
 // QueueBySession returns a session's undispatched inputs in dispatch order.
 func (s *SQLStore) QueueBySession(ctx context.Context, sessionID string, limit int) ([]*QueueEntry, error) {
 	if sessionID == "" {

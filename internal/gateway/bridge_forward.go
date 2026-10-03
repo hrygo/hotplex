@@ -691,6 +691,9 @@ func (b *Bridge) finishRuntimeOnDone(sessionID string, fc *forwardContext, env *
 	// deliverToWorker → acceptInputExecution re-enters the seq barrier in its
 	// own context. cloneForReplay sets seq=0 so the hub reassigns it.
 	b.replayPending(sessionID)
+	// The active gate is released, so the session's durable queue may promote
+	// its head. Both are async for the same seq-lease reason.
+	b.dispatchQueued(context.Background(), sessionID)
 
 	// A late Done proves the worker actually executed the input. If the
 	// delivery was recorded as failed (e.g. a native skill invocation that

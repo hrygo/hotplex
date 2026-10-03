@@ -164,6 +164,10 @@ func (s *fakeExecutionStore) QueueBySession(context.Context, string, int) ([]*ex
 	return nil, errFakeQueueUnsupported
 }
 
+func (s *fakeExecutionStore) QueuedByClientMessage(context.Context, string, string) (*execution.Record, error) {
+	return nil, errFakeQueueUnsupported
+}
+
 func (s *fakeExecutionStore) QueueDepth(context.Context) (int64, error) {
 	return 0, errFakeQueueUnsupported
 }

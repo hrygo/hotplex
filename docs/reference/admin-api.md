@@ -55,7 +55,7 @@ admin:
 | `config:read` | - | - | - | 🟢 Read | - | - | `POST /admin/config/validate` |
 | `config:write` | - | - | - | 🟠 Write | - | - | `POST /admin/config/rollback` |
 | `runtime:read` | - | - | - | - | - | - | `GET /admin/executions/fences`<br>`GET /admin/effects`<br>`GET /admin/effects/{id}`<br>`GET /admin/sessions/{id}/runtime-plan`（需与 `session:read` 同时持有） |
-| `runtime:write` | - | - | - | - | - | - | `POST /admin/executions/{id}/fence-action`<br>`POST /admin/effects/{id}/action` |
+| `runtime:write` | - | - | - | - | - | - | `POST /admin/executions/{id}/fence-action`<br>`POST /admin/executions/{id}/queue-cancel`<br>`POST /admin/sessions/{id}/queue-clear`<br>`POST /admin/effects/{id}/action` |
 | `admin:read` | - | - | - | - | 🟢 Read | 🟢 Read | `GET /admin/logs`<br>`GET /admin/debug/...`<br>`GET /admin/bots`<br>`GET /admin/cron/jobs` |
 | `admin:write` | - | - | - | - | - | 🟠 Write | `POST/PATCH/DELETE /admin/cron/jobs`<br>`POST /admin/cron/jobs/{id}/run` |
 
@@ -157,6 +157,8 @@ curl -H "Authorization: Bearer $TOKEN" \
 |------|------|-------|------|
 | GET | `/admin/executions/fences` | `runtime:read` | 列出阻塞新输入的 fenced executions |
 | POST | `/admin/executions/{id}/fence-action` | `runtime:write` | 应用 operator 决策（resolve/abandon），以 fence_version 为条件 |
+| POST | `/admin/executions/{id}/queue-cancel` | `runtime:write` | 撤销一条**尚未派发**的排队输入；已派发返回 `409` |
+| POST | `/admin/sessions/{id}/queue-clear` | `runtime:write` | 撤销该 session 全部尚未派发的排队输入 |
 | GET | `/admin/sessions/{id}/runtime-plan` | `runtime:read` + `session:read` | 会话的 desired-state plan（redacted）与 observed bootstrap 摘要 |
 | GET | `/admin/effects` | `runtime:read` | 列出外部交付 effect 及其生命周期状态 |
 | GET | `/admin/effects/{id}` | `runtime:read` | 单个 effect 及其逐次发送尝试历史 |
@@ -182,6 +184,21 @@ curl -H "Authorization: Bearer $TOKEN" \
 | `evidence_ref` | string | - | 工单/run 引用指针，≤256 字符；仅指针，不允许内联内容 |
 
 错误码：`400 BAD_REQUEST`（字段校验）/ `403 INSUFFICIENT_SCOPE` / `404 FENCE_NOT_FOUND` / `409 FENCE_CONFLICT` / `503 SERVICE_UNAVAILABLE`（store 未配置或超时）。收到 409 必须重新 inspect 当前 fence 状态后审慎重试 —— 并发 operator 或 inspect 与 action 之间的网关重启都会触发冲突，服务端不自动重试。`abandon` 成功后 best-effort 通知在线连接终态。
+
+**持久输入队列端点** — 队列里的输入是网关对客户端已经许下的承诺：「已存下，稍后派发」。这两个入口让 operator 在**还能撤回的时候**撤回它。跨过派发边界之后就不一样了：那条输入已经是一次正在运行的 execution，停止它属于另一件事，冒充成「已取消」只会让 operator 以为自己撤销了一次从未发生的操作。
+
+**POST /admin/executions/{id}/queue-cancel** — 撤销单条尚未派发的排队输入。请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|:---:|------|
+| `reason` | string | ✅ | operator 理由，1–512 字符；仅进入审计层，队列与 execution store 永不保存 |
+| `evidence_ref` | string | - | 工单/run 引用指针，≤256 字符；仅指针，不允许内联输入内容 |
+
+成功返回 `{"execution_id": "...", "cancelled": true}`。若该输入已跨过派发边界（正在运行、已结束或已被fence），返回 `409 INPUT_NOT_QUEUED`，并提示改用 stop —— 服务端不会为一次没有发生的取消返回 200。
+
+**POST /admin/sessions/{id}/queue-clear** — 撤销该 session 全部尚未派发的排队输入，请求体同上。成功返回 `{"session_id": "...", "cleared": N}`，`N` 为实际结算条数。队列为空是**成功的 no-op**（`cleared: 0`），与清除失败不同：后者返回 `503`，绝不以 `cleared: 0` 冒充「已确认队列为空」。正在运行或已派发的轮次不受影响。
+
+两个端点都需要 `runtime:write`。actor 取自鉴权上下文，绝不来自请求体。错误码：`400 BAD_REQUEST` / `403 INSUFFICIENT_SCOPE` / `409 INPUT_NOT_QUEUED` / `503 SERVICE_UNAVAILABLE`（dispatcher 未配置或超时）。队列默认关闭；关闭时这两个端点报告「没有可撤销的输入」，而不是伪造一次取消。
 
 **GET /admin/sessions/{id}/runtime-plan** — 返回会话的 EffectiveRuntimePlan 诊断投影（#946 spec §6.6）：`plan`（redacted view：plan hash、worker_type、permission/sandbox 摘要、env key **名称**、source refs、warnings、blocked codes）与 `observed`（bootstrap 状态：`planned` / `unknown` / `declared` 及 permission ceiling）。投影由会话持久化事实 + 当前 config 按需计算，无 plan 表、无第二份持久化真相；blocked plan 返回 200 并携带 bounded 拦截原因与空 `plan_hash`（blocked 是有效诊断载荷，不是 HTTP 错误）。响应永不包含 prompt、完整命令、model、工具清单或任何值内容。
 
@@ -586,6 +603,7 @@ zip 格式、文件类型白名单与安全约束同上方「Skill 管理（admi
 | 409 | `RESTART_REJECTED` | 已有 Gateway 重启事务 |
 | 409 | `FENCE_CONFLICT` | fence_version 条件更新失败；重新 inspect 后审慎重试，勿自动重试（#877） |
 | 409 | `EFFECT_CONFLICT` | effect 条件更新失败（已不再是 unknown）；重新 inspect 后审慎重试，勿自动重试 |
+| 409 | `INPUT_NOT_QUEUED` | queue-cancel 目标输入已跨过派发边界；改用 stop，服务端不会伪造一次取消 |
 | 409 | `WORKSPACE_VERSION_MISMATCH` | PATCH workspace 乐观并发冲突（`updated_at` CAS 失败，re-fetch 后重试） |
 | 409 | `WORKSPACE_NOT_EMPTY` | workspace 存在活跃会话，拒绝改 `work_dir` / 删除 |
 | 409 | `WORK_DIR_TAKEN` | workspace `work_dir` 已被该 owner 的其他 workspace 占用 |
@@ -638,4 +656,16 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 # 查看会话的 effective runtime plan（#946）
 curl -H "Authorization: Bearer $TOKEN" \
   http://localhost:9999/admin/sessions/abc-123/runtime-plan
+
+# 撤销一条尚未派发的排队输入（已派发返回 409 INPUT_NOT_QUEUED）
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"operator selected the wrong batch","evidence_ref":"OPS-1234"}' \
+  http://localhost:9999/admin/executions/exec-abc/queue-cancel
+
+# 清空某 session 全部尚未派发的排队输入（cleared:0 表示本就为空，不是失败）
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"session intent changed before dispatch"}' \
+  http://localhost:9999/admin/sessions/abc-123/queue-clear
 ```

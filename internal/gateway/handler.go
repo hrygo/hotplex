@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/hrygo/hotplex/internal/audit"
+	"github.com/hrygo/hotplex/internal/config"
 	"github.com/hrygo/hotplex/internal/execution"
 	"github.com/hrygo/hotplex/internal/messaging"
 	"github.com/hrygo/hotplex/internal/observability"
@@ -57,6 +58,10 @@ type Handler struct {
 	ownerInstanceID string
 	stopFence       turnStopFence
 	dispatchGate    sessionDispatchGate
+	// configProvider reads the LIVE configuration so a hot-reload of the input
+	// queue is visible to the next enqueue instead of being frozen at startup.
+	// Nil (tests, no config store) means the queue is disabled.
+	configProvider func() *config.Config
 
 	// catalogStore is the session-scoped merged command catalog (spec §5.2).
 	// catalogGen tracks the per-session generation bumped on /reset, /cd, and
@@ -69,6 +74,10 @@ type Handler struct {
 	homeDir     string
 	homeDirErr  error
 }
+
+// SetConfigProvider late-injects the live config reader. The Bridge uses the
+// same hook for runtime-plan resolution (#946 D2).
+func (h *Handler) SetConfigProvider(fn func() *config.Config) { h.configProvider = fn }
 
 // SkillsLocator discovers skills from the filesystem.
 type SkillsLocator interface {
@@ -976,6 +985,17 @@ func (h *Handler) handleSupplementOnBusy(ctx context.Context, env *events.Envelo
 		h.ackSupplement(ctx, env, supplementReceiptForDisposition(disposition), true,
 			h.activeExecutionID(ctx, env.SessionID))
 		return nil
+	case supplementQueued:
+		// A retry of an already-queued input. The durable record is the answer;
+		// re-answering with a synthetic supplement ID would tell the client
+		// something weaker than what we actually know.
+		if h.executionStore != nil {
+			if record, err := h.queuedRecordFor(ctx, env.SessionID, clientID); err == nil && record != nil {
+				h.ackQueuedInput(ctx, env, record, true)
+				return nil
+			}
+		}
+		return h.sendErrorf(ctx, env, events.ErrCodeInternalError, "queued input record unavailable")
 	case supplementNormal:
 		unlockSession()
 		sessionLocked = false
@@ -1056,6 +1076,26 @@ func (h *Handler) handleSupplementOnBusy(ctx context.Context, env *events.Envelo
 	}
 	if invocation != nil {
 		stashInvocation(env, *invocation, content)
+	}
+	// Durable queue first. A volatile buffer is a strictly weaker promise: it
+	// is lost on restart and cannot be inspected by an operator. Taking it only
+	// when the durable path is disabled or refuses keeps the existing fallback
+	// while making the queue the default answer when it can answer.
+	if h.queueEnabled() {
+		record, queued, qerr := h.EnqueueBusyInput(ctx, env, content, invocation)
+		switch {
+		case qerr == nil && queued && record != nil:
+			lease.Commit(supplementQueued)
+			committed = true
+			h.ackQueuedInput(ctx, env, record, false)
+			h.notifySupplement(ctx, env.SessionID, "queued")
+			return nil
+		case qerr != nil && errors.Is(qerr, execution.ErrPayloadConflict):
+			return h.sendErrorf(ctx, env, events.ErrCodeInvalidMessage,
+				"client message id %q was already used with different input", clientID)
+		}
+		// Full, oversized or otherwise unusable: fall through to the volatile
+		// buffer, which is still better than refusing the input outright.
 	}
 	if !h.bridge.BufferPending(env.SessionID, env, content) {
 		return h.sendErrorf(ctx, env, events.ErrCodeSessionBusy, "supplement buffer is full")
@@ -1691,6 +1731,14 @@ func (h *Handler) deliverToWorkerWithBusyHandling(ctx context.Context, env *even
 func (h *Handler) acceptInputExecution(ctx context.Context, env *events.Envelope) (*execution.Record, bool, error) {
 	if h.executionStore == nil {
 		return nil, false, nil
+	}
+	// A queued input has already been durably accepted by the queue claim,
+	// which promoted it to pending with an owner lease. Accepting it again
+	// would recompute a payload hash from a reconstructed envelope that cannot
+	// reproduce the stored one, and report a conflict against the item's own
+	// row. The claim IS the acceptance.
+	if record := preacceptedFrom(ctx); record != nil {
+		return record, false, nil
 	}
 	payloadHash, err := inputPayloadHash(env)
 	if err != nil {

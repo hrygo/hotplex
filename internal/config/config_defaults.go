@@ -96,6 +96,20 @@ func Default() *Config {
 				AuthoritativeWorkers: nil,
 			},
 		},
+		// The queue is OFF by default. Accepting into a queue whose dispatch
+		// path is not wired would accumulate inputs nobody ever sends, which is
+		// worse than refusing the input outright.
+		Execution: ExecutionConfig{
+			Queue: ExecutionQueueConfig{
+				Enabled:         false,
+				PerSession:      20,
+				Global:          1000,
+				MaxPayloadBytes: 64 << 10,
+				TTL:             24 * time.Hour,
+				SweepInterval:   time.Minute,
+				SweepBatch:      100,
+			},
+		},
 		Security: SecurityConfig{
 			APIKeyHeader:    "X-API-Key",
 			APIKeys:         nil,

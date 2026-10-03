@@ -317,6 +317,41 @@ rate(hotplex_execution_session_busy_total[5m])
 histogram_quantile(0.95, rate(hotplex_execution_delivery_latency_bucket[5m]))
 ```
 
+## 持久输入队列指标
+
+`execution.queue` 队列（默认关闭，见 [configuration.md §3.17](configuration.md#317-executionqueue--)）。这组指标回答两个问题：队列是否在真正接住输入，以及它是否在拖累体验。
+
+| 指标 | 类型 | 说明 |
+|------|------|------|
+| `hotplex.execution.queue_accepted` | Counter | 成功持久入队的输入数，label: `input_mode`（text / native_command） |
+| `hotplex.execution.queue_refused` | Counter | 入队被拒，label: `reason`（full / payload_too_large / conflict / content_unavailable / not_dispatchable） |
+| `hotplex.execution.queue_dispatched` | Counter | 队首被 claim 并派发的输入数，label: `input_mode`（text / native_command） |
+| `hotplex.execution.queue_settled` | Counter | 未派发即结算的输入数，label: `reason`（cancelled / expired / not_dispatchable） |
+| `hotplex.execution.queue_depth` | UpDownCounter | 当前排队中的输入数（存量，非流量） |
+| `hotplex.execution.queue_wait_ms` | Histogram | 入队到派发的等待耗时（毫秒） |
+| `hotplex.runtime.queue_actions` | Counter | Admin API 上的队列 operator 决策，label: `action`（cancel / clear）、`result`（ok / error） |
+
+标签集全部低基数：不含 execution ID、session ID、actor 或任何输入内容。
+
+### 常用查询
+
+```promql
+# 当前积压
+hotplex_execution_queue_depth
+
+# 队列拒绝率（full 持续升高说明容量不足或 dispatch 不通畅）
+sum by (reason) (rate(hotplex_execution_queue_refused_total[5m]))
+
+# P95 排队等待
+histogram_quantile(0.95, rate(hotplex_execution_queue_wait_ms_bucket[5m]))
+
+# 结算原因分布：expired 占比高说明 TTL 相对实际等待过短
+sum by (reason) (rate(hotplex_execution_queue_settled_total[1h]))
+
+# operator 取消量
+sum by (action) (rate(hotplex_runtime_queue_actions_total[1h]))
+```
+
 ## Lease-Repair 指标
 
 Durable ingress 的 owner lease 续约与终态修复子系统。

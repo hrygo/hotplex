@@ -1069,6 +1069,27 @@ var (
 	supplementBuffered     metric.Int64Counter
 	supplementBufferedInit sync.Once
 
+	executionQueueAccepted     metric.Int64Counter
+	executionQueueAcceptedInit sync.Once
+
+	executionQueueRefused     metric.Int64Counter
+	executionQueueRefusedInit sync.Once
+
+	executionQueueDispatched     metric.Int64Counter
+	executionQueueDispatchedInit sync.Once
+
+	executionQueueSettled     metric.Int64Counter
+	executionQueueSettledInit sync.Once
+
+	executionQueueDepth     metric.Int64UpDownCounter
+	executionQueueDepthInit sync.Once
+
+	executionQueueWaitMs     metric.Float64Histogram
+	executionQueueWaitMsInit sync.Once
+
+	runtimeQueueOperatorActions     metric.Int64Counter
+	runtimeQueueOperatorActionsInit sync.Once
+
 	executionDeliveryOutcome     metric.Int64Counter
 	executionDeliveryOutcomeInit sync.Once
 
@@ -1219,6 +1240,122 @@ func SupplementBuffered() metric.Int64Counter {
 		}
 	})
 	return supplementBuffered
+}
+
+// ExecutionQueueAccepted counts inputs durably accepted into the bounded
+// queue. Separate from supplement_buffered because that one is process-local
+// and lost on restart; conflating them would make a volatile backlog look
+// durable in the metrics.
+func ExecutionQueueAccepted() metric.Int64Counter {
+	executionQueueAcceptedInit.Do(func() {
+		var err error
+		executionQueueAccepted, err = Meter().Int64Counter(
+			"hotplex.execution.queue_accepted",
+			metric.WithDescription("Inputs durably accepted into the bounded queue. Labels: input_mode (text|native_command)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_accepted", err)
+		}
+	})
+	return executionQueueAccepted
+}
+
+// ExecutionQueueRefused counts queue rejections by reason. Labels are bounded
+// enums only — a session ID or client message ID would blow up cardinality.
+func ExecutionQueueRefused() metric.Int64Counter {
+	executionQueueRefusedInit.Do(func() {
+		var err error
+		executionQueueRefused, err = Meter().Int64Counter(
+			"hotplex.execution.queue_refused",
+			metric.WithDescription("Queue rejections. Labels: reason (full|payload_too_large|conflict|content_unavailable|not_dispatchable)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_refused", err)
+		}
+	})
+	return executionQueueRefused
+}
+
+// ExecutionQueueDispatched counts queue heads promoted across the dispatch
+// boundary.
+func ExecutionQueueDispatched() metric.Int64Counter {
+	executionQueueDispatchedInit.Do(func() {
+		var err error
+		executionQueueDispatched, err = Meter().Int64Counter(
+			"hotplex.execution.queue_dispatched",
+			metric.WithDescription("Queued inputs claimed and dispatched. Labels: input_mode (text|native_command)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_dispatched", err)
+		}
+	})
+	return executionQueueDispatched
+}
+
+// ExecutionQueueSettled counts queued inputs settled without ever reaching a
+// worker. Labels: reason (cancelled|expired|not_dispatchable).
+func ExecutionQueueSettled() metric.Int64Counter {
+	executionQueueSettledInit.Do(func() {
+		var err error
+		executionQueueSettled, err = Meter().Int64Counter(
+			"hotplex.execution.queue_settled",
+			metric.WithDescription("Queued inputs settled without dispatch. Labels: reason (cancelled|expired|not_dispatchable)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_settled", err)
+		}
+	})
+	return executionQueueSettled
+}
+
+// ExecutionQueueDepth tracks how many inputs are waiting. It is a gauge
+// because the queue is a level, not a flow.
+func ExecutionQueueDepth() metric.Int64UpDownCounter {
+	executionQueueDepthInit.Do(func() {
+		var err error
+		executionQueueDepth, err = Meter().Int64UpDownCounter(
+			"hotplex.execution.queue_depth",
+			metric.WithDescription("Inputs currently waiting in the durable queue"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_depth", err)
+		}
+	})
+	return executionQueueDepth
+}
+
+// ExecutionQueueWaitMs measures how long an input waited before dispatch. This
+// is the number that tells an operator whether the queue is helping.
+func ExecutionQueueWaitMs() metric.Float64Histogram {
+	executionQueueWaitMsInit.Do(func() {
+		var err error
+		executionQueueWaitMs, err = Meter().Float64Histogram(
+			"hotplex.execution.queue_wait_ms",
+			metric.WithDescription("Milliseconds a queued input waited before dispatch"),
+			metric.WithUnit("ms"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_wait_ms", err)
+		}
+	})
+	return executionQueueWaitMs
+}
+
+// RuntimeQueueOperatorActions counts operator decisions applied to the durable
+// input queue. Labels: action (cancel|clear), result (ok|error). Low-cardinality
+// only — no execution IDs, no actors, no input content.
+func RuntimeQueueOperatorActions() metric.Int64Counter {
+	runtimeQueueOperatorActionsInit.Do(func() {
+		var err error
+		runtimeQueueOperatorActions, err = Meter().Int64Counter(
+			"hotplex.runtime.queue_actions",
+			metric.WithDescription("Operator input-queue decisions applied. Labels: action (cancel|clear), result (ok|error)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.runtime.queue_actions", err)
+		}
+	})
+	return runtimeQueueOperatorActions
 }
 
 func ExecutionDeliveryOutcome() metric.Int64Counter {

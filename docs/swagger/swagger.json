@@ -1951,6 +1951,77 @@
                 }
             }
         },
+        "/admin/executions/{id}/queue-cancel": {
+            "post": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Settles a durable-queue input that has NOT been dispatched yet. Conditional on the item still being queued: once the dispatch boundary is crossed the input may be running or finished, and the call returns 409 instead of a false success. Requires runtime:write scope.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin API"
+                ],
+                "summary": "Cancel one queued input",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Execution ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Operator rationale",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.queueActionBody"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Queued input cancelled",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid reason or evidence_ref",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Insufficient scope: need runtime:write",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Input is no longer queued: it has been dispatched",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Queue dispatcher not configured",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/admin/health": {
             "get": {
                 "security": [
@@ -2338,6 +2409,71 @@
                     },
                     "500": {
                         "description": "Failed to delete session",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/sessions/{id}/queue-clear": {
+            "post": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Cancels every queued-but-not-dispatched input for a session. Inputs already dispatched (running, finished or fenced) are left alone. Requires runtime:write scope.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin API"
+                ],
+                "summary": "Clear a session's undispatched input queue",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Session ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Operator rationale",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.queueActionBody"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Number of queued inputs settled",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid session id, reason or evidence_ref",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Insufficient scope: need runtime:write",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Queue dispatcher not configured",
                         "schema": {
                             "$ref": "#/definitions/admin.ErrorResponse"
                         }
@@ -4074,11 +4210,19 @@
         "admin.RuntimePlanReport": {
             "type": "object",
             "properties": {
+                "from_launch": {
+                    "description": "FromLaunch reports whether Plan is what this session's current run was\nACTUALLY launched under. False means it was re-resolved against the live\nconfig — a different question, and one that must not be read as history.",
+                    "type": "boolean"
+                },
                 "observed": {
                     "$ref": "#/definitions/agentspec.ObservedSummary"
                 },
                 "plan": {
                     "$ref": "#/definitions/agentspec.EffectiveRuntimePlanView"
+                },
+                "plan_applied": {
+                    "description": "PlanApplied reports whether the recorded run was started from its plan\n(authoritative rollout) or only shadow-compared against it. A plan that\nmerely AGREED with the legacy parameters is not an applied plan.",
+                    "type": "boolean"
                 }
             }
         },
@@ -4430,6 +4574,17 @@
                 },
                 "expected_fence_version": {
                     "type": "integer"
+                },
+                "reason": {
+                    "type": "string"
+                }
+            }
+        },
+        "admin.queueActionBody": {
+            "type": "object",
+            "properties": {
+                "evidence_ref": {
+                    "type": "string"
                 },
                 "reason": {
                     "type": "string"

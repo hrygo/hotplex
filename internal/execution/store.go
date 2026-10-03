@@ -288,6 +288,12 @@ type Store interface {
 	// limit<=0 uses the store default.
 	QueueBySession(ctx context.Context, sessionID string, limit int) ([]*QueueEntry, error)
 
+	// QueuedByClientMessage returns the execution record for one queued input
+	// identified by the client's own message ID, or ErrNotFound when no queued
+	// input carries that key. It exists so a retried submission can be answered
+	// with the durable record it already has instead of a weaker synthetic one.
+	QueuedByClientMessage(ctx context.Context, sessionID, clientMessageID string) (*Record, error)
+
 	// QueueDepth returns the number of undispatched inputs across the instance.
 	// It is read from the queue itself rather than from a maintained counter,
 	// so no delete path can leak capacity by forgetting to report.
