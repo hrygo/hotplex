@@ -1673,10 +1673,19 @@ export function useHotPlexRuntime({
                 settlement.kind === "volatile-accepted"
             ) {
                 // The gateway staged the input in process memory (supplement
-                // buffer). It never re-ACKs that input, so the dispatch must be
-                // released or the head-of-line item blocks the queue forever.
-                // It is deliberately NOT recorded as delivered: buffering is not
-                // a delivery proof, and the running parent turn stays active.
+                // buffer). It is deliberately NOT recorded as delivered:
+                // buffering is not a delivery proof, and the running parent
+                // turn stays active.
+                //
+                // The release below only fires for a dispatch the queue store
+                // still tracks in "sending" state, and no production path
+                // creates one today: drainQueue pops every queued item through
+                // popAllDispatchable before dispatching them merged, so
+                // activeQueueDispatchRef is never set and a volatile
+                // acceptance on that path is a deliberate no-op — the parent
+                // turn's terminal envelope is what ends the turn. The branch
+                // remains for a future per-item dispatch path and must not be
+                // read as protection that is load-bearing today.
                 const releasedItem = queueStore.releaseVolatileAccepted(
                     queuedDispatch.sessionId,
                     data.client_message_id,
