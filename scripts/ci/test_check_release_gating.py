@@ -91,6 +91,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Verify
+        run: python3 scripts/ci/verify_release_artifacts.py --dir dist
       - uses: softprops/action-gh-release@v3.0.0
 """
 
@@ -356,6 +358,38 @@ jobs:
         self.assertNotEqual(RELEASE_HEADER, broken, "fixture did not apply")
         problems = self.check(broken, VALIDATE_HEADER)
         self.assertTrue(any("npm view" in p for p in problems), problems)
+
+    # -- Verification must come before publication -----------------------
+    def test_publish_without_verification_is_rejected(self):
+        broken = RELEASE_HEADER.replace(
+            "      - name: Verify\n"
+            "        run: python3 scripts/ci/verify_release_artifacts.py --dir dist\n",
+            "",
+        )
+        self.assertNotEqual(RELEASE_HEADER, broken, "fixture did not apply")
+        problems = self.check(broken, VALIDATE_HEADER)
+        self.assertTrue(
+            any("without running verify_release_artifacts.py" in p for p in problems),
+            problems,
+        )
+
+    def test_verification_after_publication_is_rejected(self):
+        """Checking the artifacts once the release page exists can only ever
+        annotate a page that is already public."""
+        broken = RELEASE_HEADER.replace(
+            "      - name: Verify\n"
+            "        run: python3 scripts/ci/verify_release_artifacts.py --dir dist\n"
+            "      - uses: softprops/action-gh-release@v3.0.0\n",
+            "      - uses: softprops/action-gh-release@v3.0.0\n"
+            "      - name: Verify\n"
+            "        run: python3 scripts/ci/verify_release_artifacts.py --dir dist\n",
+        )
+        self.assertNotEqual(RELEASE_HEADER, broken, "fixture did not apply")
+        problems = self.check(broken, VALIDATE_HEADER)
+        self.assertTrue(
+            any("creates the release before verifying" in p for p in problems),
+            problems,
+        )
 
 if __name__ == "__main__":
     unittest.main()

@@ -266,6 +266,10 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      # Keyless signing and provenance attestation use OIDC, not a key we own.
+      # No private key is created, purchased or stored by this workflow.
+      id-token: write
+      attestations: write
     steps:
       - name: Download all binaries
         uses: actions/download-artifact@v7
@@ -324,6 +328,40 @@ jobs:
             exit 1
           fi
           echo "${COUNT} provenance file(s) declare ${SHA}"
+
+      - name: Generate SBOMs
+        uses: anchore/sbom-action@v0.24.3
+        with:
+          path: dist
+          format: cyclonedx-json
+          output-file: sbom
+          artifact-name: sbom
+
+      - name: Sign the checksums
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Keyless-sign checksums.txt
+        env:
+          DIGEST: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --output-signature dist/checksums.txt.sig dist/checksums.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: dist/hotplex-*.tar.gz
+
+      - name: Verify what is about to be published
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The same verification a downloader performs: checksums, declared
+          # source SHA, an SBOM per artifact, a signature and an attestation.
+          # It runs here so a broken release fails before the page exists,
+          # rather than being discovered by whoever installs it.
+          python3 scripts/ci/verify_release_artifacts.py --dir dist --expect-sha "${SHA}"
 
       - name: Create Release
         uses: softprops/action-gh-release@v3.0.0

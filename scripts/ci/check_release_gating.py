@@ -27,6 +27,7 @@ PROP_RE = re.compile(r"^    ([A-Za-z0-9_-]+):\s*(.*)$")
 NESTED_RE = re.compile(r"^      ([A-Za-z0-9_-]+):\s*(.*)$")
 LIST_ITEM_RE = re.compile(r"^      -\s+(.*)$")
 STEP_USE_RE = re.compile(r"^\s*-?\s*uses:\s*(\S+)")
+STEP_RUN_RE = re.compile(r"^\s*-?\s*run:\s*(.*)$")
 CHECKOUT_REF_RE = re.compile(r"^\s*ref:\s*(.+?)\s*$")
 
 
@@ -36,11 +37,16 @@ class Workflow:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.jobs: dict[str, dict] = {}
+        # Raw text per job. A `run: |` block hides its real command on the
+        # following lines, so step ORDER can only be judged against the
+        # original text, not against the parsed action names.
+        self.raw: dict[str, str] = {}
         self._parse(path.read_text(encoding="utf-8"))
 
     def _parse(self, text: str) -> None:
         in_jobs = False
         current: str | None = None
+        collected: list[str] = []
         in_steps = False
         in_needs = False
         nested: dict | None = None
@@ -53,6 +59,8 @@ class Workflow:
                 continue
             # A top-level key ends the jobs block.
             if raw[:1] not in (" ", "\t"):
+                if current is not None:
+                    self.raw[current] = "\n".join(collected)
                 in_jobs = False
                 current = None
                 nested = None
@@ -60,7 +68,10 @@ class Workflow:
 
             job_match = JOB_RE.match(raw)
             if job_match:
+                if current is not None:
+                    self.raw[current] = "\n".join(collected)
                 current = job_match.group(1)
+                collected = []
                 self.jobs[current] = {"needs": [], "steps": []}
                 in_steps = False
                 in_needs = False
@@ -68,6 +79,7 @@ class Workflow:
                 continue
             if current is None:
                 continue
+            collected.append(raw)
 
             prop = PROP_RE.match(raw)
             if prop:
@@ -103,6 +115,20 @@ class Workflow:
                 use = STEP_USE_RE.match(raw)
                 if use:
                     self.jobs[current]["steps"].append(use.group(1))
+                    continue
+                # A `run:` step is recorded too: whether verification happens
+                # BEFORE publication is a question of step order, not of which
+                # steps exist.
+                run = STEP_RUN_RE.match(raw)
+                if run:
+                    self.jobs[current]["steps"].append(f"run:{run.group(1).strip()}")
+
+        # The final job is never followed by another job header, and a file
+        # ending in a step has no trailing top-level line to trigger the flush
+        # above. Without this the last job's raw text is silently empty, which
+        # turns the ordering check into a false positive.
+        if current is not None and current in self.jobs and current not in self.raw:
+            self.raw[current] = "\n".join(collected)
 
     def job(self, name: str) -> dict:
         return self.jobs.get(name, {})
@@ -298,6 +324,26 @@ def check(repo_root: Path) -> list[str]:
             "configs/worker-runtime-lock.json, not from whatever upstream "
             "publishes that day",
         )
+
+    # -- Verification must precede publication, not follow it ----------
+    # Checking the artifacts after the release page exists means the check can
+    # only ever annotate a page that is already public.
+    for producer in release.uses("softprops/action-gh-release"):
+        raw = release.raw.get(producer, "")
+        publish_at = raw.find("softprops/action-gh-release")
+        verify_at = raw.find("verify_release_artifacts.py")
+        require(
+            verify_at > -1,
+            f"release.yml: '{producer}' publishes without running "
+            "verify_release_artifacts.py; nothing checks the artifacts it ships",
+        )
+        if verify_at > -1 and publish_at > -1:
+            require(
+                verify_at < publish_at,
+                f"release.yml: '{producer}' creates the release before verifying "
+                "the artifacts; a failed check could then only annotate a page "
+                "that is already public",
+            )
 
     return problems
 
