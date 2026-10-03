@@ -54,8 +54,8 @@ admin:
 | `stats:read` | - | - | 🟢 Read | - | - | - | `GET /admin/stats`<br>`GET /admin/metrics`<br>`GET /admin/sessions/pool` |
 | `config:read` | - | - | - | 🟢 Read | - | - | `POST /admin/config/validate` |
 | `config:write` | - | - | - | 🟠 Write | - | - | `POST /admin/config/rollback` |
-| `runtime:read` | - | - | - | - | - | - | `GET /admin/executions/fences`<br>`GET /admin/sessions/{id}/runtime-plan`（需与 `session:read` 同时持有） |
-| `runtime:write` | - | - | - | - | - | - | `POST /admin/executions/{id}/fence-action` |
+| `runtime:read` | - | - | - | - | - | - | `GET /admin/executions/fences`<br>`GET /admin/effects`<br>`GET /admin/effects/{id}`<br>`GET /admin/sessions/{id}/runtime-plan`（需与 `session:read` 同时持有） |
+| `runtime:write` | - | - | - | - | - | - | `POST /admin/executions/{id}/fence-action`<br>`POST /admin/effects/{id}/action` |
 | `admin:read` | - | - | - | - | 🟢 Read | 🟢 Read | `GET /admin/logs`<br>`GET /admin/debug/...`<br>`GET /admin/bots`<br>`GET /admin/cron/jobs` |
 | `admin:write` | - | - | - | - | - | 🟠 Write | `POST/PATCH/DELETE /admin/cron/jobs`<br>`POST /admin/cron/jobs/{id}/run` |
 
@@ -105,6 +105,7 @@ Rate Limit 和 IP Whitelist 支持配置热重载，无需重启生效。
 | Audit | `audit.identity_link.create` / `audit.identity_link.delete` |
 | Config | `config.rollback` / `config.validate` |
 | Runtime Fence（#877） | `runtime.fence.action`（middleware slog，decision 无关）<br>`runtime.fence.resolve` / `runtime.fence.abandon`（`user_activity` 行，含 reason/evidence_ref） |
+| Runtime Effect | `runtime.effect.action`（middleware slog，decision 无关）<br>`runtime.effect.abandon` / `runtime.effect.mark_delivered` / `runtime.effect.requeue`（`user_activity` 行，含 reason/evidence_ref；永不记录消息正文） |
 | 多租户成员/邀请 | `member.status.update` / `invitation.create` / `invitation.delete` |
 | 认证拒绝 | `auth.denied` |
 
@@ -157,6 +158,9 @@ curl -H "Authorization: Bearer $TOKEN" \
 | GET | `/admin/executions/fences` | `runtime:read` | 列出阻塞新输入的 fenced executions |
 | POST | `/admin/executions/{id}/fence-action` | `runtime:write` | 应用 operator 决策（resolve/abandon），以 fence_version 为条件 |
 | GET | `/admin/sessions/{id}/runtime-plan` | `runtime:read` + `session:read` | 会话的 desired-state plan（redacted）与 observed bootstrap 摘要 |
+| GET | `/admin/effects` | `runtime:read` | 列出外部交付 effect 及其生命周期状态 |
+| GET | `/admin/effects/{id}` | `runtime:read` | 单个 effect 及其逐次发送尝试历史 |
+| POST | `/admin/effects/{id}/action` | `runtime:write` | 对不确定交付应用 operator 决策（abandon/mark_delivered/requeue），以 `expected_status` 为条件 |
 
 **GET /admin/executions/fences** — 列出运行时结局不明（runtime unknown）并触发 fence 的 execution。fenced execution 会阻塞同 session 的新输入，直至 operator 决策。
 
@@ -180,6 +184,23 @@ curl -H "Authorization: Bearer $TOKEN" \
 错误码：`400 BAD_REQUEST`（字段校验）/ `403 INSUFFICIENT_SCOPE` / `404 FENCE_NOT_FOUND` / `409 FENCE_CONFLICT` / `503 SERVICE_UNAVAILABLE`（store 未配置或超时）。收到 409 必须重新 inspect 当前 fence 状态后审慎重试 —— 并发 operator 或 inspect 与 action 之间的网关重启都会触发冲突，服务端不自动重试。`abandon` 成功后 best-effort 通知在线连接终态。
 
 **GET /admin/sessions/{id}/runtime-plan** — 返回会话的 EffectiveRuntimePlan 诊断投影（#946 spec §6.6）：`plan`（redacted view：plan hash、worker_type、permission/sandbox 摘要、env key **名称**、source refs、warnings、blocked codes）与 `observed`（bootstrap 状态：`planned` / `unknown` / `declared` 及 permission ceiling）。投影由会话持久化事实 + 当前 config 按需计算，无 plan 表、无第二份持久化真相；blocked plan 返回 200 并携带 bounded 拦截原因与空 `plan_hash`（blocked 是有效诊断载荷，不是 HTTP 错误）。响应永不包含 prompt、完整命令、model、工具清单或任何值内容。
+
+**外部交付 effect 端点** — 交付 effect 是一次「已向外部渠道投递」的独立事实，与 execution fence 是**两套不相交的 operator 入口**：fence 回答「这次运行还能否接收新输入」，effect 回答「这条消息到底送没送出去」。共用一个端点会让 fence 决策悄悄改写交付历史，或让交付决策解开一个被 fence 的运行。
+
+**GET /admin/effects** — 分页列出交付 effect。参数：`status`（按交付状态过滤）、`limit`（默认 100，上限 500）、`offset`。返回 `{"effects": [...], "limit": N, "offset": N}`。列表项为刻意收窄的无内容投影：`effect_id`、`occurrence_id`、`session_id`、`execution_id`、`delivery_status`、`target_kind`、`target_ref`、`attempt`、`error_code`、`reason`、`provider_ref`、`evidence_ref`、`lease_version`、`created_at`、`updated_at` —— 不含消息正文、payload、凭证或任何由用户内容派生的字段。
+
+**GET /admin/effects/{id}** — 返回 `{"effect": {...}, "attempts": [...]}`，attempts 按发送次序给出每次尝试实际建立了什么：`attempt`、`owner_instance_id`、`lease_version`、`started_at`、`finished_at`、`in_flight`、`outcome`、`rejection_class`、`provider_ref`、`error_code`、`reason`。**lease token 是写凭据，永不投影**；正文与 tool args 同样不返回。`in_flight: true` 表示该次尝试的租约仍有效，不表示消息已送达。
+
+**POST /admin/effects/{id}/action** — 对不确定交付的人工决策入口。请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|:---:|------|
+| `decision` | string | ✅ | `abandon`（放弃这笔交付，置 failed）/ `mark_delivered`（operator 依据外部证据确认已送达）/ `requeue`（允许再次发送，产生新的 attempt，**不产生新的 effect**） |
+| `expected_status` | string | ✅ | 必须是 `unknown`：只有结局不明的交付才接受人工决策，其余状态一律 `400` |
+| `reason` | string | ✅ | operator 理由，1–512 字符；进入审计层与 effect 的 operator 归因字段，绝不冒充 provider 说法 |
+| `evidence_ref` | string | - | 工单/run 引用指针，≤256 字符；仅指针，不允许内联消息内容 |
+
+actor 取自鉴权上下文（`ActorFromRequest`），**绝不来自请求体**。错误码：`400 BAD_REQUEST` / `403 INSUFFICIENT_SCOPE` / `404 EFFECT_NOT_FOUND` / `409 EFFECT_CONFLICT` / `503 SERVICE_UNAVAILABLE`（effect store 未配置或超时）。收到 409 必须重新 inspect 后再决定 —— 并发 operator 或后台恢复流程已经改动了这笔交付的状态，服务端不自动重试。
 
 ### 监控指标
 
@@ -551,9 +572,11 @@ zip 格式、文件类型白名单与安全约束同上方「Skill 管理（admi
 | 404 | `NOT_FOUND` | Session/Cron Job/Invitation 未找到 |
 | 404 | `WORKSPACE_NOT_FOUND` | workspace id 不存在 |
 | 404 | `FENCE_NOT_FOUND` | fence-action 目标 execution 不存在 |
+| 404 | `EFFECT_NOT_FOUND` | effect 端点目标 effect 不存在 |
 | 409 | `CONFLICT` | 资源状态冲突 |
 | 409 | `RESTART_REJECTED` | 已有 Gateway 重启事务 |
 | 409 | `FENCE_CONFLICT` | fence_version 条件更新失败；重新 inspect 后审慎重试，勿自动重试（#877） |
+| 409 | `EFFECT_CONFLICT` | effect 条件更新失败（已不再是 unknown）；重新 inspect 后审慎重试，勿自动重试 |
 | 409 | `WORKSPACE_VERSION_MISMATCH` | PATCH workspace 乐观并发冲突（`updated_at` CAS 失败，re-fetch 后重试） |
 | 409 | `WORKSPACE_NOT_EMPTY` | workspace 存在活跃会话，拒绝改 `work_dir` / 删除 |
 | 409 | `WORK_DIR_TAKEN` | workspace `work_dir` 已被该 owner 的其他 workspace 占用 |

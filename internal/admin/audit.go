@@ -47,6 +47,10 @@ const (
 	AuditRuntimeFenceAction            = "runtime.fence.action"  // #877 decision-agnostic middleware line
 	AuditRuntimeFenceResolve           = "runtime.fence.resolve" // #877 specific decision (user_activity)
 	AuditRuntimeFenceAbandon           = "runtime.fence.abandon" // #877 specific decision (user_activity)
+	AuditRuntimeEffectAction           = "runtime.effect.action" // decision-agnostic middleware line
+	AuditRuntimeEffectAbandon          = "runtime.effect.abandon"
+	AuditRuntimeEffectMarkDelivered    = "runtime.effect.mark_delivered"
+	AuditRuntimeEffectRequeue          = "runtime.effect.requeue"
 
 	// AuditResult* — stable "result" field values. Reuse instead of literals so
 	// dashboard filters stay correct (issue #788 review P3).
@@ -116,6 +120,11 @@ func adminActionFor(method, path string) string {
 		return AuditCronTrigger
 	case strings.Contains(path, "/fence-action"):
 		return AuditRuntimeFenceAction
+	case strings.Contains(path, "/effects/"):
+		// GET /admin/effects/{id} is a read; only the write verb reaches the
+		// audit table, and it stays decision-agnostic here — the
+		// decision-specific row is written by the handler itself.
+		return AuditRuntimeEffectAction
 	case strings.Contains(path, "/config/rollback"):
 		return AuditConfigRollback
 	case strings.Contains(path, "/config/validate"):

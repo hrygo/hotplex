@@ -6,6 +6,7 @@ import (
 
 	"github.com/hrygo/hotplex/internal/admin"
 	"github.com/hrygo/hotplex/internal/config"
+	"github.com/hrygo/hotplex/internal/effect"
 	"github.com/hrygo/hotplex/internal/eventstore"
 	"github.com/hrygo/hotplex/internal/execution"
 	"github.com/hrygo/hotplex/internal/gateway"
@@ -181,6 +182,36 @@ func (a *executionProviderAdapter) ListFences(ctx context.Context, sessionID str
 
 func (a *executionProviderAdapter) ApplyFenceDecision(ctx context.Context, request execution.FenceActionRequest) (*execution.Record, error) {
 	return a.store.ApplyFenceDecision(ctx, request)
+}
+
+// effectProviderAdapter exposes the delivery ledger to the Admin API for the
+// operator effect console. Pass-through only — the store owns every
+// conditional-update semantic, so the adapter cannot introduce a second way to
+// move an effect.
+type effectProviderAdapter struct {
+	store effect.Store
+}
+
+func (a *effectProviderAdapter) ListForOperator(
+	ctx context.Context, f effect.OperatorListFilter,
+) ([]*effect.Effect, error) {
+	return a.store.ListForOperator(ctx, f)
+}
+
+func (a *effectProviderAdapter) GetByID(ctx context.Context, effectID string) (*effect.Effect, error) {
+	return a.store.GetByID(ctx, effectID)
+}
+
+func (a *effectProviderAdapter) ListAttempts(
+	ctx context.Context, effectID string,
+) ([]*effect.Attempt, error) {
+	return a.store.ListAttempts(ctx, effectID)
+}
+
+func (a *effectProviderAdapter) ApplyOperatorAction(
+	ctx context.Context, req effect.OperatorActionRequest,
+) (*effect.Effect, error) {
+	return a.store.ApplyOperatorAction(ctx, req)
 }
 
 // runtimeEventNotifier emits the additive runtime.execution.failed event with

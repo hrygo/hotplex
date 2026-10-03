@@ -58,8 +58,8 @@ func newCronEffectDelivery(
 	owners *adapterLookup,
 	occurrences cron.OccurrenceStore,
 	jobs cron.Store,
+	store effect.Store,
 ) cron.EffectDelivery {
-	store := effectStoreFor(log, stores)
 	if store == nil {
 		return nil
 	}

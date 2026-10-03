@@ -353,6 +353,8 @@ Admin 响应中，永不作为指标 label）。
 |------|------|------|
 | `hotplex.runtime.fence_actions` | Counter | 通过 Admin API 应用的 operator fence 决策，labels: `decision`（resolve\|abandon）、`result`（ok\|conflict\|error） |
 | `hotplex.runtime.fence_conflicts` | Counter | fence-version 冲突（409，条件更新匹配 0 行）；上升说明 operator 或网关重启在 inspect 与 action 之间发生竞态 |
+| `hotplex.runtime.effect_actions` | Counter | 通过 Admin API 应用的 operator 外部交付决策，labels: `decision`（abandon\|mark_delivered\|requeue）、`result`（ok\|conflict\|error） |
+| `hotplex.runtime.effect_conflicts` | Counter | effect 状态冲突（409，effect 已不再是 unknown）；上升说明多个 operator 或恢复流程与人工决策竞争同一笔交付 |
 | `hotplex.runtime.plan_resolutions` | Counter | EffectiveRuntimePlan 影子解析次数，label: `result`（ok\|blocked） |
 | `hotplex.runtime.plan_blocked` | Counter | fail-closed 拦截的 plan，label: `code`（unknown_worker_type\|invalid_permission_mode\|invalid_sandbox_mode\|facts_missing_or_conflicting\|capability_unverifiable\|secret_shaped_value） |
 | `hotplex.runtime.plan_observed` | Counter | plan 读路径返回的 observed bootstrap 状态，label: `state`（planned\|unknown\|declared\|partial\|enforced） |
@@ -365,6 +367,12 @@ sum by (decision, result) (rate(hotplex_runtime_fence_actions_total[5m]))
 
 # fence 冲突率（持续非零说明存在并发 operator 或重启竞态）
 rate(hotplex_runtime_fence_conflicts_total[5m])
+
+# 不确定交付的处置速率（ok 为成功决策，conflict 需人工复查后重试）
+sum by (decision, result) (rate(hotplex_runtime_effect_actions_total[5m]))
+
+# 交付决策冲突率（持续非零说明同一笔交付被并发决策）
+rate(hotplex_runtime_effect_conflicts_total[5m])
 
 # plan 拦截率（影子模式下非零即配置边界问题，blocked plan 永不静默成功）
 sum(rate(hotplex_runtime_plan_blocked_total[5m]))

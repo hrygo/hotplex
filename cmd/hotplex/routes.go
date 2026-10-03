@@ -154,6 +154,12 @@ func setupRoutes(
 			&runtimeEventNotifier{hub: hub},
 		)
 	}
+	// Delivery effect console: inspect effects and their per-attempt history,
+	// and apply a bounded operator decision to an uncertain delivery.
+	// Nil store → endpoints answer 503 instead of crashing the mux.
+	if deps.EffectStore != nil {
+		adminAPI.SetRuntimeEffects(&effectProviderAdapter{store: deps.EffectStore})
+	}
 
 	if cfg.Admin.RateLimitEnabled {
 		limiter := admin.NewRateLimiter(cfg.Admin.RequestsPerSec, cfg.Admin.Burst)
@@ -205,6 +211,15 @@ func setupRoutes(
 	// a fencing token. GET needs runtime:read, POST needs runtime:write.
 	adminMux.HandleFunc("GET /admin/executions/fences", adminAPI.HandleListFences)
 	adminMux.HandleFunc("POST /admin/executions/{id}/fence-action", adminAPI.HandleFenceAction)
+
+	// Delivery effect API: inspect external deliveries and their attempts, and
+	// decide an uncertain one. Separate from the fence endpoints on purpose —
+	// a delivery decision must never unblock a run, and a fence decision must
+	// never rewrite delivery history. GET needs runtime:read, POST needs
+	// runtime:write.
+	adminMux.HandleFunc("GET /admin/effects", adminAPI.HandleListEffects)
+	adminMux.HandleFunc("GET /admin/effects/{id}", adminAPI.HandleGetEffect)
+	adminMux.HandleFunc("POST /admin/effects/{id}/action", adminAPI.HandleEffectAction)
 
 	// User activity API (issue #833) - by-user audit query + export
 	adminMux.HandleFunc("GET /admin/users/{id}/activity", adminAPI.HandleUserActivity)

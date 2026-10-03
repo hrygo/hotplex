@@ -1117,6 +1117,12 @@ var (
 	runtimeFenceConflicts     metric.Int64Counter
 	runtimeFenceConflictsInit sync.Once
 
+	runtimeEffectActions     metric.Int64Counter
+	runtimeEffectActionsInit sync.Once
+
+	runtimeEffectConflicts     metric.Int64Counter
+	runtimeEffectConflictsInit sync.Once
+
 	runtimePlanResolutions     metric.Int64Counter
 	runtimePlanResolutionsInit sync.Once
 
@@ -1461,6 +1467,44 @@ func RuntimeFenceConflicts() metric.Int64Counter {
 		}
 	})
 	return runtimeFenceConflicts
+}
+
+// ─── Runtime Effect Instruments ──────────────────────────────────────
+
+// RuntimeEffectActions counts operator decisions applied to an uncertain
+// delivery effect. Labels: decision (abandon|mark_delivered|requeue),
+// result (ok|conflict|error). Low-cardinality only — no effect IDs, no
+// actors, no message content.
+func RuntimeEffectActions() metric.Int64Counter {
+	runtimeEffectActionsInit.Do(func() {
+		var err error
+		runtimeEffectActions, err = Meter().Int64Counter(
+			"hotplex.runtime.effect_actions",
+			metric.WithDescription("Operator effect decisions applied. Labels: decision (abandon|mark_delivered|requeue), result (ok|conflict|error)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.runtime.effect_actions", err)
+		}
+	})
+	return runtimeEffectActions
+}
+
+// RuntimeEffectConflicts counts effect-status conflicts (409). A rising value
+// means operators decided against a stale view, or a late receipt arrived
+// while one was deciding. Neither is a bug; a spike means the console is
+// showing operators stale state.
+func RuntimeEffectConflicts() metric.Int64Counter {
+	runtimeEffectConflictsInit.Do(func() {
+		var err error
+		runtimeEffectConflicts, err = Meter().Int64Counter(
+			"hotplex.runtime.effect_conflicts",
+			metric.WithDescription("Effect-status conflicts on operator decisions (conditional update matched 0 rows)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.runtime.effect_conflicts", err)
+		}
+	})
+	return runtimeEffectConflicts
 }
 
 // ─── Runtime Plan Instruments (#946) ────────────────────────────────

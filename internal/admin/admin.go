@@ -14,6 +14,7 @@ import (
 
 	"github.com/hrygo/hotplex/internal/audit"
 	"github.com/hrygo/hotplex/internal/config"
+	"github.com/hrygo/hotplex/internal/effect"
 	"github.com/hrygo/hotplex/internal/eventstore"
 	"github.com/hrygo/hotplex/internal/execution"
 	"github.com/hrygo/hotplex/internal/security"
@@ -99,6 +100,17 @@ type RuntimeExecutionProvider interface {
 	ApplyFenceDecision(ctx context.Context, request execution.FenceActionRequest) (*execution.Record, error)
 }
 
+// RuntimeEffectProvider is the narrow delivery-ledger view used by the effect
+// operator endpoints. Injected from cmd/hotplex so admin stays decoupled from
+// the gateway; errors must preserve effect.ErrEffectNotFound /
+// effect.ErrLeaseLost for status mapping.
+type RuntimeEffectProvider interface {
+	ListForOperator(ctx context.Context, f effect.OperatorListFilter) ([]*effect.Effect, error)
+	GetByID(ctx context.Context, effectID string) (*effect.Effect, error)
+	ListAttempts(ctx context.Context, effectID string) ([]*effect.Attempt, error)
+	ApplyOperatorAction(ctx context.Context, req effect.OperatorActionRequest) (*effect.Effect, error)
+}
+
 // RuntimeEventNotifier emits the additive runtime.execution.failed event for
 // an operator abandon (#877). Best-effort: fenced sessions usually have no
 // connected clients, and the store write is already durable when this fires.
@@ -177,6 +189,7 @@ type AdminAPI struct {
 	builtinSkills    BuiltinSkillsCatalog     // Optional: embedded read-only Agent Skills
 	runtimeExec      RuntimeExecutionProvider // Optional: enables /admin/executions fence endpoints (#877); nil → 503
 	runtimeNotifier  RuntimeEventNotifier     // Optional: emits runtime.execution.failed on abandon (#877)
+	runtimeEffects   RuntimeEffectProvider    // Optional: enables /admin/effect endpoints; nil → 503
 }
 
 type Deps struct {
@@ -260,6 +273,10 @@ func (a *AdminAPI) SetRuntimeExecution(p RuntimeExecutionProvider, n RuntimeEven
 	a.runtimeExec = p
 	a.runtimeNotifier = n
 }
+
+// SetRuntimeEffects injects the delivery-ledger provider that backs the
+// operator effect endpoints. nil-safe: they return 503 until wired.
+func (a *AdminAPI) SetRuntimeEffects(p RuntimeEffectProvider) { a.runtimeEffects = p }
 
 func (a *AdminAPI) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

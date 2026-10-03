@@ -1628,6 +1628,194 @@
                 }
             }
         },
+        "/admin/effects": {
+            "get": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Lists external-delivery effects with their lifecycle state. Requires runtime:read scope.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin API"
+                ],
+                "summary": "List delivery effects",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Filter by delivery status",
+                        "name": "status",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Max results (default 100, max 500)",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Pagination offset",
+                        "name": "offset",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "effects list",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "403": {
+                        "description": "Insufficient scope: need runtime:read",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Effect store not configured",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/effects/{id}": {
+            "get": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Returns one effect plus every send attempt, so an operator can see what each try actually established. Requires runtime:read scope.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin API"
+                ],
+                "summary": "Inspect a delivery effect",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Effect ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "effect and attempts",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "403": {
+                        "description": "Insufficient scope: need runtime:read",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Effect not found",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Effect store not configured",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/effects/{id}/action": {
+            "post": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Abandons, confirms or requeues an unknown delivery effect. Conditional on expected_status; conflicts return 409 so the operator re-inspects instead of double-deciding. Requires runtime:write scope.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin API"
+                ],
+                "summary": "Apply operator effect action",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Effect ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Operator decision",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.effectActionBody"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Applied decision and updated effect fact",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid decision, status, reason or evidence_ref",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Insufficient scope: need runtime:write",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Effect not found",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Effect is no longer unknown: re-inspect before retrying",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Effect store not configured or timed out",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/admin/executions/fences": {
             "get": {
                 "security": [
@@ -4210,6 +4398,24 @@
                 "content": {
                     "type": "string",
                     "example": "You are a helpful assistant."
+                }
+            }
+        },
+        "admin.effectActionBody": {
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string"
+                },
+                "evidence_ref": {
+                    "type": "string"
+                },
+                "expected_status": {
+                    "description": "ExpectedStatus is the status the operator saw. The write is refused\nunless the effect is still in exactly that state.",
+                    "type": "string"
+                },
+                "reason": {
+                    "type": "string"
                 }
             }
         },

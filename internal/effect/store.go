@@ -63,6 +63,13 @@ type Store interface {
 	ListDueRetries(ctx context.Context, now time.Time, maxAttempts int64, limit int) ([]*Effect, error)
 	// ListAttempts returns the per-attempt facts for an effect, oldest first.
 	ListAttempts(ctx context.Context, effectID string) ([]*Attempt, error)
+	// ListForOperator returns effects for the operator console, newest first.
+	// Content is never included.
+	ListForOperator(ctx context.Context, f OperatorListFilter) ([]*Effect, error)
+	// ApplyOperatorAction records one conditional operator decision against an
+	// effect that is still unknown. It conflicts rather than overwrites when
+	// the effect moved in the meantime.
+	ApplyOperatorAction(ctx context.Context, req OperatorActionRequest) (*Effect, error)
 }
 
 const effectColumns = `effect_id, occurrence_id, delivery_ordinal, target_revision, attempt,

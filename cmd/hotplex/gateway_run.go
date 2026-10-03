@@ -35,6 +35,7 @@ import (
 	"github.com/hrygo/hotplex/internal/config"
 	"github.com/hrygo/hotplex/internal/cron"
 	"github.com/hrygo/hotplex/internal/dbutil"
+	"github.com/hrygo/hotplex/internal/effect"
 	"github.com/hrygo/hotplex/internal/eventstore"
 	"github.com/hrygo/hotplex/internal/execution"
 	"github.com/hrygo/hotplex/internal/gateway"
@@ -188,6 +189,7 @@ type GatewayDeps struct {
 	EventStore         eventStoreProvider
 	EventCollector     *eventstore.Collector
 	ExecutionStore     execution.Store
+	EffectStore        effect.Store
 	Auth               *security.Authenticator
 	Handler            *gateway.Handler
 	Bridge             *gateway.Bridge
@@ -349,6 +351,7 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 	// the scheduler is wired earlier than the messaging adapters.
 	cronEffectOwners := &adapterLookup{}
 	var cronEffectDelivery cron.EffectDelivery
+	var cronEffectStore effect.Store
 	// bridge is forward-declared (and assigned later at NewBridge) so this
 	// closure can clear busy-supplement buffers on session end. Mirrors the
 	// existing cronScheduler pattern. Nil before assignment — ClearPending is
@@ -693,6 +696,9 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 
 	// Cron scheduler: init after Bridge, before messaging adapters.
 	if cfg.Cron.Enabled {
+		// One ledger instance for both the cron delivery path and the operator
+		// console, so an operator reads exactly what the sender wrote.
+		cronEffectStore = effectStoreFor(log, stores)
 		var cronStore cron.Store
 		if stores.cron != nil {
 			cronStore = stores.cron
@@ -708,7 +714,8 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 			occurrenceStore = cron.NewSQLiteOccurrenceStore(stores.sqlDB, log, stores.writeMu)
 		}
 		cronEffectDelivery = newCronEffectDelivery(
-			log, stores, ownerInstanceID, cronEffectOwners, occurrenceStore, cronStore)
+			log, stores, ownerInstanceID, cronEffectOwners, occurrenceStore, cronStore,
+			cronEffectStore)
 		// Unfinished deliveries converge without an operator: the loop fences
 		// lapsed leases into unknown first, then finishes what is provably
 		// owed. Its first tick is deliberately late so messaging adapters are
@@ -831,6 +838,7 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 		EventStore:           stores.event,
 		EventCollector:       stores.collector,
 		ExecutionStore:       stores.execution,
+		EffectStore:          cronEffectStore,
 		Auth:                 auth,
 		Handler:              handler,
 		Bridge:               bridge,
