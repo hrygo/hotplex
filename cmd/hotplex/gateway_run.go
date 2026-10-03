@@ -694,6 +694,14 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 		} else {
 			cronStore = cron.NewSQLiteStore(stores.sqlDB, log, stores.writeMu)
 		}
+		// Occurrences share the job store's database and write mutex so a
+		// firing and its durable identity commit against the same ledger.
+		var occurrenceStore cron.OccurrenceStore
+		if stores.occurrences != nil {
+			occurrenceStore = stores.occurrences
+		} else {
+			occurrenceStore = cron.NewSQLiteOccurrenceStore(stores.sqlDB, log, stores.writeMu)
+		}
 		cronDelivery = cron.NewDelivery(log,
 			func(ctx context.Context, sessionID string) (string, error) {
 				if err := stores.collector.Flush(); err != nil {
@@ -711,6 +719,7 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 		cronScheduler = cron.New(cron.Deps{
 			Log:            log,
 			Store:          cronStore,
+			Occurrences:    occurrenceStore,
 			Bridge:         bridge,
 			SessionMgr:     sm,
 			Delivery:       cronDelivery,
@@ -1247,6 +1256,7 @@ type gatewayStores struct {
 	turnQuerier eventstore.TurnQuerier
 	collector   *eventstore.Collector
 	cron        cron.Store
+	occurrences cron.OccurrenceStore
 	chatAccess  messaging.ChatAccessStorer
 	writeMu     *sqlutil.WriteMu // nil when using PostgreSQL (WriteMu is SQLite-only)
 	db          *dbutil.DB
@@ -1345,6 +1355,7 @@ func initPGStores(ctx context.Context, cfg *config.Config, log *slog.Logger) (*g
 		turnQuerier: eventStore,
 		collector:   eventstore.NewCollector(eventStore, log),
 		cron:        cronStore,
+		occurrences: cron.NewPGOccurrenceStore(db, log),
 		chatAccess:  chatAccessStore,
 		db:          db,
 		sqlDB:       db.DB,

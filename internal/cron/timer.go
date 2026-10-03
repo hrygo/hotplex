@@ -178,7 +178,7 @@ func (tl *timerLoop) onTick() {
 				s.wg.Done()
 			}()
 			observability.CronFires().Add(s.ctx, 1, metric.WithAttributes(attribute.String("job_name", j.Name)))
-			s.executeJob(j)
+			s.executeJob(j, ScheduledTriggerFor(j))
 		}(execJob)
 	}
 
@@ -188,7 +188,7 @@ func (tl *timerLoop) onTick() {
 // executeJob runs a single job and updates its state.
 // The job must be a clone (not a shared map pointer).
 // Uses mergeJobState to avoid overwriting concurrent state changes (e.g. CLI disable).
-func (s *Scheduler) executeJob(job *CronJob) {
+func (s *Scheduler) executeJob(job *CronJob, trigger TriggerIdentity) {
 	// Resolve workdir with system fallback: explicit > platform-specific > worker default.
 	if job.WorkDir == "" && s.resolveWorkDir != nil {
 		if resolved := s.resolveWorkDir(job); resolved != "" {
@@ -209,17 +209,25 @@ func (s *Scheduler) executeJob(job *CronJob) {
 	defer cancel()
 
 	start := time.Now()
-	sessionKey, err := s.executor.Execute(ctx, job, timeout)
+	result, err := s.executor.Execute(ctx, job, trigger, timeout)
 	observability.CronDuration().Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(attribute.String("job_name", job.Name)))
 
-	job.State.LastRunID = sessionKey
+	// LastRunID stays a display pointer to the latest run; it is not the run
+	// fact itself — the occurrence is.
+	job.State.LastRunID = result.SessionID
 	if s.handlePostExecution(job, start.UnixMilli(), err, errorType(err)) {
+		return
+	}
+	if result.Duplicate {
+		// The trigger was already claimed by an earlier run. Nothing new was
+		// executed and nothing new may be delivered.
+		s.applyLifecycle(job)
 		return
 	}
 
 	// Deliver results for successful isolated_session runs.
 	if s.delivery != nil && !job.Silent && !HasCLIDelivery(job) {
-		s.delivery.Deliver(s.ctx, job, sessionKey)
+		s.delivery.Deliver(s.ctx, job, result.SessionID)
 	}
 	s.applyLifecycle(job)
 }

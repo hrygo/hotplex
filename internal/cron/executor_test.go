@@ -15,12 +15,14 @@ import (
 
 // mockBridge implements BridgeStarter for testing.
 type mockBridge struct {
-	startErr  error
-	lastStart worker.SessionStartParams // captures params from the most recent StartSession call
+	startErr   error
+	lastStart  worker.SessionStartParams // captures params from the most recent StartSession call
+	startCount int                       // number of StartSession calls, to prove a duplicate trigger ran once
 }
 
 func (m *mockBridge) StartSession(_ context.Context, p worker.SessionStartParams) error {
 	m.lastStart = p
+	m.startCount++
 	return m.startErr
 }
 
@@ -99,14 +101,25 @@ func testJob() *CronJob {
 	}
 }
 
+// testTrigger returns a stable manual trigger identity for executor tests.
+func testTrigger() TriggerIdentity {
+	return TriggerIdentity{Kind: TriggerManual, JobID: "cron_test", Nonce: "nonce-1"}
+}
+
+// newTestExecutor builds an executor with no occurrence store, for tests that
+// exercise dispatch behavior rather than occurrence persistence.
+func newTestExecutor(bridge BridgeStarter, sm SessionStateChecker) *Executor {
+	return NewExecutor(slog.Default(), bridge, sm, "", nil)
+}
+
 func TestExecutor_Execute_StartFails(t *testing.T) {
 	t.Parallel()
 
 	bridge := &mockBridge{startErr: errTestNotFound}
 	sm := &mockSessionStateChecker{workers: map[string]worker.Worker{}}
 
-	e := NewExecutor(slog.Default(), bridge, sm, "")
-	_, err := e.Execute(context.Background(), testJob(), 5*time.Minute)
+	e := newTestExecutor(bridge, sm)
+	_, err := e.Execute(context.Background(), testJob(), testTrigger(), 5*time.Minute)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "start cron session")
 }
@@ -117,8 +130,8 @@ func TestExecutor_Execute_WorkerNotFound(t *testing.T) {
 	bridge := &mockBridge{}
 	sm := &mockSessionStateChecker{workers: map[string]worker.Worker{}}
 
-	e := NewExecutor(slog.Default(), bridge, sm, "")
-	_, err := e.Execute(context.Background(), testJob(), 5*time.Minute)
+	e := newTestExecutor(bridge, sm)
+	_, err := e.Execute(context.Background(), testJob(), testTrigger(), 5*time.Minute)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "worker not found")
 }
@@ -131,8 +144,8 @@ func TestExecutor_Execute_InputFails(t *testing.T) {
 		defaultWorker: &mockWorker{inputErr: errTestNotFound},
 	}
 
-	e := NewExecutor(slog.Default(), bridge, sm, "")
-	_, err := e.Execute(context.Background(), testJob(), 5*time.Minute)
+	e := newTestExecutor(bridge, sm)
+	_, err := e.Execute(context.Background(), testJob(), testTrigger(), 5*time.Minute)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "input prompt")
 }
@@ -146,8 +159,8 @@ func TestExecutor_Execute_TimeoutWaiting(t *testing.T) {
 		defaultWorker:  &mockWorker{},
 	}
 
-	e := NewExecutor(slog.Default(), bridge, sm, "")
-	_, err := e.Execute(context.Background(), testJob(), 100*time.Millisecond)
+	e := newTestExecutor(bridge, sm)
+	_, err := e.Execute(context.Background(), testJob(), testTrigger(), 100*time.Millisecond)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "timeout")
 }
@@ -162,9 +175,9 @@ func TestExecutor_Execute_Success(t *testing.T) {
 		defaultWorker:  &mockWorker{},
 	}
 
-	e := NewExecutor(slog.Default(), bridge, sm, "")
+	e := newTestExecutor(bridge, sm)
 
-	gotKey, err := e.Execute(context.Background(), testJob(), 5*time.Second)
+	gotKey, err := e.Execute(context.Background(), testJob(), testTrigger(), 5*time.Second)
 	require.NoError(t, err)
 	require.NotEmpty(t, gotKey)
 }
@@ -182,10 +195,10 @@ func TestExecutor_Execute_NormalizesEmptyPlatformToCron(t *testing.T) {
 		defaultSession: &session.SessionInfo{State: "terminated"},
 		defaultWorker:  &mockWorker{},
 	}
-	e := NewExecutor(slog.Default(), bridge, sm, "")
+	e := newTestExecutor(bridge, sm)
 
 	job := testJob() // Platform is empty
-	_, err := e.Execute(context.Background(), job, 5*time.Second)
+	_, err := e.Execute(context.Background(), job, testTrigger(), 5*time.Second)
 	require.NoError(t, err)
 	require.Equal(t, "cron", bridge.lastStart.Platform,
 		"empty-platform cron job must be normalized to the cron platform for audit/metrics")
@@ -202,12 +215,12 @@ func TestExecutor_Execute_PreservesDeliveryPlatform(t *testing.T) {
 		defaultSession: &session.SessionInfo{State: "terminated"},
 		defaultWorker:  &mockWorker{},
 	}
-	e := NewExecutor(slog.Default(), bridge, sm, "")
+	e := newTestExecutor(bridge, sm)
 
 	job := testJob()
 	job.Platform = "feishu"
 	job.PlatformKey = map[string]string{"chat_id": "oc_123"}
-	_, err := e.Execute(context.Background(), job, 5*time.Second)
+	_, err := e.Execute(context.Background(), job, testTrigger(), 5*time.Second)
 	require.NoError(t, err)
 	require.Equal(t, "feishu", bridge.lastStart.Platform)
 }
@@ -291,12 +304,12 @@ func TestExecutor_Execute_WebhookPromptContainsPrefix(t *testing.T) {
 		defaultWorker:  mw,
 	}
 
-	e := NewExecutor(slog.Default(), bridge, sm, "")
+	e := newTestExecutor(bridge, sm)
 
 	job := testJob()
 	job.PlatformKey = map[string]string{"trigger": "webhook", "pr_number": "642"}
 
-	_, err := e.Execute(context.Background(), job, 5*time.Second)
+	_, err := e.Execute(context.Background(), job, testTrigger(), 5*time.Second)
 	require.NoError(t, err)
 	require.Contains(t, mw.lastInput, "WEBHOOK")
 	require.Contains(t, mw.lastInput, "PR #642")

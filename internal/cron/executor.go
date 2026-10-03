@@ -29,27 +29,95 @@ type SessionStateChecker interface {
 
 // Executor runs a single cron job by starting a worker session and delivering the prompt.
 type Executor struct {
-	log     *slog.Logger
-	bridge  BridgeStarter
-	sm      SessionStateChecker
-	sandbox string
+	log         *slog.Logger
+	bridge      BridgeStarter
+	sm          SessionStateChecker
+	sandbox     string
+	occurrences OccurrenceStore
+	// now is injectable so occurrence timestamps and schedule keys are
+	// deterministic under test.
+	now func() time.Time
 }
 
 // NewExecutor creates a new cron executor.
-func NewExecutor(log *slog.Logger, bridge BridgeStarter, sm SessionStateChecker, sandbox string) *Executor {
+func NewExecutor(
+	log *slog.Logger,
+	bridge BridgeStarter,
+	sm SessionStateChecker,
+	sandbox string,
+	occurrences OccurrenceStore,
+) *Executor {
 	return &Executor{
-		log:     log.With("component", "cron_executor"),
-		bridge:  bridge,
-		sm:      sm,
-		sandbox: sandbox,
+		log:         log.With("component", "cron_executor"),
+		bridge:      bridge,
+		sm:          sm,
+		sandbox:     sandbox,
+		occurrences: occurrences,
+		now:         time.Now,
 	}
 }
 
-// Execute runs a cron job: starts a session, sends the prompt, and waits for completion.
-// Returns the session key used for delivery routing.
+// ExecuteResult describes how one firing was resolved against the durable
+// occurrence ledger.
+type ExecuteResult struct {
+	// SessionID is the session the run used, empty on a rejected duplicate.
+	SessionID string
+	// OccurrenceID is the durable occurrence for this firing.
+	OccurrenceID string
+	// Duplicate is true when the trigger had already been claimed, so no new
+	// Agent run was started.
+	Duplicate bool
+}
+
+// Execute runs a cron job: claims its durable occurrence, starts a session,
+// sends the prompt, and waits for completion.
+//
+// The occurrence is claimed before any Worker starts, so a crash between
+// accept and dispatch cannot lose the fact that the trigger was taken, and a
+// repeated trigger resolves to the existing run instead of starting a second
+// Agent. Returns the result for delivery routing.
 // timeout is the execution deadline (from job.TimeoutSec or scheduler default).
-func (e *Executor) Execute(ctx context.Context, job *CronJob, timeout time.Duration) (string, error) {
-	sessionKey := session.DeriveCronSessionKey(job.ID, time.Now().UnixNano())
+func (e *Executor) Execute(
+	ctx context.Context,
+	job *CronJob,
+	trigger TriggerIdentity,
+	timeout time.Duration,
+) (ExecuteResult, error) {
+	var out ExecuteResult
+
+	now := e.now()
+	occ, err := NewOccurrence(trigger, now)
+	if err != nil {
+		return out, fmt.Errorf("cron executor: build occurrence: %w", err)
+	}
+	out.OccurrenceID = occ.OccurrenceID
+
+	if e.occurrences != nil {
+		stored, created, err := e.occurrences.Claim(ctx, occ)
+		if err != nil {
+			// A claim failure must not start an Agent: without a durable
+			// record we could neither deduplicate the trigger nor prove what
+			// it did.
+			return out, fmt.Errorf("cron executor: claim occurrence: %w", err)
+		}
+		occ = stored
+		out.OccurrenceID = stored.OccurrenceID
+		if !created {
+			// Already claimed. Returning the recorded identity lets the caller
+			// report the original run instead of executing a second one.
+			out.Duplicate = true
+			out.SessionID = stored.SessionID
+			e.log.Info("cron executor: duplicate trigger suppressed",
+				"job_id", job.ID, "occurrence_id", stored.OccurrenceID,
+				"status", stored.Status, "session_id", stored.SessionID)
+			return out, nil
+		}
+	}
+
+	// The session key derives from the occurrence, not from the wall clock, so
+	// a retry of the same firing lands on the same session identity.
+	sessionKey := session.DeriveCronSessionKey(job.ID, occurrenceEpoch(occ))
+	out.SessionID = sessionKey
 
 	// Merge platform context so the bridge can inject environment variables (like channel_id).
 	// Inject default sandbox first; per-job PlatformKey overrides below.
@@ -91,19 +159,35 @@ func (e *Executor) Execute(ctx context.Context, job *CronJob, timeout time.Durat
 		PlatformKey:  platformKey,
 		Title:        title,
 	}); err != nil {
-		return "", fmt.Errorf("start cron session: %w", err)
+		e.markOccurrence(ctx, occ, OccurrenceFailed, "SESSION_START_FAILED")
+		return out, fmt.Errorf("start cron session: %w", err)
 	}
 
 	w := e.sm.GetWorker(sessionKey)
 	if w == nil {
-		return "", fmt.Errorf("cron executor: worker not found after start")
+		e.markOccurrence(ctx, occ, OccurrenceFailed, "WORKER_NOT_FOUND")
+		return out, fmt.Errorf("cron executor: worker not found after start")
 	}
 
-	prompt := buildWebhookPrefix(job) + formatJobPrompt(job, time.Now())
+	// Bind the session and mark the run started before the first prompt byte
+	// reaches the Worker, so an interrupted run is still attributable.
+	if e.occurrences != nil {
+		if err := e.occurrences.BindSession(ctx, occ.OccurrenceID, sessionKey); err != nil {
+			e.log.Error("cron executor: bind occurrence session failed",
+				"occurrence_id", occ.OccurrenceID, "session_id", sessionKey, "err", err)
+		}
+		if err := e.occurrences.UpdateStatus(ctx, occ.OccurrenceID, OccurrenceStarted, "", e.now()); err != nil {
+			e.log.Error("cron executor: persist occurrence start failed",
+				"occurrence_id", occ.OccurrenceID, "err", err)
+		}
+	}
+
+	prompt := buildWebhookPrefix(job) + formatJobPrompt(job, e.now())
 	prompt += buildDeliverySuffix(job)
 
 	if err := w.Input(ctx, prompt, nil); err != nil {
-		return "", fmt.Errorf("cron executor: input prompt: %w", err)
+		e.markOccurrence(ctx, occ, OccurrenceFailed, "WORKER_INPUT_FAILED")
+		return out, fmt.Errorf("cron executor: input prompt: %w", err)
 	}
 
 	// Signal EOF so --print mode workers exit after processing instead of
@@ -112,11 +196,16 @@ func (e *Executor) Execute(ctx context.Context, job *CronJob, timeout time.Durat
 		_ = ci.CloseInput()
 	}
 
-	err := e.waitForCompletion(ctx, sessionKey, timeout)
+	err = e.waitForCompletion(ctx, sessionKey, timeout)
 
 	if err != nil {
 		e.log.Error("cron executor: session execution failed",
 			"session_id", sessionKey, "timeout", timeout, "err", err)
+		// A timeout is not proof that the Agent had no effect, so the
+		// occurrence stops at unknown rather than a retryable failure.
+		e.markOccurrence(ctx, occ, OccurrenceUnknown, "EXECUTION_TIMEOUT")
+	} else {
+		e.markOccurrence(ctx, occ, OccurrenceCompleted, "")
 	}
 
 	// Explicitly terminate the session to ensure the worker process exits immediately.
@@ -128,7 +217,31 @@ func (e *Executor) Execute(ctx context.Context, job *CronJob, timeout time.Durat
 		e.log.Warn("cron executor: failed to terminate session", "session_id", sessionKey, "err", termErr)
 	}
 
-	return sessionKey, err
+	return out, err
+}
+
+// occurrenceEpoch derives a stable per-occurrence epoch for the session key.
+func occurrenceEpoch(occ *Occurrence) int64 {
+	var sum uint64
+	for _, c := range []byte(occ.TriggerKey) {
+		sum = sum*131 + uint64(c)
+	}
+	return int64(sum) + occ.Generation
+}
+
+// markOccurrence records an occurrence lifecycle transition, logging rather
+// than propagating failures: the run outcome is already decided, and losing
+// the annotation must not turn a completed run into an error.
+func (e *Executor) markOccurrence(
+	ctx context.Context, occ *Occurrence, status OccurrenceStatus, errCode string,
+) {
+	if e.occurrences == nil || occ == nil {
+		return
+	}
+	if err := e.occurrences.UpdateStatus(ctx, occ.OccurrenceID, status, errCode, e.now()); err != nil {
+		e.log.Error("cron executor: persist occurrence status failed",
+			"occurrence_id", occ.OccurrenceID, "status", status, "err", err)
+	}
 }
 
 // resolveWorkDir computes the working directory for a cron job execution.

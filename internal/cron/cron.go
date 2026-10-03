@@ -60,6 +60,7 @@ type WorkDirResolver func(job *CronJob) string
 type Deps struct {
 	Log            *slog.Logger
 	Store          Store
+	Occurrences    OccurrenceStore
 	Bridge         BridgeStarter
 	SessionMgr     SessionStateChecker
 	Delivery       *Delivery
@@ -93,7 +94,7 @@ func New(deps Deps) *Scheduler {
 		defaultTimeout = time.Duration(deps.Cfg.DefaultTimeoutSec) * time.Second
 	}
 	s.defaultTimeout = defaultTimeout
-	s.executor = NewExecutor(deps.Log, deps.Bridge, deps.SessionMgr, deps.Cfg.DefaultSandbox)
+	s.executor = NewExecutor(deps.Log, deps.Bridge, deps.SessionMgr, deps.Cfg.DefaultSandbox, deps.Occurrences)
 	if deps.AttachedRouter != nil {
 		s.attachedHandler = NewAttachedSessionHandler(deps.Log, deps.AttachedRouter)
 	}
@@ -272,7 +273,11 @@ func (s *Scheduler) TriggerJob(ctx context.Context, job *CronJob) error {
 			s.tickLoop.releaseSlot()
 			s.wg.Done()
 		}()
-		s.executeJob(j)
+		// Each manual request carries its own nonce, so distinct requests stay
+		// distinct runs while the occurrence ledger still records that this
+		// exact request was taken. A webhook carrying a verified event ID
+		// deduplicates on that ID instead.
+		s.executeJob(j, RequestedTriggerFor(j, GenerateOccurrenceID(), j.PlatformKey["event_id"]))
 	}()
 	return nil
 }
@@ -466,7 +471,10 @@ func (s *Scheduler) scheduleCatchUp(jobs []*CronJob) {
 				return
 			}
 			s.log.Info("cron: catch-up executing", "job_id", j.ID, "name", j.Name, "delay_sec", d)
-			s.executeJob(j)
+			// A catch-up run is still the scheduled firing for this job's
+			// persisted next_run_at_ms, so it must derive the same occurrence
+			// key as the normal timer path instead of racing it into a second run.
+			s.executeJob(j, ScheduledTriggerFor(j))
 		}(delay)
 	}
 }
