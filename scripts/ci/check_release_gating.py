@@ -30,6 +30,15 @@ STEP_USE_RE = re.compile(r"^\s*-?\s*uses:\s*(\S+)")
 STEP_RUN_RE = re.compile(r"^\s*-?\s*run:\s*(.*)$")
 CHECKOUT_REF_RE = re.compile(r"^\s*ref:\s*(.+?)\s*$")
 
+# The keys a workflow may declare at column 0. The parser ends its jobs block
+# at the first column-0 line, which is only sound if that line is one of these:
+# a PowerShell here-string written from column 0 inside a `run: |` block ends
+# the YAML block scalar and turns the rest of the file into something this
+# parser silently ignores — including, once, the entire publish job.
+TOP_LEVEL_KEYS = frozenset(
+    {"name", "on", "run-name", "permissions", "env", "defaults", "concurrency", "jobs"}
+)
+
 
 class Workflow:
     """The subset of a workflow file this check cares about."""
@@ -37,6 +46,10 @@ class Workflow:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.jobs: dict[str, dict] = {}
+        # Set when the jobs block ended on a column-0 key the parser does not
+        # recognise as a workflow-level key, which means the file is not the
+        # YAML this parser assumes it is reading.
+        self.truncated_at: str | None = None
         # Raw text per job. A `run: |` block hides its real command on the
         # following lines, so step ORDER can only be judged against the
         # original text, not against the parsed action names.
@@ -59,6 +72,9 @@ class Workflow:
                 continue
             # A top-level key ends the jobs block.
             if raw[:1] not in (" ", "\t"):
+                key = raw.split(":", 1)[0].strip()
+                if key and key not in TOP_LEVEL_KEYS:
+                    self.truncated_at = raw.strip()
                 if current is not None:
                     self.raw[current] = "\n".join(collected)
                 in_jobs = False
@@ -201,6 +217,21 @@ def check(repo_root: Path) -> list[str]:
 
     # ── The publish edge ───────────────────────────────────────────────
     # Everything that can create or attach a release must sit behind the gate.
+    #
+    # A file this parser cannot finish reading is reported before any other
+    # verdict. Otherwise the findings that follow describe a workflow the
+    # checker invented — a missing publisher, an ungated check — while the real
+    # problem is that the file stopped being YAML partway through.
+    for workflow in (release, validate):
+        if workflow.truncated_at:
+            problems.append(
+                f"{workflow.path.name}: the jobs block ends at "
+                f"'{workflow.truncated_at}', which is not a workflow-level key. "
+                "The file is not the YAML this checker assumes it is reading — "
+                "most likely a column-0 line inside a run block. Every verdict "
+                "below this point is unreliable."
+            )
+
     for producer in release.uses("softprops/action-gh-release"):
         job = release.job(producer)
         for required in ("validate", "build", "offline-bundle", "smoke"):

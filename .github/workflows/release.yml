@@ -374,10 +374,13 @@ jobs:
           # whatever the default happens to be.
           $env:HOTPLEX_HOME = Join-Path $env:RUNNER_TEMP 'hotplex-smoke'
           New-Item -ItemType Directory -Force -Path $env:HOTPLEX_HOME | Out-Null
-          @"
-gateway:
-  addr: "127.0.0.1:$env:PORT"
-"@ | Set-Content -Path "$env:HOTPLEX_HOME\config.yaml" -Encoding utf8
+          # Built as a string, not a here-string: a here-string's body has to
+          # start at column 0, and a column-0 line inside this run block ends
+          # the YAML block scalar. That produced a release.yml GitHub refuses to
+          # parse, while the gating checker — reading the file with its own line
+          # parser — silently saw a workflow with no publish job.
+          $config = "gateway:`n  addr: `"127.0.0.1:$env:PORT`""
+          Set-Content -Path "$env:HOTPLEX_HOME\config.yaml" -Value $config -Encoding utf8
 
           $proc = Start-Process -FilePath $env:BINARY `
             -ArgumentList @('gateway', 'start', '--config', "$env:HOTPLEX_HOME\config.yaml") `

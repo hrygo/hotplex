@@ -123,6 +123,36 @@ class ReleaseGatingTest(unittest.TestCase):
         """The real workflows must satisfy the invariant this script enforces."""
         self.assertEqual([], checker.check(REPO_ROOT))
 
+    # ── The parser's own blind spot ────────────────────────────────────
+    def test_column_0_line_inside_a_run_block_is_reported_as_truncated(self):
+        """A file the parser cannot finish reading must say so.
+
+        A PowerShell here-string written from column 0 ends the YAML block
+        scalar. The parser used to end its jobs block on that line and go on
+        reporting verdicts about a workflow whose publish job it had never
+        seen — which is how a release.yml GitHub refuses to parse reached
+        main with every local check green.
+        """
+        broken = RELEASE_HEADER.replace(
+            "      - run: echo smoke",
+            '      - run: |\n          @"\ngateway:\n  addr: "127.0.0.1"\n"@ | Out-File x',
+        )
+        problems = self.check(broken, VALIDATE_HEADER)
+        self.assertTrue(
+            any("not a workflow-level key" in p for p in problems),
+            f"expected a truncation diagnostic, got {problems}",
+        )
+
+    def test_repository_workflows_are_not_truncated(self):
+        """The real workflows must be read to their end, not just their head."""
+        for name in ("release.yml", "validate.yml"):
+            path = REPO_ROOT / ".github" / "workflows" / name
+            workflow = checker.Workflow(path)
+            self.assertIsNone(
+                workflow.truncated_at,
+                f"{name} stops being parseable at {workflow.truncated_at!r}",
+            )
+
     # ── The edges that matter ──────────────────────────────────────────
     def test_publish_without_validate_is_rejected(self):
         broken = RELEASE_HEADER.replace(
