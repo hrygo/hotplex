@@ -154,6 +154,11 @@ jobs:
         # hurry. This step fails when the graph stops being a gate.
         run: python3 scripts/ci/check_release_gating.py --repo-root .
 
+      - name: Check worker runtime lock
+        # Offline bundles used to resolve their OpenCode and Oh My OpenAgent
+        # versions from whatever upstream published at build time.
+        run: python3 scripts/ci/check_runtime_lock.py --repo-root .
+
       - name: Determine test scope
         id: scope
         env:

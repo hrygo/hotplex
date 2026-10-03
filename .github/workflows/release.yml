@@ -214,20 +214,22 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Resolve versions
-        id: versions
+      - name: Verify the runtime lock
+        # The bundle's OpenCode and Oh My OpenAgent versions come from the
+        # committed lock, never from whatever upstream publishes today.
+        run: python3 scripts/ci/check_runtime_lock.py --repo-root .
+
+      - name: Show the locked versions
         run: |
           set -euo pipefail
-          OPENCODE_VER=$(curl -sf https://api.github.com/repos/anomalyco/opencode/releases/latest \
-            | jq -r .tag_name 2>/dev/null | sed 's/^v//')
-          if [[ -z "$OPENCODE_VER" ]]; then
-            echo "::error::Failed to resolve latest OpenCode version from GitHub API (rate limit?)"
-            exit 1
-          fi
-          OMO_VER=$(npm view oh-my-opencode version 2>/dev/null || echo "unknown")
-          echo "opencode=${OPENCODE_VER}" >> "$GITHUB_OUTPUT"
-          echo "omo=${OMO_VER}" >> "$GITHUB_OUTPUT"
-          echo "OpenCode: ${OPENCODE_VER}, OMO: ${OMO_VER}"
+          python3 - <<'PY'
+          import json
+          with open("configs/worker-runtime-lock.json", encoding="utf-8") as handle:
+              lock = json.load(handle)
+          print("opencode:", lock["runtimes"]["opencode"]["version"])
+          print("omo:", lock["runtimes"]["oh-my-opencode"]["version"])
+          print("lock digest:", lock["runtimes"]["opencode"]["assets"]["linux-x64"]["sha256"][:16], "...")
+          PY
 
       - name: Pack bundles
         run: |
@@ -236,9 +238,10 @@ jobs:
 
           for PLATFORM in linux-x64 linux-x64-musl linux-arm64 linux-arm64-musl darwin-arm64 darwin-x64 windows-x64 windows-arm64; do
             echo "==> Packing ${PLATFORM}..."
+            # No --opencode-version / --omo-version: those flags imply
+            # --allow-dynamic, which is exactly the unreproducible build this
+            # lock exists to prevent.
             bash scripts/pack-offline-bundle.sh \
-              --opencode-version "${{ steps.versions.outputs.opencode }}" \
-              --omo-version "${{ steps.versions.outputs.omo }}" \
               --platform "${PLATFORM}" \
               --output "dist/offline-bundle-${PLATFORM}"
           done

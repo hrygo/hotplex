@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "description": "Pinned worker runtime versions for offline bundles. Regenerate with scripts/ci/generate_runtime_lock.py; a release reads this file and never resolves a version at build time.",
+  "platforms": [
+    "darwin-arm64",
+    "darwin-x64",
+    "linux-arm64",
+    "linux-arm64-musl",
+    "linux-x64",
+    "linux-x64-musl",
+    "windows-arm64",
+    "windows-x64"
+  ],
+  "runtimes": {
+    "opencode": {
+      "version": "1.18.34",
+      "tag": "v1.18.34",
+      "source": "https://github.com/anomalyco/opencode/releases",
+      "assets": {
+        "darwin-arm64": {
+          "asset": "opencode-darwin-arm64.zip",
+          "sha256": "8522b70f545184b3a8d97c5ca4f814093b2476d72aebfda8c48bcd072ec31d1b",
+          "url": "https://github.com/anomalyco/opencode/releases/download/v1.18.34/opencode-darwin-arm64.zip"
+        },
+        "darwin-x64": {
+          "asset": "opencode-darwin-x64.zip",
+          "sha256": "66bf0638cffad3b65bd6648cc3947619e1dd71f4bfeee0a81e087ac036bb1088",
+          "url": "https://github.com/anomalyco/opencode/releases/download/v1.18.34/opencode-darwin-x64.zip"
+        },
+        "linux-arm64": {
+          "asset": "opencode-linux-arm64.tar.gz",
+          "sha256": "bbdb3f00c2c51e42e315525233151309724226a8776da8e9145e3b0fa3d5310f",
+          "url": "https://github.com/anomalyco/opencode/releases/download/v1.18.34/opencode-linux-arm64.tar.gz"
+        },
+        "linux-arm64-musl": {
+          "asset": "opencode-linux-arm64-musl.tar.gz",
+          "sha256": "eaf0692e4b60dca382a126ca607d617be7b6eaf82d318a828f2b6eb1eacea99a",
+          "url": "https://github.com/anomalyco/opencode/releases/download/v1.18.34/opencode-linux-arm64-musl.tar.gz"
+        },
+        "linux-x64": {
+          "asset": "opencode-linux-x64.tar.gz",
+          "sha256": "0f22479647226d1d2dd99595d20082ee7bda3870b62dc6a90b41efc1a71d7e9a",
+          "url": "https://github.com/anomalyco/opencode/releases/download/v1.18.34/opencode-linux-x64.tar.gz"
+        },
+        "linux-x64-musl": {
+          "asset": "opencode-linux-x64-musl.tar.gz",
+          "sha256": "9dd4470885d07205e31b702465564aaee97be26ee3dc192ec6702a15e7a21272",
+          "url": "https://github.com/anomalyco/opencode/releases/download/v1.18.34/opencode-linux-x64-musl.tar.gz"
+        },
+        "windows-arm64": {
+          "asset": "opencode-windows-arm64.zip",
+          "sha256": "b738ae4e823c862eaba6d6bd6e1d35e01b46851d7160882c7bdb189f33a16447",
+          "url": "https://github.com/anomalyco/opencode/releases/download/v1.18.34/opencode-windows-arm64.zip"
+        },
+        "windows-x64": {
+          "asset": "opencode-windows-x64.zip",
+          "sha256": "8ec42ed1ad8db108052394b83ab69d0331398f761fbfff5fe50f91d65bdd3548",
+          "url": "https://github.com/anomalyco/opencode/releases/download/v1.18.34/opencode-windows-x64.zip"
+        }
+      }
+    },
+    "oh-my-opencode": {
+      "version": "5.1.13",
+      "registry": "https://registry.npmjs.org",
+      "packages": {
+        "oh-my-opencode": {
+          "version": "5.1.13",
+          "integrity": "sha512-2TQFO0Y3QYYxinRtEqx+QllRAgx+w1BS+Lu63N1ef1XPN4av8JnOa45lnm0hZtbmIfX7kuGpDIV9FVHxw8QSCg==",
+          "tarball": "https://registry.npmjs.org/oh-my-opencode/-/oh-my-opencode-5.1.13.tgz"
+        },
+        "oh-my-opencode-linux-x64": {
+          "version": "5.1.13",
+          "integrity": "sha512-QKJS5CTUgJr5Ru/R76peJCB6tVSDicMhZzJwfkMHNA/YqmKw2GAF4w9KY2EE5Evq2XV+s70ZmBO32c/yuUk8lw==",
+          "tarball": "https://registry.npmjs.org/oh-my-opencode-linux-x64/-/oh-my-opencode-linux-x64-5.1.13.tgz"
+        },
+        "oh-my-opencode-linux-x64-musl": {
+          "version": "5.1.13",
+          "integrity": "sha512-Bf9VduR9Jmfrw/luRhWZNYPRglOVSJAenOlcMSpYVbSY7ilM6OX5V6ZNG7XayQBVQoB10s4i0NkR2epVV/fqIg==",
+          "tarball": "https://registry.npmjs.org/oh-my-opencode-linux-x64-musl/-/oh-my-opencode-linux-x64-musl-5.1.13.tgz"
+        },
+        "oh-my-opencode-linux-x64-baseline": {
+          "version": "5.1.13",
+          "integrity": "sha512-H/WRJgQrir6TK4huqM21UqegAo+b+OonOiJ0cwvVMsF/6bUAcBupL1R/JMgc1KZ1QES0EVAvxH3Qf3tumzMd3A==",
+          "tarball": "https://registry.npmjs.org/oh-my-opencode-linux-x64-baseline/-/oh-my-opencode-linux-x64-baseline-5.1.13.tgz"
+        },
+        "oh-my-opencode-linux-arm64": {
+          "version": "5.1.13",
+          "integrity": "sha512-Dglsc9dJZ/Z/rf2ygjsSgtDpKsaC8xadxZQvHqhHRJKqEmkEjLH/ohnaK1pMaOntrKgzTcXDknGKM716kfZ31w==",
+          "tarball": "https://registry.npmjs.org/oh-my-opencode-linux-arm64/-/oh-my-opencode-linux-arm64-5.1.13.tgz"
+        },
+        "oh-my-opencode-linux-arm64-musl": {
+          "version": "5.1.13",
+          "integrity": "sha512-as+TuY9MXl1elMRbqIP/tItkI98qrCI/1I2JI9Cd4PZtPXkwK1Y3P3k0NYOzQMWOXISrg0hQdd7/4vu1n55WnA==",
+          "tarball": "https://registry.npmjs.org/oh-my-opencode-linux-arm64-musl/-/oh-my-opencode-linux-arm64-musl-5.1.13.tgz"
+        },
+        "oh-my-opencode-darwin-x64": {
+          "version": "5.1.13",
+          "integrity": "sha512-L2muOy+IoGoEBLJNtlFnBPYDqwAXiYDPlKjZ6DzDZ7kJj0MKi9BaKoEaeF9WFM0YxdgMKbG+EUrC2v8f+Mf30Q==",
+          "tarball": "https://registry.npmjs.org/oh-my-opencode-darwin-x64/-/oh-my-opencode-darwin-x64-5.1.13.tgz"
+        },
+        "oh-my-opencode-darwin-x64-baseline": {
+          "version": "5.1.13",
+          "integrity": "sha512-X7pmcvRgy0vYvsm4Wk38nafvoC+NxieIGjZ1jKMTgkH2a5QGDwrZJ0hPZPfnfjDrxt+6MNv0jDu/jNp/kM+1IA==",
+          "tarball": "https://registry.npmjs.org/oh-my-opencode-darwin-x64-baseline/-/oh-my-opencode-darwin-x64-baseline-5.1.13.tgz"
+        },
+        "oh-my-opencode-darwin-arm64": {
+          "version": "5.1.13",
+          "integrity": "sha512-HhvnbTLJbTrb4TpF2RvMYsOAUOnU6pwgq5f+VPZVPJZKgIgdG0b0uAyPgXGRLmdUMaSMg94f81alq+BaPJlGJQ==",
+          "tarball": "https://registry.npmjs.org/oh-my-opencode-darwin-arm64/-/oh-my-opencode-darwin-arm64-5.1.13.tgz"
+        },
+        "oh-my-opencode-windows-x64": {
+          "version": "5.1.13",
+          "integrity": "sha512-PRvHixeEYZy64CubE7uAUODgmpQV5+TMPhJYuKQOfWlw/CG1DaO4zek6/MtbQlNW5JYzoXYlPR268+KOh2XUxw==",
+          "tarball": "https://registry.npmjs.org/oh-my-opencode-windows-x64/-/oh-my-opencode-windows-x64-5.1.13.tgz"
+        },
+        "oh-my-opencode-windows-arm64": {
+          "version": "5.1.13",
+          "integrity": "sha512-0r9tyFeiwBtjn+yafdiC92MY4gaIYt5kvjkHIjmknV3THW4gzgbEueTCVK/XzajmcJeqm4H9ZVx40LSZG1+YeA==",
+          "tarball": "https://registry.npmjs.org/oh-my-opencode-windows-arm64/-/oh-my-opencode-windows-arm64-5.1.13.tgz"
+        }
+      }
+    }
+  },
+  "generated_at": "2026-10-03T19:33:40+00:00"
+}

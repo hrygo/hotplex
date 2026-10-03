@@ -315,5 +315,47 @@ jobs:
         )
 
 
+    # -- A release must not resolve versions at build time ---------------
+    def _dynamic_release(self, needle: str) -> str:
+        return RELEASE_HEADER.replace(
+            "      - run: echo pack\n",
+            f"      - run: echo pack\n        {needle}\n",
+        )
+
+    def test_opencode_version_override_is_rejected(self):
+        broken = self._dynamic_release("bash scripts/pack-offline-bundle.sh --opencode-version 1.2.3")
+        self.assertNotEqual(RELEASE_HEADER, broken, "fixture did not apply")
+        problems = self.check(broken, VALIDATE_HEADER)
+        self.assertTrue(
+            any("--opencode-version" in p for p in problems),
+            problems,
+        )
+
+    def test_omo_version_override_is_rejected(self):
+        broken = self._dynamic_release("bash scripts/pack-offline-bundle.sh --omo-version 9.9.9")
+        self.assertNotEqual(RELEASE_HEADER, broken, "fixture did not apply")
+        problems = self.check(broken, VALIDATE_HEADER)
+        self.assertTrue(any("--omo-version" in p for p in problems), problems)
+
+    def test_allow_dynamic_is_rejected(self):
+        broken = self._dynamic_release("bash scripts/pack-offline-bundle.sh --allow-dynamic")
+        self.assertNotEqual(RELEASE_HEADER, broken, "fixture did not apply")
+        problems = self.check(broken, VALIDATE_HEADER)
+        self.assertTrue(any("--allow-dynamic" in p for p in problems), problems)
+
+    def test_latest_release_lookup_is_rejected(self):
+        broken = self._dynamic_release(
+            "curl -sf https://api.github.com/repos/anomalyco/opencode/releases/latest"
+        )
+        self.assertNotEqual(RELEASE_HEADER, broken, "fixture did not apply")
+        problems = self.check(broken, VALIDATE_HEADER)
+        self.assertTrue(any("releases/latest" in p for p in problems), problems)
+
+    def test_npm_view_is_rejected(self):
+        broken = self._dynamic_release("npm view oh-my-opencode version")
+        self.assertNotEqual(RELEASE_HEADER, broken, "fixture did not apply")
+        problems = self.check(broken, VALIDATE_HEADER)
+        self.assertTrue(any("npm view" in p for p in problems), problems)
+
 if __name__ == "__main__":
     unittest.main()

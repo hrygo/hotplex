@@ -9,12 +9,21 @@
 #   ./scripts/pack-offline-bundle.sh [options]
 #
 # Options:
-#   --opencode-version VER   OpenCode version (default: latest)
-#   --omo-version VER        Oh My OpenAgent version (default: latest)
+#   --lock PATH              Runtime lock manifest (default: configs/worker-runtime-lock.json)
+#   --allow-dynamic          Resolve versions from upstream instead of the lock.
+#                            Non-release only: the result is not reproducible.
+#   --dry-run                Print the resolved plan and exit. Downloads nothing.
+#   --opencode-version VER   Override the OpenCode version (implies --allow-dynamic)
+#   --omo-version VER        Override the Oh My OpenAgent version (implies --allow-dynamic)
 #   --platform PLAT          Target platform (default: auto-detect)
 #   --all-platforms          Pack all platform binaries
 #   --output DIR             Output directory (default: dist/offline-bundle)
 #   --help                   Show this help
+#
+# Locked mode is the default and the only mode a release may use. Every
+# download is verified against a digest pinned in the lock, and a package that
+# is missing at the locked version is a hard failure — never a silent fallback
+# to whatever version happens to be published today.
 #
 set -euo pipefail
 
@@ -28,6 +37,9 @@ OMO_VERSION=""
 PLATFORM=""
 ALL_PLATFORMS=false
 OUTPUT_DIR=""
+LOCK_FILE="${PROJECT_DIR}/configs/worker-runtime-lock.json"
+ALLOW_DYNAMIC=false
+DRY_RUN=false
 
 # ── Colors ──────────────────────────────────────────────────────────────────
 
@@ -52,6 +64,9 @@ need_arg() {
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --lock)          need_arg "$@"; LOCK_FILE="$2"; shift 2 ;;
+        --allow-dynamic) ALLOW_DYNAMIC=true; shift ;;
+        --dry-run)       DRY_RUN=true; shift ;;
         --opencode-version) need_arg "$@"; OPENCODE_VERSION="$2"; shift 2 ;;
         --omo-version)      need_arg "$@"; OMO_VERSION="$2"; shift 2 ;;
         --platform)         need_arg "$@"; PLATFORM="$2"; shift 2 ;;
@@ -61,6 +76,13 @@ while [[ $# -gt 0 ]]; do
         *)                  die "Unknown option: $1" ;;
     esac
 done
+
+# An explicit version is a request to depart from the lock. Making that
+# explicit is the point: the release workflow never passes these flags, so it
+# cannot accidentally ship an unreviewed runtime.
+if [[ -n "$OPENCODE_VERSION" || -n "$OMO_VERSION" ]]; then
+    ALLOW_DYNAMIC=true
+fi
 
 # ── Resolve platform ────────────────────────────────────────────────────────
 
@@ -107,6 +129,25 @@ resolve_platform() {
 
 # ── Resolve versions ────────────────────────────────────────────────────────
 
+# Read one value out of the lock manifest. jq is not assumed to exist on every
+# machine that packs a bundle; python3 is already required by the CI helpers,
+# so it is the safer dependency.
+lock_get() {
+    python3 - "$LOCK_FILE" "$1" <<'PY'
+import json, sys
+
+path, expr = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as handle:
+    node = json.load(handle)
+for part in expr.split("."):
+    if isinstance(node, list):
+        node = node[int(part)]
+    else:
+        node = node[part]
+print(node if not isinstance(node, (dict, list)) else json.dumps(node))
+PY
+}
+
 resolve_latest_opencode() {
     curl -sf https://api.github.com/repos/anomalyco/opencode/releases/latest \
         | jq -r .tag_name 2>/dev/null | sed 's/^v//'
@@ -116,11 +157,39 @@ resolve_latest_omo() {
     npm view oh-my-opencode version 2>/dev/null || echo "unknown"
 }
 
-[[ -z "$OPENCODE_VERSION" ]] && OPENCODE_VERSION=$(resolve_latest_opencode)
-[[ -z "$OMO_VERSION" ]] && OMO_VERSION=$(resolve_latest_omo)
+LOCKED_SHA256=""
+LOCKED_OMO_INTEGRITY=""
 
-[[ "$OPENCODE_VERSION" == "unknown" || -z "$OPENCODE_VERSION" ]] && die "Cannot resolve OpenCode version. Use --opencode-version."
-[[ "$OMO_VERSION" == "unknown" || -z "$OMO_VERSION" ]] && die "Cannot resolve OMO version. Use --omo-version."
+if [[ "$ALLOW_DYNAMIC" == true ]]; then
+    warn "Resolving versions from upstream: this build is NOT reproducible and must not be released."
+    [[ -z "$OPENCODE_VERSION" ]] && OPENCODE_VERSION=$(resolve_latest_opencode)
+    [[ -z "$OMO_VERSION" ]] && OMO_VERSION=$(resolve_latest_omo)
+    [[ "$OPENCODE_VERSION" == "unknown" || -z "$OPENCODE_VERSION" ]] && die "Cannot resolve OpenCode version. Use --opencode-version."
+    [[ "$OMO_VERSION" == "unknown" || -z "$OMO_VERSION" ]] && die "Cannot resolve OMO version. Use --omo-version."
+else
+    [[ -f "$LOCK_FILE" ]] || die "Runtime lock not found: $LOCK_FILE (regenerate with scripts/ci/generate_runtime_lock.py, or pass --allow-dynamic for a non-release build)"
+
+    # Versions come from the lock, never from upstream. A lock that pins
+    # "latest" has stopped being a lock.
+    OPENCODE_VERSION=$(lock_get runtimes.opencode.version)
+    OMO_VERSION=$(lock_get runtimes.oh-my-opencode.version)
+
+    for pinned in "$OPENCODE_VERSION" "$OMO_VERSION"; do
+        case "$pinned" in
+            ""|latest|unknown)
+                die "Runtime lock does not pin a concrete version (got '$pinned')"
+                ;;
+        esac
+    done
+
+    # The digest is what makes this a lock rather than a version number. An
+    # unpinned platform fails here, before anything is downloaded, rather than
+    # fetching something nobody verified.
+    if ! LOCKED_SHA256=$(lock_get "runtimes.opencode.assets.${PLATFORM}.sha256" 2>/dev/null); then
+        die "Platform '${PLATFORM}' is not in the runtime lock; refusing to build an unverifiable bundle. Regenerate the lock or pass --allow-dynamic for a non-release build."
+    fi
+    LOCKED_OMO_INTEGRITY=$(lock_get "runtimes.oh-my-opencode.packages.oh-my-opencode.integrity")
+fi
 
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$PROJECT_DIR/dist/offline-bundle"
 
@@ -136,7 +205,22 @@ echo -e "  OMO:         ${GREEN}v${OMO_VERSION}${NC}"
 echo -e "  Platform:    ${GREEN}${PLATFORM}${NC}"
 echo -e "  All-plat:    ${ALL_PLATFORMS}"
 echo -e "  Output:      ${DIM}${OUTPUT_DIR}${NC}"
+if [[ "$ALLOW_DYNAMIC" == true ]]; then
+    echo -e "  Mode:        ${YELLOW}DYNAMIC (not releasable)${NC}"
+else
+    echo -e "  Mode:        ${GREEN}LOCKED${NC}"
+fi
+echo -e "  Lock:        ${DIM}${LOCK_FILE}${NC}"
 echo ""
+
+if [[ "$DRY_RUN" == true ]]; then
+    echo -e "${DIM}Dry run: nothing downloaded, nothing written.${NC}"
+    if [[ "$ALLOW_DYNAMIC" != true ]]; then
+        echo "  opencode sha256: ${LOCKED_SHA256}"
+        echo "  omo integrity:   ${LOCKED_OMO_INTEGRITY}"
+    fi
+    exit 0
+fi
 
 # ── Prepare ─────────────────────────────────────────────────────────────────
 
@@ -156,6 +240,19 @@ opencode_url="https://github.com/anomalyco/opencode/releases/download/v${OPENCOD
 
 curl -fSL --progress-bar -o "${OUTPUT_DIR}/opencode${archive_ext}" "$opencode_url" \
     || die "Failed to download OpenCode from ${opencode_url}"
+
+# A pinned version is not a pinned artifact: the same tag can be re-uploaded.
+# In locked mode the bytes have to match the digest someone reviewed.
+if [[ "$ALLOW_DYNAMIC" != true ]]; then
+    actual_sha256=$(shasum -a 256 "${OUTPUT_DIR}/opencode${archive_ext}" 2>/dev/null | awk '{print $1}' || true)
+    if [[ -z "$actual_sha256" ]]; then
+        actual_sha256=$(sha256sum "${OUTPUT_DIR}/opencode${archive_ext}" | awk '{print $1}')
+    fi
+    if [[ "$actual_sha256" != "$LOCKED_SHA256" ]]; then
+        die "OpenCode ${archive_ext} digest mismatch: expected ${LOCKED_SHA256}, got ${actual_sha256}. The downloaded artifact is not the one the runtime lock pins."
+    fi
+    info "  ✓ digest matches runtime lock (${LOCKED_SHA256:0:16}…)"
+fi
 
 info "  ✓ opencode${archive_ext} downloaded"
 
@@ -192,13 +289,11 @@ declare -A PLATFORM_MAP=(
 pack_omo_platform() {
     local pkg_name="$1"
     echo -e "  ${DIM}Packing ${pkg_name}@${OMO_VERSION}...${NC}"
+    # There is deliberately no fallback to "whatever version is published
+    # today". A bundle that quietly ships a different runtime than the one
+    # reviewed is worse than a build that stops and says so.
     if ! npm pack "${pkg_name}@${OMO_VERSION}" --pack-destination="$OUTPUT_DIR" 2>/dev/null; then
-        local fallback_ver
-        fallback_ver=$(npm view "${pkg_name}" version 2>/dev/null || echo "")
-        if [[ -n "$fallback_ver" && "$fallback_ver" != "$OMO_VERSION" ]]; then
-            echo -e "  ${DIM}  Version ${OMO_VERSION} not found, falling back to ${fallback_ver}${NC}"
-            npm pack "${pkg_name}@${fallback_ver}" --pack-destination="$OUTPUT_DIR" 2>/dev/null || true
-        fi
+        die "${pkg_name}@${OMO_VERSION} is not available. Refusing to substitute another version; regenerate the lock or pass --allow-dynamic for a non-release build."
     fi
 }
 

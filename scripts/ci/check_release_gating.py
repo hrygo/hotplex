@@ -274,6 +274,31 @@ def check(repo_root: Path) -> list[str]:
         "release.yml: more than one job holds contents: write",
     )
 
+    # ── A release must not resolve runtime versions at build time ──────
+    # Passing --opencode-version / --omo-version switches the packer into
+    # dynamic mode, and a workflow that queries upstream for "latest" ships
+    # whatever is published that day rather than what the lock pins. Only
+    # command lines are scanned: a comment explaining WHY the flag is absent
+    # must not be mistaken for its use.
+    release_text = "\n".join(
+        line
+        for line in release_path.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    for forbidden in (
+        "--opencode-version",
+        "--omo-version",
+        "--allow-dynamic",
+        "releases/latest",
+        "npm view",
+    ):
+        require(
+            forbidden not in release_text,
+            f"release.yml: references {forbidden!r}; a release must build from "
+            "configs/worker-runtime-lock.json, not from whatever upstream "
+            "publishes that day",
+        )
+
     return problems
 
 
