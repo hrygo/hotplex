@@ -24,6 +24,13 @@ const (
 type RuntimeStatus string
 
 const (
+	// RuntimeQueued is accepted, durable, and NOT yet handed to a worker. It
+	// holds no owner lease and occupies no active slot, so a session with a
+	// backlog still presents exactly one active execution to the dispatcher.
+	// Recovery treats it as safely resumable; pending/running never are,
+	// because those already crossed the dispatch boundary where a lost
+	// response becomes unknown plus a fence.
+	RuntimeQueued    RuntimeStatus = "queued"
 	RuntimePending   RuntimeStatus = "pending"
 	RuntimeRunning   RuntimeStatus = "running"
 	RuntimeCompleted RuntimeStatus = "completed"
@@ -89,6 +96,15 @@ var (
 	// (another operator or gateway instance acted first). The caller must
 	// re-inspect; the store never auto-retries.
 	ErrFenceConflict = errors.New("execution: fence version conflict")
+	// ErrQueueFull means a bounded queue limit would be exceeded. The store
+	// refuses the input instead of evicting something already accepted:
+	// dropping an acknowledged input to make room for a new one turns a
+	// durable promise into a silent loss.
+	ErrQueueFull = errors.New("execution: input queue is full")
+	// ErrQueuePayloadTooLarge means one payload exceeds the per-item byte
+	// bound. It is reported separately from ErrQueueFull because the fix is to
+	// send less, not to retry later.
+	ErrQueuePayloadTooLarge = errors.New("execution: queued payload exceeds the size limit")
 )
 
 // Record is the secret-free durable representation of an input delivery.
@@ -226,4 +242,30 @@ type Store interface {
 	// TerminateOwnerLeases marks all active (pending/running) executions owned by
 	// ownerID as unknown with a fence_reason. Used during graceful shutdown.
 	TerminateOwnerLeases(ctx context.Context, ownerID, reason string) (int64, error)
+
+	// AcceptQueued durably accepts an input into the bounded persistent queue
+	// with runtime status queued. The canonical execution row, the queue row
+	// and every capacity check commit in one transaction, so a returned record
+	// is already durable and already known to be within bounds.
+	//
+	// The same (session_id, client_message_id) key with the same payload hash
+	// returns the existing record with duplicate=true; with a different hash it
+	// returns ErrPayloadConflict. Capacity pressure returns ErrQueueFull rather
+	// than evicting anything.
+	AcceptQueued(ctx context.Context, request QueuedRequest, limits QueueLimits) (
+		record *Record, entry *QueueEntry, duplicate bool, err error)
+
+	// QueueByExecution returns the scheduling state of one queued input, or
+	// ErrNotFound when that execution is not queued (including after it has
+	// been dispatched, cancelled or expired).
+	QueueByExecution(ctx context.Context, executionID string) (*QueueEntry, error)
+
+	// QueueBySession returns a session's undispatched inputs in dispatch order.
+	// limit<=0 uses the store default.
+	QueueBySession(ctx context.Context, sessionID string, limit int) ([]*QueueEntry, error)
+
+	// QueueDepth returns the number of undispatched inputs across the instance.
+	// It is read from the queue itself rather than from a maintained counter,
+	// so no delete path can leak capacity by forgetting to report.
+	QueueDepth(ctx context.Context) (int64, error)
 }

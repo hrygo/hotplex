@@ -17,6 +17,10 @@ import (
 	"github.com/hrygo/hotplex/pkg/events"
 )
 
+// errFakeQueueUnsupported keeps the fake honest: it holds no queue, so it must
+// not pretend one exists.
+var errFakeQueueUnsupported = errors.New("fake execution store: queue unsupported")
+
 type fakeExecutionStore struct {
 	mu            sync.Mutex
 	record        *execution.Record
@@ -137,6 +141,27 @@ func (s *fakeExecutionStore) RecoverExpiredLeases(context.Context, []string) (ex
 }
 func (s *fakeExecutionStore) TerminateOwnerLeases(context.Context, string, string) (int64, error) {
 	return 0, nil
+}
+
+// The queue surface is not exercised by the ordinary accept paths these tests
+// cover, so the fake refuses rather than inventing a plausible queue. A test
+// that starts asserting about queued inputs must build a real store.
+func (s *fakeExecutionStore) AcceptQueued(
+	context.Context, execution.QueuedRequest, execution.QueueLimits,
+) (*execution.Record, *execution.QueueEntry, bool, error) {
+	return nil, nil, false, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) QueueByExecution(context.Context, string) (*execution.QueueEntry, error) {
+	return nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) QueueBySession(context.Context, string, int) ([]*execution.QueueEntry, error) {
+	return nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) QueueDepth(context.Context) (int64, error) {
+	return 0, errFakeQueueUnsupported
 }
 
 func (s *fakeExecutionStore) snapshot() (execution.Status, string, int) {
