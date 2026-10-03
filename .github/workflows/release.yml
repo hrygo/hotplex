@@ -7,29 +7,100 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., v1.0.0)'
+        description: 'Version tag to release (e.g., v1.0.0). Must already exist.'
         required: true
         type: string
 
+# Read-only by default. Only the publish job can write, and it says so
+# explicitly, so a blocked release fails loudly instead of quietly proceeding
+# with whatever permissions happened to be inherited.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   GO_VERSION: '1.26'
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # ── Resolve: pin an immutable SHA before anything else ────────────────
+  # workflow_dispatch used to check out the default branch while stamping the
+  # binary with the requested version string. That publishes one commit's code
+  # under another version's name, and nothing in the old graph could detect it.
+  resolve:
+    name: Resolve release ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve tag to an immutable commit SHA
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="${REQUESTED}"
+            if [ -z "$TAG" ]; then
+              echo "::error::workflow_dispatch requires a version tag"
+              exit 1
+            fi
+          else
+            TAG="${REF#refs/tags/}"
+          fi
+
+          case "$TAG" in
+            v*) ;;
+            *)
+              echo "::error::Release tag '$TAG' must start with 'v'"
+              exit 1
+              ;;
+          esac
+
+          # Fetch the tag itself. A tag that does not exist must fail here, not
+          # three jobs later after a release page already exists.
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth=1 origin "refs/tags/${TAG}:refs/tags/${TAG}"
+
+          SHA="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          if [ -z "$SHA" ]; then
+            echo "::error::Tag '$TAG' did not resolve to a commit"
+            exit 1
+          fi
+
+          echo "Releasing ${TAG} from ${SHA}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+
+  # ── Validate: the same gate CI runs, against the SHA being released ────
+  validate:
+    name: Validate ${{ needs.resolve.outputs.version }}
+    needs: [resolve]
+    uses: ./.github/workflows/validate.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      ref-label: ${{ needs.resolve.outputs.version }}
+      test-scope: 'full'
+
   # ── Prepare: build webchat once ────────────────────────────────────────
   prepare:
     name: Prepare
+    needs: [resolve, validate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
       - uses: ./.github/actions/setup-go-webchat
         with:
@@ -47,14 +118,12 @@ jobs:
           path: internal/docs/out
           retention-days: 1
 
-  # ── Build ────────────────────────────────────────────────────────────────
+  # ── Build ───────────────────────────────────────────────────────────────
   build:
-    needs: [prepare]
+    needs: [resolve, validate, prepare]
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +131,8 @@ jobs:
         arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
       - name: Restore webchat
         uses: actions/download-artifact@v7
@@ -86,24 +157,16 @@ jobs:
         if: matrix.os == 'windows'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq zip
 
-      - name: Compute version
-        id: version
-        run: |
-          REF="${{ github.ref }}"
-          TAG="${REF#refs/tags/}"
-          VER="${TAG:-dev}"
-          if [ "$VER" = "$REF" ]; then VER="${{ github.event.inputs.version || 'dev' }}"; fi
-          echo "version=${VER}" >> "$GITHUB_OUTPUT"
-
       - name: Build
         env:
           CGO_ENABLED: 0
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
           LDFLAGS: -s -w
-          VERSION: ${{ steps.version.outputs.version }}
-          COMMIT: ${{ github.sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          COMMIT: ${{ needs.resolve.outputs.sha }}
         run: |
+          set -euo pipefail
           EXT=""
           [ "${{ matrix.os }}" = "windows" ] && EXT=".exe"
           NAME="hotplex-${{ matrix.os }}-${{ matrix.arch }}${EXT}"
@@ -112,12 +175,16 @@ jobs:
           go build -ldflags="${LDFLAGS} -X main.version=${VERSION} -X main.commit=${COMMIT}" \
             -o "dist/${NAME}" ./cmd/hotplex
 
+          # Each artifact records the SHA it was built from, so a downloaded
+          # archive can be traced without trusting the release page it came from.
+          printf 'version=%s\nsource_sha=%s\n' "${VERSION}" "${COMMIT}" > "dist/${ARCHIVE}.provenance"
+
           # Pack archive: tar.gz for unix, zip for windows
           cd dist
           if [ "${{ matrix.os }}" = "windows" ]; then
-            zip -9 "${ARCHIVE}.zip" "${NAME}"
+            zip -9 "${ARCHIVE}.zip" "${NAME}" "${ARCHIVE}.provenance"
           else
-            tar -czf "${ARCHIVE}.tar.gz" "${NAME}"
+            tar -czf "${ARCHIVE}.tar.gz" "${NAME}" "${ARCHIVE}.provenance"
           fi
 
       - uses: actions/upload-artifact@v7
@@ -126,54 +193,22 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.provenance
           retention-days: 7
 
-  # ── Release ─────────────────────────────────────────────────────────────
-  release:
-    needs: [build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download all binaries
-        uses: actions/download-artifact@v7
-        with:
-          pattern: dist-*
-          path: dist
-          merge-multiple: true
-
-      - name: Generate checksums
-        run: |
-          cd dist
-          sha256sum hotplex-*.tar.gz hotplex-*.zip > checksums.txt
-          echo "=== Checksums ==="
-          cat checksums.txt
-          echo ""
-          echo "=== Integrity check ==="
-          sha256sum --check checksums.txt
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v3.0.0
-        with:
-          draft: false
-          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
-          generate_release_notes: true
-          files: |
-            dist/hotplex-*.tar.gz
-            dist/hotplex-*.zip
-            dist/checksums.txt
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   # ── Offline Bundle (OpenCode + OMO) ────────────────────────────────────
+  # Produces artifacts only. It used to publish to the release page itself, in
+  # parallel with the release job and gated on nothing but a build, so a failed
+  # or skipped validation still shipped bundles.
   offline-bundle:
     name: Pack offline bundle
-    needs: [build]
+    needs: [resolve, validate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
       - uses: actions/setup-node@v6
         with:
@@ -182,6 +217,7 @@ jobs:
       - name: Resolve versions
         id: versions
         run: |
+          set -euo pipefail
           OPENCODE_VER=$(curl -sf https://api.github.com/repos/anomalyco/opencode/releases/latest \
             | jq -r .tag_name 2>/dev/null | sed 's/^v//')
           if [[ -z "$OPENCODE_VER" ]]; then
@@ -194,8 +230,8 @@ jobs:
           echo "OpenCode: ${OPENCODE_VER}, OMO: ${OMO_VER}"
 
       - name: Pack bundles
-        if: steps.versions.outputs.opencode != ''
         run: |
+          set -euo pipefail
           chmod +x scripts/pack-offline-bundle.sh
 
           for PLATFORM in linux-x64 linux-x64-musl linux-arm64 linux-arm64-musl darwin-arm64 darwin-x64 windows-x64 windows-arm64; do
@@ -209,19 +245,95 @@ jobs:
 
           ls -lh dist/hotplex-offline-bundle-*.tar.gz
 
-      - name: Compute bundle checksums
-        run: |
-          for f in dist/hotplex-offline-bundle-*.tar.gz; do
-            sha256sum "$f" >> dist/checksums-offline.txt
-          done
-          cat dist/checksums-offline.txt
-
-      - name: Upload offline bundles to release
-        uses: softprops/action-gh-release@v3.0.0
+      - name: Upload offline bundles
+        uses: actions/upload-artifact@v7
         with:
-          files: |
+          name: offline-bundle
+          path: |
             dist/hotplex-offline-bundle-*.tar.gz
             dist/hotplex-offline-bundle-*.zip
-            dist/checksums-offline.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── Publish: the single owner of the release page ──────────────────────
+  publish:
+    name: Publish ${{ needs.resolve.outputs.version }}
+    needs: [resolve, validate, build, offline-bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download offline bundles
+        uses: actions/download-artifact@v7
+        with:
+          name: offline-bundle
+          path: dist
+
+      - name: Record release provenance
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          printf 'version=%s\nsource_sha=%s\n' "${VERSION}" "${SHA}" > dist/source-sha.txt
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          # Only shipped artifacts are checksummed. The checksum file is written
+          # last and is deliberately not part of its own input list.
+          sha256sum hotplex-*.tar.gz hotplex-*.zip > checksums.txt
+          if compgen -G 'hotplex-offline-bundle-*' > /dev/null; then
+            sha256sum hotplex-offline-bundle-*.tar.gz >> checksums.txt 2>/dev/null || true
+            sha256sum hotplex-offline-bundle-*.zip >> checksums.txt 2>/dev/null || true
+          fi
+          echo "=== Checksums ==="
+          cat checksums.txt
+          echo ""
+          echo "=== Integrity check ==="
+          sha256sum --check --quiet checksums.txt
+
+      - name: Verify every artifact declares this SHA
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          COUNT=0
+          for prov in dist/hotplex-*.provenance; do
+            [ -e "$prov" ] || continue
+            COUNT=$((COUNT + 1))
+            if ! grep -qx "source_sha=${SHA}" "$prov"; then
+              echo "::error::${prov} does not declare source_sha=${SHA}"
+              exit 1
+            fi
+          done
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No provenance files found; artifacts cannot be tied to a source SHA"
+            exit 1
+          fi
+          echo "${COUNT} provenance file(s) declare ${SHA}"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3.0.0
+        with:
+          draft: false
+          prerelease: ${{ contains(needs.resolve.outputs.version, 'alpha') || contains(needs.resolve.outputs.version, 'beta') || contains(needs.resolve.outputs.version, 'rc') }}
+          generate_release_notes: true
+          files: |
+            dist/hotplex-*.tar.gz
+            dist/hotplex-*.zip
+            dist/hotplex-offline-bundle-*.tar.gz
+            dist/hotplex-offline-bundle-*.zip
+            dist/checksums.txt
+            dist/source-sha.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
