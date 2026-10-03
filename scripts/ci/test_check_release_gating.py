@@ -84,9 +84,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo pack
+  smoke:
+    name: Smoke
+    needs: [resolve, validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo smoke
   publish:
     name: Publish
-    needs: [resolve, validate, build, offline-bundle]
+    needs: [resolve, validate, build, offline-bundle, smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -122,7 +128,7 @@ class ReleaseGatingTest(unittest.TestCase):
         broken = RELEASE_HEADER.replace(
             "  publish:\n"
             "    name: Publish\n"
-            "    needs: [resolve, validate, build, offline-bundle]\n",
+            "    needs: [resolve, validate, build, offline-bundle, smoke]\n",
             "  publish:\n"
             "    name: Publish\n"
             "    needs: [resolve, build, offline-bundle]\n",
@@ -136,7 +142,7 @@ class ReleaseGatingTest(unittest.TestCase):
 
     def test_publish_without_offline_bundle_is_rejected(self):
         broken = RELEASE_HEADER.replace(
-            "    needs: [resolve, validate, build, offline-bundle]\n"
+            "    needs: [resolve, validate, build, offline-bundle, smoke]\n"
             "    runs-on: ubuntu-latest\n"
             "    permissions:\n",
             "    needs: [resolve, validate, build]\n"
@@ -203,9 +209,9 @@ class ReleaseGatingTest(unittest.TestCase):
 
     def test_continue_on_error_publish_is_rejected(self):
         broken = RELEASE_HEADER.replace(
-            "    needs: [resolve, validate, build, offline-bundle]\n"
+            "    needs: [resolve, validate, build, offline-bundle, smoke]\n"
             "    runs-on: ubuntu-latest\n",
-            "    needs: [resolve, validate, build, offline-bundle]\n"
+            "    needs: [resolve, validate, build, offline-bundle, smoke]\n"
             "    runs-on: ubuntu-latest\n"
             "    continue-on-error: true\n",
         )

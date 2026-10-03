@@ -187,6 +187,15 @@ jobs:
             tar -czf "${ARCHIVE}.tar.gz" "${NAME}" "${ARCHIVE}.provenance"
           fi
 
+          # Per-leg digests travel with the archive, so the smoke job verifies
+          # THESE bytes rather than trusting whatever the artifact store
+          # returns later.
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.sha256"
+          else
+            sha256sum "${ARCHIVE}.tar.gz" > "${ARCHIVE}.sha256"
+          fi
+
       - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.os }}-${{ matrix.arch }}
@@ -194,6 +203,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*.provenance
+            dist/*.sha256
           retention-days: 7
 
   # ── Offline Bundle (OpenCode + OMO) ────────────────────────────────────
@@ -259,9 +269,228 @@ jobs:
           retention-days: 7
 
   # ── Publish: the single owner of the release page ──────────────────────
+  # ── Smoke: run the artifacts that were actually built ─────────────────
+  # These jobs download the release archives and run them. They never rebuild:
+  # a rebuild would prove the source compiles, not that the bytes people
+  # download start. Only the (os, arch) pairs a hosted runner can actually
+  # execute are covered; the rest stay build-only and are reported as such.
+  smoke:
+    name: Smoke ${{ matrix.target }}
+    needs: [resolve, validate, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-latest
+            artifact: dist-linux-amd64
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            artifact: dist-linux-arm64
+          - target: darwin-arm64
+            runner: macos-latest
+            artifact: dist-darwin-arm64
+          - target: darwin-amd64
+            runner: macos-15-intel
+            artifact: dist-darwin-amd64
+          - target: windows-amd64
+            runner: windows-latest
+            artifact: dist-windows-amd64
+    steps:
+      - name: Download the built artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+
+      - name: Verify the archive checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # The digest was recorded at build time and shipped beside the
+          # archive. Without this the smoke would happily test whatever the
+          # artifact store happened to hand back.
+          sha256sum --check --quiet ./*.sha256
+
+      - name: Extract
+        id: extract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location dist
+          $archive = Get-ChildItem -Filter 'hotplex-*.zip' | Select-Object -First 1
+          if ($archive) {
+            Expand-Archive -Path $archive.FullName -DestinationPath extracted
+          } else {
+            $tar = Get-ChildItem -Filter 'hotplex-*.tar.gz' | Select-Object -First 1
+            if (-not $tar) { throw 'no release archive found' }
+            tar -xzf $tar.FullName
+            New-Item -ItemType Directory -Path extracted | Out-Null
+            Get-ChildItem -Directory | Where-Object { $_.Name -ne 'extracted' } |
+              Move-Item -Destination extracted
+          }
+          $binary = Get-ChildItem -Path extracted -Filter 'hotplex*.exe' -Recurse | Select-Object -First 1
+          if (-not $binary) {
+            $binary = Get-ChildItem -Path extracted -Filter 'hotplex*' -File -Recurse | Select-Object -First 1
+          }
+          if (-not $binary) { throw 'no hotplex binary in archive' }
+          "BINARY=$($binary.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Extract (unix)
+        id: extract-unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # The archive is built with the binary and its provenance at the
+          # root, so this is a plain extraction with no directory to strip.
+          mkdir -p extracted
+          tar -xzf hotplex-*.tar.gz -C extracted
+          BINARY=$(find extracted -type f -name 'hotplex*' ! -name '*.provenance' | head -1)
+          if [ -z "$BINARY" ]; then
+            echo "::error::no hotplex binary in archive"
+            find extracted -type f | head -20
+            exit 1
+          fi
+          chmod +x "$BINARY"
+          echo "BINARY=$BINARY" >> "$GITHUB_OUTPUT"
+
+      - name: Binary starts, migrates a fresh database, serves health, shuts down cleanly
+        shell: pwsh
+        env:
+          BINARY: ${{ steps.extract.outputs.BINARY }}
+          PORT: 18888
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:BINARY --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "--help failed" }
+
+          # An isolated HOTPLEX_HOME so the smoke never touches a real
+          # installation, and an explicit config so the port does not depend on
+          # whatever the default happens to be.
+          $env:HOTPLEX_HOME = Join-Path $env:RUNNER_TEMP 'hotplex-smoke'
+          New-Item -ItemType Directory -Force -Path $env:HOTPLEX_HOME | Out-Null
+          @"
+gateway:
+  addr: "127.0.0.1:$env:PORT"
+"@ | Set-Content -Path "$env:HOTPLEX_HOME\config.yaml" -Encoding utf8
+
+          $proc = Start-Process -FilePath $env:BINARY `
+            -ArgumentList @('gateway', 'start', '--config', "$env:HOTPLEX_HOME\config.yaml") `
+            -PassThru -RedirectStandardOutput "$env:RUNNER_TEMP\out.log" `
+            -RedirectStandardError "$env:RUNNER_TEMP\err.log"
+          try {
+            $deadline = (Get-Date).AddSeconds(60)
+            $healthy = $false
+            while ((Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 2
+              if ($proc.HasExited) {
+                Get-Content "$env:RUNNER_TEMP\err.log" -Tail 40
+                throw "gateway exited early with code $($proc.ExitCode)"
+              }
+              try {
+                $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$env:PORT/health" -UseBasicParsing -TimeoutSec 5
+                if ($resp.StatusCode -eq 200) { $healthy = $true; break }
+              } catch { }
+            }
+            if (-not $healthy) {
+              Get-Content "$env:RUNNER_TEMP\err.log" -Tail 40
+              throw 'gateway did not become healthy'
+            }
+            Write-Host 'health OK'
+            if (-not (Test-Path "$env:HOTPLEX_HOME\data\hotplex.db")) {
+              Write-Host "::warning::no SQLite database at the expected path; migrations may live elsewhere"
+            }
+          } finally {
+            if (-not $proc.HasExited) {
+              # Graceful shutdown: SIGTERM-equivalent, not a kill.
+              $proc.CloseMainWindow() | Out-Null
+              $null = $proc.WaitForExit(30000)
+              if (-not $proc.HasExited) { $proc.Kill() }
+            }
+          }
+          if ($proc.ExitCode -ne 0) {
+            Get-Content "$env:RUNNER_TEMP\err.log" -Tail 40
+            throw "gateway exited with $($proc.ExitCode)"
+          }
+          Write-Host 'graceful shutdown OK'
+
+      - name: Binary starts, migrates a fresh database, serves health, shuts down cleanly (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          BINARY: ${{ steps.extract-unix.outputs.BINARY }}
+          PORT: 18888
+        run: |
+          set -euo pipefail
+          "$BINARY" --help >/dev/null
+
+          export HOTPLEX_HOME="$RUNNER_TEMP/hotplex-smoke"
+          mkdir -p "$HOTPLEX_HOME"
+          # An explicit config keeps the port off whatever the default is.
+          printf 'gateway:\n  addr: "127.0.0.1:%s"\n' "$PORT" > "$HOTPLEX_HOME/config.yaml"
+
+          "$BINARY" gateway start --config "$HOTPLEX_HOME/config.yaml" \
+            >"$RUNNER_TEMP/out.log" 2>"$RUNNER_TEMP/err.log" &
+          PID=$!
+          cleanup() {
+            if kill -0 "$PID" 2>/dev/null; then
+              # SIGTERM first: the gateway has an ordered shutdown sequence
+              # and a SIGKILL here would prove nothing about it.
+              kill -TERM "$PID" 2>/dev/null || true
+              for _ in $(seq 1 30); do
+                kill -0 "$PID" 2>/dev/null || return 0
+                sleep 1
+              done
+              kill -KILL "$PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 60); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "gateway exited during startup"
+              tail -40 "$RUNNER_TEMP/err.log"
+              exit 1
+            fi
+            if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+              echo "health OK"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
+
+          kill -TERM "$PID"
+          for _ in $(seq 1 30); do
+            kill -0 "$PID" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "::error::gateway ignored SIGTERM"
+            tail -40 "$RUNNER_TEMP/err.log"
+            exit 1
+          fi
+          wait "$PID" 2>/dev/null || true
+          echo "graceful shutdown OK"
+
+      - name: Upload smoke logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-logs-${{ matrix.target }}
+          path: ${{ runner.temp }}/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ── Publish: the single owner of the release page ──────────────────────
   publish:
     name: Publish ${{ needs.resolve.outputs.version }}
-    needs: [resolve, validate, build, offline-bundle]
+    needs: [resolve, validate, build, offline-bundle, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

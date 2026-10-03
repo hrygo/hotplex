@@ -203,7 +203,7 @@ def check(repo_root: Path) -> list[str]:
     # Everything that can create or attach a release must sit behind the gate.
     for producer in release.uses("softprops/action-gh-release"):
         job = release.job(producer)
-        for required in ("validate", "build", "offline-bundle"):
+        for required in ("validate", "build", "offline-bundle", "smoke"):
             require(
                 required in job["needs"],
                 f"release.yml: '{producer}' publishes but does not need '{required}'",
