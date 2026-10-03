@@ -127,6 +127,20 @@ const (
 	evidenceNotQueried evidenceState = "unavailable"
 )
 
+// Notes are stable codes, not sentences. A client has to render them in its own
+// language, and an operator comparing two runs needs the same string to mean
+// the same thing; English prose in the payload would satisfy neither. Unknown
+// codes are shown verbatim rather than swallowed.
+const (
+	noteEventsUnavailable    = "events_unavailable"
+	noteEventsNotConfigured  = "events_not_configured"
+	noteEventsTruncated      = "events_truncated"
+	noteEffectsUnavailable   = "effects_unavailable"
+	noteEffectsNotConfigured = "effects_not_configured"
+	noteEffectsTruncated     = "effects_truncated"
+	noteNoDeliveryPlanned    = "no_delivery_planned"
+)
+
 // TimelineItem is one bounded, redacted fact in a run's history.
 //
 // FactTime is when the thing happened according to the system that recorded
@@ -174,7 +188,8 @@ type ExecutionTimeline struct {
 	// an external delivery, which is most runs.
 	EffectEvidence evidenceState `json:"effect_evidence"`
 	Truncated      bool          `json:"truncated"`
-	Notes          []string      `json:"notes,omitempty"`
+	// Notes are stable codes (see the note* constants), not prose.
+	Notes []string `json:"notes,omitempty"`
 }
 
 // SetExecutionConsole wires the three read-only views. Each is optional; a
@@ -362,7 +377,7 @@ func (a *AdminAPI) ListExecutions(w http.ResponseWriter, r *http.Request) {
 // GetExecutionTimeline projects one run's history from three bounded sources.
 //
 // @Summary      Get one execution's timeline
-// @Description  Returns a bounded, redacted projection of a single execution: its control facts, a capped window of session events, and the external deliveries planned for it. Reports explicitly when plan or effect evidence was never recorded for THIS run, and offers only the actions valid for the record's current state. Requires runtime:read scope.
+// @Description  Returns a bounded, redacted projection of a single execution: its control facts, a capped window of session events, and the external deliveries planned for it. Reports explicitly when plan or effect evidence was never recorded for THIS run, and offers only the actions valid for the record's current state. The notes array carries stable codes (events_unavailable, events_not_configured, events_truncated, effects_unavailable, effects_not_configured, effects_truncated, no_delivery_planned) rather than prose. Requires runtime:read scope.
 // @Tags         Admin API
 // @Produce      json
 // @Security     AdminBearerAuth
@@ -461,7 +476,7 @@ func (a *AdminAPI) buildTimeline(
 	if a.consoleEvents != nil {
 		events, hasMore, err := a.consoleEvents.RecentEvents(ctx, rec.SessionID, timelineMaxEvents)
 		if err != nil {
-			out.Notes = append(out.Notes, "session events unavailable for this run")
+			out.Notes = append(out.Notes, noteEventsUnavailable)
 		} else {
 			for _, ev := range events {
 				if sinceMs > 0 && ev.CreatedAt < sinceMs {
@@ -489,12 +504,11 @@ func (a *AdminAPI) buildTimeline(
 					ObservedAt: now,
 					Truncated:  true,
 				})
-				out.Notes = append(out.Notes,
-					"event window truncated; narrow since_ms/until_ms to see the rest")
+				out.Notes = append(out.Notes, noteEventsTruncated)
 			}
 		}
 	} else {
-		out.Notes = append(out.Notes, "event source not configured")
+		out.Notes = append(out.Notes, noteEventsNotConfigured)
 	}
 
 	var loadedEffects []*effect.Effect
@@ -503,9 +517,9 @@ func (a *AdminAPI) buildTimeline(
 		loadedEffects = effects
 		switch {
 		case err != nil:
-			out.Notes = append(out.Notes, "delivery evidence unavailable for this run")
+			out.Notes = append(out.Notes, noteEffectsUnavailable)
 		case len(effects) == 0:
-			out.Notes = append(out.Notes, "this run planned no external delivery")
+			out.Notes = append(out.Notes, noteNoDeliveryPlanned)
 		default:
 			out.EffectEvidence = evidenceRecorded
 			for _, eff := range effects {
@@ -513,11 +527,11 @@ func (a *AdminAPI) buildTimeline(
 			}
 			if len(effects) == timelineMaxEffects {
 				out.Truncated = true
-				out.Notes = append(out.Notes, "delivery list truncated")
+				out.Notes = append(out.Notes, noteEffectsTruncated)
 			}
 		}
 	} else {
-		out.Notes = append(out.Notes, "effect source not configured")
+		out.Notes = append(out.Notes, noteEffectsNotConfigured)
 	}
 
 	// Actions come from the record and the effects already loaded above, never a

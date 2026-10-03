@@ -181,7 +181,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | `actions[]` | **服务端**按当前状态计算出的可用动作，含 `requires_version` 条件令牌 |
 | `plan_evidence` | 启动计划的证据状态，见下 |
 | `effect_evidence` | 外部交付的证据状态 |
-| `truncated` / `notes[]` | 是否被截断，以及为什么 |
+| `truncated` / `notes[]` | 是否被截断，以及为什么（`notes` 是**稳定代码**而非句子，便于各语言渲染） |
 
 三条硬约束：
 
@@ -190,6 +190,8 @@ curl -H "Authorization: Bearer $TOKEN" \
 - **无内容**：事件只投影类型、方向、来源与时间，`Data` 永不过界——AEP 载荷可能携带 assistant 正文或 tool 参数。
 
 `fact_time` 与 `observed_at` 分开保留：延迟到达的事实（effect 回执、晚到的 done）两者本就不同，合并会掩盖 operator 正在排查的延迟。
+
+`notes[]` 取值为固定代码：`events_unavailable`、`events_not_configured`、`events_truncated`、`effects_unavailable`、`effects_not_configured`、`effects_truncated`、`no_delivery_planned`。**不返回英文散文**：客户端要用自己的语言渲染，且同一字符串在两次运行之间必须含义一致。遇到未知代码应原样显示，而不是丢弃。
 
 Agent 完成、提供方接受与外部可核验是**分开的条目**：一个 `runtime=completed` 的 execution 和一条 `status=unknown` 的交付在时间线上是两条独立事实。
 

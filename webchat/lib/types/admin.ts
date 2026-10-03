@@ -278,3 +278,80 @@ export interface AdminWorkspace {
   created_at: number;
   updated_at: number;
 }
+
+// --- Execution console (operator timeline) ---
+
+// EvidenceState separates "we looked and there is nothing" from "we never
+// recorded it". The console must render the latter as missing history, never
+// as a success or a failure.
+export type EvidenceState = 'recorded' | 'not_recorded_for_this_run' | 'unavailable';
+
+// AdminExecutionSummary is the control-fact row for one run. delivery_status
+// (was the input accepted and handed over) and runtime_status (did the Worker
+// actually finish) are separate on purpose: conflating them is what makes
+// "the agent answered" get read as "the message was delivered".
+export interface AdminExecutionSummary {
+  execution_id: string;
+  session_id: string;
+  delivery_status: string;
+  runtime_status: string;
+  runtime_error_code?: string;
+  worker_run_id?: string;
+  fence_reason?: string;
+  fence_version: number;
+  created_at: number;
+  updated_at: number;
+  started_at?: number;
+  finished_at?: number;
+  fence_created_at?: number;
+}
+
+// AdminExecutionCursor is a keyset cursor, not an offset: new rows arriving
+// while an operator pages cannot make an earlier page repeat or skip rows.
+export interface AdminExecutionCursor {
+  before_created_at: number;
+  before_execution_id: string;
+}
+
+export interface AdminExecutionListResponse {
+  executions: AdminExecutionSummary[];
+  next_cursor: AdminExecutionCursor | null;
+}
+
+// AdminTimelineItem is one bounded, redacted fact. fact_time is when the
+// recording system saw it happen; observed_at is when this projection read it.
+// They differ legitimately (a late receipt, a delayed Done) and collapsing
+// them hides exactly the lag an operator is diagnosing.
+export interface AdminTimelineItem {
+  phase: string;
+  source: string;
+  kind: string;
+  fact_time: number;
+  observed_at: number;
+  execution_id?: string;
+  worker_run_id?: string;
+  effect_id?: string;
+  evidence?: string;
+  evidence_state?: EvidenceState;
+  truncated?: boolean;
+}
+
+// AdminAvailableAction is an action the SERVER says is valid right now, with
+// the conditional token it must be submitted with. The console renders these
+// and never derives an action of its own — there is no "mark as successful".
+export interface AdminAvailableAction {
+  kind: string;
+  target: string;
+  requires_version?: number;
+  description: string;
+}
+
+export interface AdminExecutionTimeline {
+  execution: AdminExecutionSummary;
+  items: AdminTimelineItem[];
+  actions: AdminAvailableAction[];
+  plan_evidence: EvidenceState;
+  effect_evidence: EvidenceState;
+  truncated: boolean;
+  notes?: string[];
+}

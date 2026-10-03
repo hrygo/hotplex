@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -292,7 +293,7 @@ func TestGetExecutionTimeline_NoEffectSourceIsANoteNotAFailure(t *testing.T) {
 	var tl ExecutionTimeline
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &tl))
 	require.Equal(t, evidenceNotStored, tl.EffectEvidence)
-	require.Contains(t, strings.Join(tl.Notes, " "), "effect source not configured")
+	require.Contains(t, tl.Notes, noteEffectsNotConfigured)
 }
 
 func TestGetExecutionTimeline_EventsAreContentFree(t *testing.T) {
@@ -327,7 +328,7 @@ func TestGetExecutionTimeline_TruncationIsReported(t *testing.T) {
 	var tl ExecutionTimeline
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &tl))
 	require.True(t, tl.Truncated)
-	require.Contains(t, strings.Join(tl.Notes, " "), "truncated")
+	require.Contains(t, tl.Notes, noteEventsTruncated)
 }
 
 func TestGetExecutionTimeline_EffectSourcesAreReadOnce(t *testing.T) {
@@ -344,6 +345,26 @@ func TestGetExecutionTimeline_EffectSourcesAreReadOnce(t *testing.T) {
 	// The projection derives actions from the effects it already loaded; a
 	// second query would make the cost per timeline unbounded in sources.
 	require.Equal(t, 1, effects.calls)
+}
+
+// Notes travel to clients that render them in their own language, so they must
+// be codes. A sentence here would be untranslatable and would tie the payload
+// to one wording.
+func TestGetExecutionTimeline_NotesAreStableCodes(t *testing.T) {
+	t.Parallel()
+	rec := record("exec-1", "sess-1", "delivered", "completed")
+	api := consoleAPI(&mockExecutionReader{records: []*execution.Record{rec}}, nil, nil)
+
+	w := timelineRequest(api, "exec-1", "", ScopeRuntimeRead)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var tl ExecutionTimeline
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &tl))
+	require.NotEmpty(t, tl.Notes)
+	code := regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+	for _, note := range tl.Notes {
+		require.Regexp(t, code, note, "note %q is not a stable code", note)
+	}
 }
 
 func TestGetExecutionTimeline_DeliveryFactsAreSeparateFromCompletion(t *testing.T) {

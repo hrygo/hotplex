@@ -100,6 +100,7 @@
     "sessions": "会话管理",
     "users": "用户管理",
     "activity": "行为审计",
+    "executions": "执行记录",
     "workspaces": "工作区管理",
     "skills": "技能管理",
     "cron": "定时任务",
@@ -634,6 +635,135 @@
       "description": "用户认证、创建会话、发送消息、调用工具或执行管理操作后，审计记录会显示在这里。"
     }
   },
+  "executions": {
+    "title": "执行记录",
+    "subtitle": "网关接收的每一条输入，以及它实际发生了什么。",
+    "loading": "正在加载执行记录…",
+    "loading_more": "加载中…",
+    "refresh": "刷新",
+    "load_older": "加载更早",
+    "showing": "共 {{count}} 条",
+    "fenced_badge": "已围栏",
+    "filters": {
+      "session": "会话 ID",
+      "session_placeholder": "精确的会话 id",
+      "delivery": "投递",
+      "runtime": "运行",
+      "all": "全部",
+      "apply": "应用",
+      "reset": "重置"
+    },
+    "empty": {
+      "title": "没有执行记录",
+      "description": "网关尚未接收过输入，或当前筛选条件排除了所有运行。"
+    },
+    "table": {
+      "created": "接收时间",
+      "execution": "执行",
+      "session": "会话",
+      "delivery": "投递",
+      "runtime": "运行",
+      "worker_run": "Worker 运行",
+      "fence": "围栏"
+    },
+    "status": {
+      "accepted": "已接收",
+      "delivered": "已送达 Worker",
+      "unknown": "不明",
+      "failed": "失败",
+      "queued": "排队中",
+      "pending": "已派发",
+      "running": "运行中",
+      "completed": "已完成"
+    },
+    "phase": {
+      "accepted": "已接收",
+      "queued": "排队中",
+      "dispatched": "已派发",
+      "running": "运行中",
+      "delivery": "外部交付",
+      "terminal": "终态",
+      "fenced": "已围栏",
+      "truncated": "已截断"
+    },
+    "evidence": {
+      "recorded": "本次运行有记录",
+      "not_recorded": "本次运行没有记录",
+      "unavailable": "无法获取",
+      "unknown": "未知"
+    },
+    "notes": {
+      "events_unavailable": "无法读取本次运行的会话事件。",
+      "events_not_configured": "当前部署未配置事件来源。",
+      "events_truncated": "事件窗口已截断，缩小时间范围可查看其余部分。",
+      "effects_unavailable": "无法读取本次运行的交付证据。",
+      "effects_not_configured": "当前部署未配置交付来源。",
+      "effects_truncated": "交付列表已截断。",
+      "no_delivery_planned": "本次运行没有计划任何外部交付。"
+    },
+    "detail": {
+      "back": "返回执行记录",
+      "untitled": "执行",
+      "missing_id": "缺少执行 id。",
+      "created": "接收于",
+      "started": "派发于",
+      "finished": "结束于",
+      "updated": "最后更新",
+      "error_code": "运行错误",
+      "plan_evidence": "启动计划证据",
+      "effect_evidence": "外部交付证据",
+      "truncated": "该时间线已被截断，缩小时间窗口可查看其余部分。",
+      "notes": "说明"
+    },
+    "timeline": {
+      "title": "时间线",
+      "lag_hint": "事实时间是事情发生的时间；观测时间是本次读取到它的时间。",
+      "empty": "本次运行没有记录到任何事实。",
+      "table": {
+        "phase": "阶段",
+        "source": "来源",
+        "kind": "类型",
+        "fact_time": "事实时间",
+        "observed_at": "观测时间",
+        "evidence": "证据"
+      }
+    },
+    "actions": {
+      "title": "可用动作",
+      "none": "当前没有对该运行有效的动作。",
+      "kind": {
+        "fence_resolve": "清除围栏",
+        "fence_abandon": "清除围栏并将该运行置为失败",
+        "queue_cancel": "撤回排队中的输入",
+        "effect_abandon": "放弃这次交付",
+        "effect_mark_delivered": "记录该交付已发送",
+        "effect_requeue": "允许再尝试一次交付"
+      },
+      "target": "目标：{{target}}",
+      "requires_version": "条件令牌：{{version}}",
+      "choose": "选择",
+      "unsupported": "本控制台不支持该动作",
+      "reason": "原因",
+      "reason_placeholder": "你为什么执行这个动作。会记入审计日志。",
+      "reason_required": "必须填写原因。",
+      "reason_too_long": "原因最多 {{max}} 个字符。",
+      "evidence_ref": "外部证据引用",
+      "evidence_ref_placeholder": "可选：你核对过的消息 id、工单或链接",
+      "evidence_ref_too_long": "证据引用最多 {{max}} 个字符。",
+      "submit": "执行",
+      "cancel": "取消",
+      "done": "已执行。",
+      "stale": "动作执行前该记录已发生变化，已重新加载当前状态。",
+      "confirm_title": {
+        "fence_resolve": "清除该围栏？",
+        "fence_abandon": "放弃该运行？",
+        "queue_cancel": "撤回该排队输入？",
+        "effect_abandon": "放弃这次交付？",
+        "effect_mark_delivered": "记录该交付已发送？",
+        "effect_requeue": "允许再尝试一次交付？"
+      }
+    }
+  },
   "cron": {
     "title": "定时任务",
     "subtitle": "配置定时 Agent 任务、自动化提醒与 Cron 触发器",
@@ -750,9 +880,15 @@
       "view": "查看",
       "close": "关闭"
     },
-    "label": { "managed": "可管理", "external": "外部（只读）" },
+    "label": {
+      "managed": "可管理",
+      "external": "外部（只读）"
+    },
     "search_placeholder": "搜索技能名称或描述…",
-    "empty": { "title": "暂无技能", "desc": "上传 .zip 技能包或新建文本技能以安装到全局技能目录。" },
+    "empty": {
+      "title": "暂无技能",
+      "desc": "上传 .zip 技能包或新建文本技能以安装到全局技能目录。"
+    },
     "pagination": {
       "prev": "上一页",
       "next": "下一页",

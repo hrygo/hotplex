@@ -2123,7 +2123,7 @@
                         "AdminBearerAuth": []
                     }
                 ],
-                "description": "Returns a bounded, redacted projection of a single execution: its control facts, a capped window of session events, and the external deliveries planned for it. Reports explicitly when plan or effect evidence was never recorded for THIS run, and offers only the actions valid for the record's current state. Requires runtime:read scope.",
+                "description": "Returns a bounded, redacted projection of a single execution: its control facts, a capped window of session events, and the external deliveries planned for it. Reports explicitly when plan or effect evidence was never recorded for THIS run, and offers only the actions valid for the record's current state. The notes array carries stable codes (events_unavailable, events_not_configured, events_truncated, effects_unavailable, effects_not_configured, effects_truncated, no_delivery_planned) rather than prose. Requires runtime:read scope.",
                 "produces": [
                     "application/json"
                 ],
@@ -4306,6 +4306,7 @@
                     }
                 },
                 "notes": {
+                    "description": "Notes are stable codes (see the note* constants), not prose.",
                     "type": "array",
                     "items": {
                         "type": "string"
