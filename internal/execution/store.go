@@ -119,6 +119,11 @@ var (
 	// head between the caller reading it and claiming it. The caller must
 	// re-read and re-validate rather than dispatching an item it never checked.
 	ErrQueueHeadMoved = errors.New("execution: queue head changed since it was read")
+	// ErrPayloadContentUnavailable means a queued input's content is gone even
+	// though its control row survived. It is reported separately from
+	// ErrNotFound because the input is still recorded as recoverable, and the
+	// honest response is to settle it rather than dispatch an empty turn.
+	ErrPayloadContentUnavailable = errors.New("execution: queued payload content unavailable")
 )
 
 // Record is the secret-free durable representation of an input delivery.
@@ -273,6 +278,11 @@ type Store interface {
 	// ErrNotFound when that execution is not queued (including after it has
 	// been dispatched, cancelled or expired).
 	QueueByExecution(ctx context.Context, executionID string) (*QueueEntry, error)
+
+	// QueuePayload returns the content a dispatcher needs to deliver a queued
+	// input. ErrPayloadContentUnavailable means the control row exists but its
+	// content does not, which must be settled rather than dispatched empty.
+	QueuePayload(ctx context.Context, executionID string) (*QueuedPayload, error)
 
 	// QueueBySession returns a session's undispatched inputs in dispatch order.
 	// limit<=0 uses the store default.

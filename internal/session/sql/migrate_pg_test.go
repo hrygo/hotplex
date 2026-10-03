@@ -209,3 +209,53 @@ func TestMigrations_PG_037ExecutionQueue_SchemaAndInvariants(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM execution_queue`).Scan(&remaining))
 	require.Equal(t, 0, remaining, "queued rows must not outlive their session")
 }
+
+// TestMigrations_PG_038ExecutionQueuePayloads_ContentFollowsControlFacts is the
+// PostgreSQL counterpart of the 038 payload guard. The foreign key to
+// execution_queue is the retention rule: content must disappear exactly when
+// the promise to dispatch it does.
+func TestMigrations_PG_038ExecutionQueuePayloads_ContentFollowsControlFacts(t *testing.T) {
+	ctx := context.Background()
+	db := openTestPGDB(t)
+	defer func() { _ = db.Close() }()
+
+	var n int
+	require.NoError(t, db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'execution_queue_payloads'`).Scan(&n))
+	require.Equal(t, 1, n, "expected the payload table after migration 038")
+
+	_, err := db.ExecContext(ctx, `INSERT INTO sessions
+		(id, user_id, worker_type, state, created_at, updated_at)
+		VALUES ('s-payload', 'u1', 'claude_code', 'idle', $1, $1)`, 1700000000000)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_inputs
+		(execution_id, session_id, client_message_id, payload_hash, status, error_code,
+		 created_at, updated_at, owner_instance_id, worker_run_id, lease_until,
+		 runtime_status, runtime_error_code, fence_reason)
+		VALUES ('exec_p', 's-payload', 'msg-p', 'hash_p', 'accepted', '', 1, 1, '', '', 0, 'queued', '', '')`)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue
+		(execution_id, session_id, queue_seq, enqueued_at, expires_at, payload_ref, payload_bytes)
+		VALUES ('exec_p', 's-payload', 1, 1, 9999999999999, 'qpayload_p', 12)`)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue_payloads
+		(payload_id, execution_id, session_id, content, invocation_json,
+		 content_bytes, content_sha256, created_at)
+		VALUES ('qpayload_orphan', 'exec_missing', 's-payload', 'x', '', 1, 'h', 1)`)
+	require.Error(t, err, "payload content must not exist without a queued input")
+
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue_payloads
+		(payload_id, execution_id, session_id, content, invocation_json,
+		 content_bytes, content_sha256, created_at)
+		VALUES ('qpayload_p', 'exec_p', 's-payload', 'do the thing', '', 12, 'hash_p', 1)`)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `DELETE FROM execution_queue WHERE execution_id = 'exec_p'`)
+	require.NoError(t, err)
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM execution_queue_payloads`).Scan(&n))
+	require.Zero(t, n, "content must not outlive the promise to dispatch it")
+}

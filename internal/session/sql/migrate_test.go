@@ -465,3 +465,54 @@ func TestMigrations_037ExecutionQueue_SchemaAndInvariants(t *testing.T) {
 		`SELECT used FROM execution_queue_budget WHERE budget_id = 1`).Scan(&used))
 	require.Equal(t, 0, used)
 }
+
+// TestMigrations_038ExecutionQueuePayloads_ContentFollowsControlFacts guards
+// the retention rule the queue depends on. The payload foreign key must be a
+// real ON DELETE CASCADE to execution_queue: without it, cancelling, expiring
+// or deleting a session would leave queued prompts behind with nothing that
+// says they are no longer dispatchable.
+func TestMigrations_038ExecutionQueuePayloads_ContentFollowsControlFacts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openMigrationTestDB(t)
+	require.NoError(t, session.RunMigrations(ctx, db, dbutil.DialectSQLite))
+
+	var n int
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='execution_queue_payloads'`).Scan(&n))
+	require.Equal(t, 1, n, "expected the payload table after migration 038")
+
+	insertMigrationSession(t, db, "s-payload")
+	_, err := db.ExecContext(ctx, `INSERT INTO execution_inputs
+		(execution_id, session_id, client_message_id, payload_hash, status, error_code,
+		 created_at, updated_at, owner_instance_id, worker_run_id, lease_until,
+		 runtime_status, runtime_error_code, fence_reason)
+		VALUES ('exec_p', 's-payload', 'msg-p', 'hash_p', 'accepted', '', 1, 1, '', '', 0, 'queued', '', '')`)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue
+		(execution_id, session_id, queue_seq, enqueued_at, expires_at, payload_ref, payload_bytes)
+		VALUES ('exec_p', 's-payload', 1, 1, 9999999999999, 'qpayload_p', 12)`)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue_payloads
+		(payload_id, execution_id, session_id, content, invocation_json,
+		 content_bytes, content_sha256, created_at)
+		VALUES ('qpayload_p', 'exec_p', 's-payload', 'do the thing', '', 12, 'hash_p', 1)`)
+	require.NoError(t, err)
+
+	// A payload with no queue row cannot exist: the foreign key is the retention
+	// rule, not a convenience constraint.
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue_payloads
+		(payload_id, execution_id, session_id, content, invocation_json,
+		 content_bytes, content_sha256, created_at)
+		VALUES ('qpayload_orphan', 'exec_missing', 's-payload', 'x', '', 1, 'h', 1)`)
+	require.Error(t, err, "payload content must not exist without a queued input to dispatch it for")
+
+	// Removing the queue row removes the content with it.
+	_, err = db.ExecContext(ctx, `DELETE FROM execution_queue WHERE execution_id = 'exec_p'`)
+	require.NoError(t, err)
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM execution_queue_payloads`).Scan(&n))
+	require.Zero(t, n, "content must not outlive the promise to dispatch it")
+}

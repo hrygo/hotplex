@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -72,13 +73,11 @@ func (s *SQLStore) AcceptQueued(
 	if request.SessionID == "" || request.ClientMessageID == "" || request.PayloadHash == "" {
 		return nil, nil, false, errors.New("execution: session id, client message id, and payload hash are required")
 	}
-	if request.PayloadBytes < 0 {
-		return nil, nil, false, errors.New("execution: payload bytes cannot be negative")
-	}
 	limits = limits.withDefaults()
-	if request.PayloadBytes > limits.MaxPayloadBytes {
+	payloadBytes := request.Payload.size()
+	if payloadBytes > limits.MaxPayloadBytes {
 		return nil, nil, false, fmt.Errorf("%w: %d bytes exceeds the %d byte limit",
-			ErrQueuePayloadTooLarge, request.PayloadBytes, limits.MaxPayloadBytes)
+			ErrQueuePayloadTooLarge, payloadBytes, limits.MaxPayloadBytes)
 	}
 
 	ctx, cancel := withTimeout(ctx)
@@ -207,14 +206,31 @@ func (s *SQLStore) AcceptQueued(
 			return fail(fmt.Errorf("execution: insert queued execution: %w", err))
 		}
 
+		payloadID := "qpayload_" + uuid.NewString()
+		invocationJSON, err := encodeInvocation(request.Payload.Invocation)
+		if err != nil {
+			return fail(err)
+		}
 		if _, err := tx.ExecContext(ctx, s.rebind(`
 			INSERT INTO execution_queue
 				(execution_id, session_id, queue_seq, enqueued_at, expires_at,
 				 lifecycle_revision, payload_ref, payload_bytes)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
 			executionID, request.SessionID, queueSeq, now, expiresAt,
-			request.LifecycleRevision, request.PayloadRef, request.PayloadBytes); err != nil {
+			request.LifecycleRevision, payloadID, payloadBytes); err != nil {
 			return fail(fmt.Errorf("execution: insert queue entry: %w", err))
+		}
+
+		// Content commits with the control facts, so a queued input can never be
+		// observable as recoverable while its payload is missing.
+		if _, err := tx.ExecContext(ctx, s.rebind(`
+			INSERT INTO execution_queue_payloads
+				(payload_id, execution_id, session_id, content, invocation_json,
+				 content_bytes, content_sha256, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
+			payloadID, executionID, request.SessionID, request.Payload.Content,
+			invocationJSON, payloadBytes, request.PayloadHash, now); err != nil {
+			return fail(fmt.Errorf("execution: insert queue payload: %w", err))
 		}
 
 		// Refresh the depth mirror so an operator reading the budget row sees a
@@ -245,8 +261,8 @@ func (s *SQLStore) AcceptQueued(
 			EnqueuedAt:        now,
 			ExpiresAt:         expiresAt,
 			LifecycleRevision: request.LifecycleRevision,
-			PayloadRef:        request.PayloadRef,
-			PayloadBytes:      int64(request.PayloadBytes),
+			PayloadRef:        payloadID,
+			PayloadBytes:      int64(payloadBytes),
 		}
 		return tx.Commit()
 	})
@@ -276,6 +292,61 @@ func (s *SQLStore) AcceptQueued(
 		return nil, nil, duplicate, err
 	}
 	return stored, entry, duplicate, nil
+}
+
+// encodeInvocation renders a native command invocation for storage. It returns
+// "" for an ordinary input rather than a JSON null, so "no invocation" and
+// "an invocation that failed to encode" cannot be confused.
+func encodeInvocation(invocation *QueuedInvocation) (string, error) {
+	if invocation == nil {
+		return "", nil
+	}
+	encoded, err := json.Marshal(invocation)
+	if err != nil {
+		return "", fmt.Errorf("execution: encode queued invocation: %w", err)
+	}
+	if len(encoded) > maxInvocationJSONBytes {
+		return "", fmt.Errorf("%w: invocation is %d bytes", ErrQueuePayloadTooLarge, len(encoded))
+	}
+	return string(encoded), nil
+}
+
+// QueuePayload returns the content a dispatcher needs to deliver a queued
+// input.
+func (s *SQLStore) QueuePayload(ctx context.Context, executionID string) (*QueuedPayload, error) {
+	if executionID == "" {
+		return nil, errors.New("execution: execution id is required")
+	}
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+
+	var content, invocationJSON string
+	err := s.db.QueryRowContext(ctx, s.rebind(`
+		SELECT content, invocation_json
+		FROM execution_queue_payloads
+		WHERE execution_id = ?`), executionID).Scan(&content, &invocationJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Distinguish "this input is not queued" from "queued but contentless":
+		// the first is ordinary, the second is a gap that must be settled
+		// rather than dispatched as an empty turn.
+		if _, entryErr := s.queueEntryByExecution(ctx, s.db, executionID); errors.Is(entryErr, ErrNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, ErrPayloadContentUnavailable
+	}
+	if err != nil {
+		return nil, fmt.Errorf("execution: read queue payload: %w", err)
+	}
+
+	payload := &QueuedPayload{Content: content}
+	if invocationJSON != "" {
+		invocation := new(QueuedInvocation)
+		if err := json.Unmarshal([]byte(invocationJSON), invocation); err != nil {
+			return nil, fmt.Errorf("execution: decode queued invocation: %w", err)
+		}
+		payload.Invocation = invocation
+	}
+	return payload, nil
 }
 
 // QueueByExecution returns the scheduling state of one queued input.

@@ -35,8 +35,7 @@ func queuedReq(sessionID, msgID string) QueuedRequest {
 		SessionID:       sessionID,
 		ClientMessageID: msgID,
 		PayloadHash:     "hash_" + msgID,
-		PayloadRef:      "payload_" + msgID,
-		PayloadBytes:    128,
+		Payload:         QueuedPayload{Content: "please do " + msgID},
 		OwnerInstanceID: testOwner,
 	}
 }
@@ -63,7 +62,7 @@ func TestAcceptQueued_WritesQueuedExecutionAndDurableEntry(t *testing.T) {
 	require.NotNil(t, entry)
 	require.Equal(t, record.ExecutionID, entry.ExecutionID)
 	require.Equal(t, "session-1", entry.SessionID)
-	require.Equal(t, "payload_m1", entry.PayloadRef)
+	require.NotEmpty(t, entry.PayloadRef, "the store assigns the content reference")
 	require.Greater(t, entry.ExpiresAt, entry.EnqueuedAt, "an undispatched input must expire later than it arrived")
 
 	// The read-back path agrees with what was written.
@@ -179,7 +178,7 @@ func TestAcceptQueued_RefusesOversizedPayload(t *testing.T) {
 	store, _ := newTestSQLStore(t)
 
 	request := queuedReq("session-1", "m1")
-	request.PayloadBytes = 1024
+	request.Payload = QueuedPayload{Content: string(make([]byte, 1024))}
 	_, _, _, err := store.AcceptQueued(ctx, request, QueueLimits{MaxPayloadBytes: 512})
 	require.ErrorIs(t, err, ErrQueuePayloadTooLarge)
 
@@ -231,7 +230,10 @@ func TestQueueBySession_ReturnsFIFOOrder(t *testing.T) {
 	require.Len(t, entries, len(wantSeq))
 	for i, entry := range entries {
 		require.Equal(t, wantSeq[i], entry.QueueSeq)
-		require.Equal(t, []string{"payload_m1", "payload_m2", "payload_m3", "payload_m4"}[i], entry.PayloadRef)
+		payload, err := store.QueuePayload(ctx, entry.ExecutionID)
+		require.NoError(t, err)
+		require.Equal(t, []string{"please do m1", "please do m2", "please do m3", "please do m4"}[i],
+			payload.Content, "dispatch order must follow the content that was queued, not a client clock")
 	}
 
 	limited, err := store.QueueBySession(ctx, "session-1", 2)

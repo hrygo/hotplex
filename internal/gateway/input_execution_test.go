@@ -156,6 +156,10 @@ func (s *fakeExecutionStore) QueueByExecution(context.Context, string) (*executi
 	return nil, errFakeQueueUnsupported
 }
 
+func (s *fakeExecutionStore) QueuePayload(context.Context, string) (*execution.QueuedPayload, error) {
+	return nil, errFakeQueueUnsupported
+}
+
 func (s *fakeExecutionStore) QueueBySession(context.Context, string, int) ([]*execution.QueueEntry, error) {
 	return nil, errFakeQueueUnsupported
 }

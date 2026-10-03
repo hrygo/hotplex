@@ -1,6 +1,9 @@
 package execution
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Queue defaults. These are the proposed first-slice bounds from the plan; each
 // is independently configurable and every one of them is checked inside the
@@ -22,6 +25,10 @@ const (
 	// is settled as expired. A queued input that waited a day is no longer the
 	// thing the user asked for.
 	DefaultQueueTTL = 24 * time.Hour
+	// maxInvocationJSONBytes bounds a stored native command invocation. Four
+	// short strings serialize well under this; the ceiling exists so a
+	// pathological Args cannot occupy an unbounded row.
+	maxInvocationJSONBytes = 8 << 10
 )
 
 // QueueLimits bounds the persistent input queue. Zero and negative fields fall
@@ -74,11 +81,9 @@ type QueuedRequest struct {
 	SessionID       string
 	ClientMessageID string
 	PayloadHash     string
-	// PayloadRef is the opaque content reference a dispatcher will read.
-	PayloadRef string
-	// PayloadBytes is the size of that content, checked against the queue's
-	// per-item bound before anything is written.
-	PayloadBytes int
+	// Payload is what a dispatcher needs in order to deliver this input after
+	// the client that sent it is gone.
+	Payload QueuedPayload
 	// OwnerInstanceID records which gateway accepted the input. A queued input
 	// holds no lease and is not owned by it until dispatch claims it, so this
 	// is provenance, not ownership.
@@ -87,6 +92,44 @@ type QueuedRequest struct {
 	// to. A dispatcher holding an older revision must refuse the item instead
 	// of resurrecting a previous turn.
 	LifecycleRevision int64
+}
+
+// QueuedInvocation is the stored form of a native command invocation.
+//
+// It is a deliberate copy of the worker layer's invocation type rather than a
+// reference to it: the store must not depend on the worker package, and only
+// these four fields decide whether the item can still be dispatched as a
+// Skill. A queued Skill keeps its identity and arguments instead of degrading
+// into an ordinary prompt that happens to start with a slash.
+type QueuedInvocation struct {
+	Name string
+	Args string
+	Path string
+	Mode string
+}
+
+// QueuedPayload is the bounded content of one queued input. Exactly one of
+// Content and Invocation is meaningful: text for an ordinary input, an
+// invocation for a Skill.
+type QueuedPayload struct {
+	Content    string
+	Invocation *QueuedInvocation
+}
+
+// size is the number of bytes the payload occupies against the per-item bound.
+// Both forms count: an invocation is content too, and a bound that ignored it
+// would let a queue fill with unbounded command arguments.
+func (p QueuedPayload) size() int {
+	if p.Invocation == nil {
+		return len(p.Content)
+	}
+	encoded, err := json.Marshal(p.Invocation)
+	if err != nil {
+		// Marshalling four string fields cannot fail; if it somehow did, the
+		// payload is unserialisable and must not be admitted silently.
+		return len(p.Content) + maxInvocationJSONBytes
+	}
+	return len(p.Content) + len(encoded)
 }
 
 // QueueEntry is the scheduling state of one durably accepted, undispatched
