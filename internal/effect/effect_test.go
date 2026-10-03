@@ -42,6 +42,7 @@ CREATE TABLE effects (
     target_kind       TEXT NOT NULL,
     target_ref        TEXT NOT NULL DEFAULT '',
     status            TEXT NOT NULL CHECK(status IN ('planned','started','delivered','failed','unknown')),
+    next_attempt_at   INTEGER,
     error_code        TEXT NOT NULL DEFAULT '',
     reason            TEXT NOT NULL DEFAULT '',
     owner_instance_id TEXT NOT NULL DEFAULT '',
@@ -52,6 +53,25 @@ CREATE TABLE effects (
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
     UNIQUE(occurrence_id, delivery_ordinal, target_revision)
+);
+CREATE TABLE effect_attempts (
+    attempt_id        TEXT PRIMARY KEY,
+    effect_id         TEXT NOT NULL,
+    attempt           INTEGER NOT NULL,
+    owner_instance_id TEXT NOT NULL,
+    lease_version     INTEGER NOT NULL,
+    lease_token       TEXT NOT NULL,
+    started_at        INTEGER NOT NULL,
+    finished_at       INTEGER,
+    outcome           TEXT NOT NULL DEFAULT ''
+                       CHECK(outcome IN ('','accepted','rejected','unknown','not_sent')),
+    rejection_class   TEXT NOT NULL DEFAULT ''
+                       CHECK(rejection_class IN ('','safe_retry','permanent','unspecified')),
+    provider_ref      TEXT NOT NULL DEFAULT '',
+    evidence_ref      TEXT NOT NULL DEFAULT '',
+    error_code        TEXT NOT NULL DEFAULT '',
+    reason            TEXT NOT NULL DEFAULT '',
+    UNIQUE(effect_id, attempt)
 );`
 
 // newLedgerDB opens a SQLite database carrying the effect tables from goose

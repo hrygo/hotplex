@@ -46,7 +46,10 @@ type EffectDeliverer struct {
 	// occurrence cannot both claim the effect.
 	ownerInstanceID string
 	lease           time.Duration
-	now             func() time.Time
+	// budget carries the first-slice delivery limits, so switching an owner
+	// does not silently change how often a target is contacted.
+	budget effect.RetryBudget
+	now    func() time.Time
 }
 
 // EffectDelivererConfig wires the deliverer.
@@ -59,7 +62,9 @@ type EffectDelivererConfig struct {
 	// Lease bounds how long this instance is trusted with a send. Zero uses a
 	// conservative default.
 	Lease time.Duration
-	Now   func() time.Time
+	// Budget overrides the default retry limits.
+	Budget effect.RetryBudget
+	Now    func() time.Time
 }
 
 // NewEffectDeliverer creates the gateway-owned delivery path.
@@ -72,6 +77,10 @@ func NewEffectDeliverer(cfg EffectDelivererConfig) *EffectDeliverer {
 	if now == nil {
 		now = time.Now
 	}
+	budget := cfg.Budget
+	if budget.MaxAttempts <= 0 {
+		budget = effect.DefaultRetryBudget()
+	}
 	return &EffectDeliverer{
 		log:             cfg.Log.With("component", "effect_delivery"),
 		effects:         cfg.Effects,
@@ -79,6 +88,7 @@ func NewEffectDeliverer(cfg EffectDelivererConfig) *EffectDeliverer {
 		senderFor:       cfg.SenderFor,
 		ownerInstanceID: cfg.OwnerInstanceID,
 		lease:           lease,
+		budget:          budget,
 		now:             now,
 	}
 }
@@ -148,7 +158,7 @@ func (d *EffectDeliverer) DeliverEffect(ctx context.Context, req cron.EffectDeli
 	}
 
 	now := d.now()
-	claimed, err := d.effects.ClaimSend(ctx, effect.ClaimRequest{
+	claim, err := d.effects.ClaimSend(ctx, effect.ClaimRequest{
 		EffectID:        planned.EffectID,
 		OwnerInstanceID: d.ownerInstanceID,
 		LeaseUntil:      now.Add(d.lease),
@@ -172,32 +182,39 @@ func (d *EffectDeliverer) DeliverEffect(ctx context.Context, req cron.EffectDeli
 	// effect while we are in flight.
 	result, sendErr := sender.SendWithReceipt(ctx, content, req.PlatformKey)
 	completion := effect.Completion{
-		EffectID:     claimed.EffectID,
-		Attempt:      claimed.Attempt,
-		LeaseVersion: claimed.LeaseVersion,
+		EffectID:     claim.Effect.EffectID,
+		Attempt:      claim.Attempt,
+		LeaseToken:   claim.LeaseToken,
+		LeaseVersion: claim.LeaseVersion,
 		Now:          d.now(),
 	}
 
 	switch {
 	case sendErr != nil:
 		// The request never reached the provider, so nothing was created and
-		// the attempt is safe to repeat.
-		completion.Outcome = effect.StatusFailed
+		// the delivery is still owed.
+		completion.Outcome = effect.AttemptNotSent
 		completion.ErrorCode = "not_sent"
 		completion.Reason = "delivery could not be attempted"
 	case result.Outcome == messaging.SendAccepted:
-		completion.Outcome = effect.StatusDelivered
+		completion.Outcome = effect.AttemptAccepted
 		completion.ProviderRef = result.ProviderRef
 		completion.EvidenceRef = result.EvidenceRef
 		completion.Reason = "provider accepted the message"
 	case result.Outcome == messaging.SendRejected:
-		completion.Outcome = effect.StatusFailed
+		completion.Outcome = effect.AttemptRejected
+		completion.RejectionClass = string(result.RejectionClass)
 		completion.ErrorCode = string(result.RejectionClass)
 		completion.Reason = result.Reason
+		if result.RejectionClass == messaging.RejectionSafeRetry {
+			// The provider said "later", not "never". The effect stays owed and
+			// waits behind a backoff that respects the provider's own hint.
+			completion.RetryAfter = d.budget.Backoff(claim.Attempt, result.RetryAfter)
+		}
 	default:
 		// The dangerous case: the request may or may not have committed.
 		// Record it as unknown so nobody resends on the assumption it failed.
-		completion.Outcome = effect.StatusUnknown
+		completion.Outcome = effect.AttemptUnknown
 		completion.ErrorCode = "unproven"
 		completion.Reason = result.Reason
 	}
@@ -208,13 +225,13 @@ func (d *EffectDeliverer) DeliverEffect(ctx context.Context, req cron.EffectDeli
 		// rather than retried, because retrying the send is what would
 		// actually cause the duplicate this ledger exists to prevent.
 		d.log.Error("effect delivery: could not record send outcome",
-			"effect_id", claimed.EffectID, "occurrence_id", req.OccurrenceID,
+			"effect_id", claim.Effect.EffectID, "occurrence_id", req.OccurrenceID,
 			"outcome", completion.Outcome, "err", err)
 		return fmt.Errorf("effect delivery: record outcome: %w", err)
 	}
 
 	d.log.Info("effect delivery: recorded",
-		"effect_id", claimed.EffectID, "occurrence_id", req.OccurrenceID,
+		"effect_id", claim.Effect.EffectID, "occurrence_id", req.OccurrenceID,
 		"outcome", completion.Outcome)
 	return nil
 }

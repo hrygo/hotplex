@@ -51,17 +51,22 @@ func (f *fakeEffectStore) PlanOnce(
 
 func (f *fakeEffectStore) ClaimSend(
 	_ context.Context, req effect.ClaimRequest,
-) (*effect.Effect, error) {
+) (*effect.Claim, error) {
 	if f.claimErr != nil {
 		return nil, f.claimErr
 	}
 	f.claims = append(f.claims, req)
-	return &effect.Effect{
-		EffectID:        req.EffectID,
-		Attempt:         req.ExpectedAttempt,
-		LeaseVersion:    1,
-		Status:          effect.StatusStarted,
-		OwnerInstanceID: req.OwnerInstanceID,
+	return &effect.Claim{
+		Effect: &effect.Effect{
+			EffectID:        req.EffectID,
+			Attempt:         req.ExpectedAttempt,
+			LeaseVersion:    1,
+			Status:          effect.StatusStarted,
+			OwnerInstanceID: req.OwnerInstanceID,
+		},
+		Attempt:      req.ExpectedAttempt,
+		LeaseVersion: 1,
+		LeaseToken:   "ltk-test",
 	}, nil
 }
 
@@ -91,6 +96,28 @@ func (f *fakeEffectStore) GetPayloadForExecution(
 	context.Context, string, string,
 ) (*effect.Payload, error) {
 	return nil, effect.ErrPayloadNotFound
+}
+
+func (f *fakeEffectStore) ClaimRetry(
+	context.Context, effect.RetryRequest,
+) (*effect.Claim, error) {
+	return nil, effect.ErrLeaseLost
+}
+
+func (f *fakeEffectStore) ExpireLeases(
+	context.Context, time.Time, int,
+) ([]*effect.Effect, error) {
+	return nil, nil
+}
+
+func (f *fakeEffectStore) ListRecoverable(context.Context, int) ([]*effect.Effect, error) {
+	return nil, nil
+}
+
+func (f *fakeEffectStore) ListAttempts(
+	context.Context, string,
+) ([]*effect.Attempt, error) {
+	return nil, nil
 }
 
 // recordingSender captures the sends that actually reached the provider.
@@ -176,7 +203,7 @@ func TestDeliverEffect_RecordsIntentBeforeSending(t *testing.T) {
 	require.Equal(t, int64(0), store.claims[0].ExpectedAttempt)
 
 	require.Len(t, store.completes, 1)
-	require.Equal(t, effect.StatusDelivered, store.completes[0].Outcome)
+	require.Equal(t, effect.AttemptAccepted, store.completes[0].Outcome)
 	require.Equal(t, "C123:1717171717.000100", store.completes[0].ProviderRef)
 }
 
@@ -268,7 +295,7 @@ func TestDeliverEffect_UnprovableOutcomeIsRecordedAsUnknown(t *testing.T) {
 
 	require.NoError(t, d.DeliverEffect(context.Background(), testRequest()))
 	require.Len(t, store.completes, 1)
-	require.Equal(t, effect.StatusUnknown, store.completes[0].Outcome)
+	require.Equal(t, effect.AttemptUnknown, store.completes[0].Outcome)
 	require.Empty(t, store.completes[0].ProviderRef)
 }
 
@@ -285,8 +312,30 @@ func TestDeliverEffect_RecordsPermanentRejection(t *testing.T) {
 
 	require.NoError(t, d.DeliverEffect(context.Background(), testRequest()))
 	require.Len(t, store.completes, 1)
-	require.Equal(t, effect.StatusFailed, store.completes[0].Outcome)
+	require.Equal(t, effect.AttemptRejected, store.completes[0].Outcome)
 	require.Equal(t, string(messaging.RejectionPermanent), store.completes[0].ErrorCode)
+}
+
+// TestDeliverEffect_SafeRejectionSchedulesARetry keeps "later" distinct from
+// "never": the effect stays owed behind a backoff instead of being failed.
+func TestDeliverEffect_SafeRejectionSchedulesARetry(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeEffectStore{}
+	sender := &recordingSender{result: messaging.SendResult{
+		Outcome:        messaging.SendRejected,
+		RejectionClass: messaging.RejectionSafeRetry,
+		RetryAfter:     90 * time.Second,
+		Reason:         "slack rate limited the request",
+	}}
+	d := newTestDeliverer(store, sender, "answer", nil)
+
+	require.NoError(t, d.DeliverEffect(context.Background(), testRequest()))
+	require.Len(t, store.completes, 1)
+	require.Equal(t, effect.AttemptRejected, store.completes[0].Outcome)
+	require.Equal(t, string(messaging.RejectionSafeRetry), store.completes[0].RejectionClass)
+	require.Equal(t, 90*time.Second, store.completes[0].RetryAfter,
+		"the provider's own hint wins over our shorter backoff")
 }
 
 // TestDeliverEffect_UnsentRequestIsNotUnknown pins the other half of the
@@ -301,7 +350,7 @@ func TestDeliverEffect_UnsentRequestIsNotUnknown(t *testing.T) {
 
 	require.NoError(t, d.DeliverEffect(context.Background(), testRequest()))
 	require.Len(t, store.completes, 1)
-	require.Equal(t, effect.StatusFailed, store.completes[0].Outcome)
+	require.Equal(t, effect.AttemptNotSent, store.completes[0].Outcome)
 	require.Equal(t, "not_sent", store.completes[0].ErrorCode)
 }
 

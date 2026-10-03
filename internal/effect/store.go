@@ -42,10 +42,24 @@ type Store interface {
 	// ClaimSend makes one caller the owner of the next send attempt. Exactly
 	// one caller can win it, which is what stops two instances recovering the
 	// same occurrence from both sending.
-	ClaimSend(ctx context.Context, req ClaimRequest) (*Effect, error)
-	// CompleteSend records the typed outcome of an attempt the caller owns. A
-	// caller that no longer owns it gets ErrLeaseLost and must re-read.
+	ClaimSend(ctx context.Context, req ClaimRequest) (*Claim, error)
+	// CompleteSend records what an attempt established and moves the effect to
+	// the status that outcome implies. A caller that no longer owns the
+	// attempt gets ErrLeaseLost and must re-read.
 	CompleteSend(ctx context.Context, c Completion) error
+	// ClaimRetry opens the next attempt after a rejection the provider
+	// explicitly declared safe to repeat. It refuses when the backoff has not
+	// elapsed, when no safe rejection was recorded, or at the attempt cap.
+	ClaimRetry(ctx context.Context, req RetryRequest) (*Claim, error)
+	// ExpireLeases moves sends whose lease elapsed into unknown. A lapsed
+	// lease is not proof that nothing was sent, so it never returns an effect
+	// to a sendable state.
+	ExpireLeases(ctx context.Context, now time.Time, limit int) ([]*Effect, error)
+	// ListRecoverable returns effects that are durably owed a send and are not
+	// currently owned by anyone.
+	ListRecoverable(ctx context.Context, limit int) ([]*Effect, error)
+	// ListAttempts returns the per-attempt facts for an effect, oldest first.
+	ListAttempts(ctx context.Context, effectID string) ([]*Attempt, error)
 }
 
 const effectColumns = `effect_id, occurrence_id, delivery_ordinal, target_revision, attempt,
