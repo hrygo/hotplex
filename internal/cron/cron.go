@@ -268,7 +268,7 @@ func (s *Scheduler) ListJobs(ctx context.Context) ([]*CronJob, error) {
 }
 
 // TriggerJob manually triggers a job execution outside of its schedule.
-func (s *Scheduler) TriggerJob(ctx context.Context, job *CronJob) error {
+func (s *Scheduler) TriggerJob(ctx context.Context, job *CronJob, req TriggerRequest) error {
 	if !s.tickLoop.tryAcquireSlot(s.maxConcurrent) {
 		return fmt.Errorf("cron: concurrency cap (%d) reached, cannot trigger job %s", s.maxConcurrent, job.ID)
 	}
@@ -283,7 +283,7 @@ func (s *Scheduler) TriggerJob(ctx context.Context, job *CronJob) error {
 		// distinct runs while the occurrence ledger still records that this
 		// exact request was taken. A webhook carrying a verified event ID
 		// deduplicates on that ID instead.
-		s.executeJob(j, RequestedTriggerFor(j, GenerateOccurrenceID(), j.PlatformKey["event_id"]))
+		s.executeJob(j, RequestedTriggerFor(j, GenerateOccurrenceID(), req.VerifiedEventID))
 	}()
 	return nil
 }
@@ -291,7 +291,7 @@ func (s *Scheduler) TriggerJob(ctx context.Context, job *CronJob) error {
 // TriggerByName finds a job by name in the in-memory index and triggers its execution.
 // It reads from s.jobs (source of truth) rather than the store to avoid stale-read windows
 // when the CLI has disabled a job but the DB has not yet been updated.
-func (s *Scheduler) TriggerByName(ctx context.Context, jobName string, extra map[string]string) error {
+func (s *Scheduler) TriggerByName(ctx context.Context, jobName string, req TriggerRequest) error {
 	s.mu.Lock()
 	var found *CronJob
 	for _, j := range s.jobs {
@@ -312,14 +312,14 @@ func (s *Scheduler) TriggerByName(ctx context.Context, jobName string, extra map
 	s.mu.Unlock()
 
 	// Inject extra context (e.g. target_pr from webhook) into PlatformKey.
-	if len(extra) > 0 {
+	if len(req.Extra) > 0 {
 		if job.PlatformKey == nil {
 			job.PlatformKey = make(map[string]string)
 		}
-		maps.Copy(job.PlatformKey, extra)
+		maps.Copy(job.PlatformKey, req.Extra)
 	}
 
-	return s.TriggerJob(ctx, job)
+	return s.TriggerJob(ctx, job, req)
 }
 
 // loadFromDB loads all jobs from the store into the in-memory index.

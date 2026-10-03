@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -81,6 +82,32 @@ func postWebhook(h *WebhookHandler, eventType string, payload any) *httptest.Res
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-GitHub-Event", eventType)
 	req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w
+}
+
+// postWebhookDelivery is postWebhook with GitHub's per-delivery identifier
+// attached, which is what makes a firing deduplicable end to end.
+func postWebhookDelivery(h *WebhookHandler, eventType string, payload any, deliveryID string) *httptest.ResponseRecorder {
+	var body []byte
+	switch p := payload.(type) {
+	case []byte:
+		body = p
+	default:
+		var err error
+		body, err = json.Marshal(p)
+		if err != nil {
+			panic(err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/webhook/github", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Event", eventType)
+	req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, body))
+	if deliveryID != "" {
+		req.Header.Set("X-GitHub-Delivery", deliveryID)
+	}
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	return w
@@ -332,13 +359,15 @@ func TestWebhookHandler_ExtractPRs(t *testing.T) {
 type mockTrigger struct {
 	triggered atomic.Int32
 	mu        sync.Mutex
-	lastExtra map[string]string
+	lastReq   cron.TriggerRequest
+	allReqs   []cron.TriggerRequest
 }
 
-func (m *mockTrigger) TriggerByName(_ context.Context, _ string, extra map[string]string) error {
+func (m *mockTrigger) TriggerByName(_ context.Context, _ string, req cron.TriggerRequest) error {
 	m.mu.Lock()
 	m.triggered.Add(1)
-	m.lastExtra = extra
+	m.lastReq = req
+	m.allReqs = append(m.allReqs, req)
 	m.mu.Unlock()
 	return nil
 }
@@ -348,7 +377,28 @@ func (m *mockTrigger) count() int { return int(m.triggered.Load()) }
 func (m *mockTrigger) getLastExtra() map[string]string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.lastExtra
+	return m.lastReq.Extra
+}
+
+// getLastSourceID is the per-delivery identity the handler derived from the
+// X-GitHub-Delivery header, or "" when the request carried none.
+func (m *mockTrigger) getLastSourceID() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastReq.VerifiedEventID
+}
+
+// sourceIDs is every identity the handler derived, in trigger order. One
+// payload can fan out to several firings, so "the last one" is not enough to
+// reason about whether they collided.
+func (m *mockTrigger) sourceIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.allReqs))
+	for _, r := range m.allReqs {
+		out = append(out, r.VerifiedEventID)
+	}
+	return out
 }
 
 func TestWebhookHandler_ServeHTTP(t *testing.T) {
@@ -670,7 +720,7 @@ func TestWebhookHandler_RateLimiting(t *testing.T) {
 
 type errorTrigger struct{}
 
-func (e *errorTrigger) TriggerByName(_ context.Context, _ string, _ map[string]string) error {
+func (e *errorTrigger) TriggerByName(_ context.Context, _ string, _ cron.TriggerRequest) error {
 	return fmt.Errorf("job not found: %w", cron.ErrJobNotFound)
 }
 
@@ -709,4 +759,130 @@ func TestWebhookHandler_EmptySecret(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	require.Equal(t, http.StatusForbidden, w.Code)
+}
+
+// --- Occurrence identity from X-GitHub-Delivery (plan §5.4 C1) ---
+//
+// A webhook firing is only deduplicable when it carries the sender's own
+// per-delivery identifier. These pin which requests produce one and, just as
+// importantly, which do not: a firing recorded as "no verified source" must
+// stay honest rather than borrow a weaker key.
+
+func prOpenedPayload(t *testing.T, number int) *GitHubEvent {
+	t.Helper()
+	pr := &struct {
+		Number int    `json:"number"`
+		State  string `json:"state"`
+		Draft  bool   `json:"draft"`
+		Head   struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}{Number: number, State: "open"}
+	pr.Head.SHA = "abc123"
+	return &GitHubEvent{
+		Action: "opened",
+		Number: number,
+		Repository: struct {
+			FullName string `json:"full_name"`
+		}{FullName: "hrygo/hotplex"},
+		PullRequest: pr,
+	}
+}
+
+func TestWebhookHandler_DeliveryIdentity(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		deliveryID string
+		// wantSource is the identity the occurrence should be keyed on. Empty
+		// means the firing must fall back to a per-request manual trigger.
+		wantSource string
+	}{
+		{
+			name:       "uuid delivery id is used as the occurrence identity",
+			deliveryID: "72d3162e-cc78-11e3-81ab-4c9367dc0958",
+			wantSource: "72d3162e-cc78-11e3-81ab-4c9367dc0958#42",
+		},
+		{
+			name:       "absent header yields no verified identity",
+			deliveryID: "",
+			wantSource: "",
+		},
+		{
+			// The value is persisted and logged. Rather than escape or trim it,
+			// refuse it: an identity that had to be cleaned up is not an identity.
+			name:       "header with characters outside the identifier alphabet is refused",
+			deliveryID: "abc/../def",
+			wantSource: "",
+		},
+		{
+			name:       "whitespace-only header is treated as absent",
+			deliveryID: "   ",
+			wantSource: "",
+		},
+		{
+			name:       "over-long header is refused rather than truncated",
+			deliveryID: strings.Repeat("a", 129),
+			wantSource: "",
+		},
+		{
+			name:       "header at the length limit is accepted",
+			deliveryID: strings.Repeat("a", 128),
+			wantSource: strings.Repeat("a", 128) + "#42",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h, trigger := newIsolatedHandler(t)
+			w := postWebhookDelivery(h, "pull_request", prOpenedPayload(t, 42), tt.deliveryID)
+			require.Equal(t, http.StatusAccepted, w.Code)
+			require.Eventually(t, func() bool { return trigger.count() >= 1 }, 2*time.Second, 50*time.Millisecond)
+			require.Equal(t, tt.wantSource, trigger.getLastSourceID())
+			// The prompt context is unchanged either way: the delivery id is an
+			// occurrence fact, not something handed to the Agent.
+			require.Equal(t, "42", trigger.getLastExtra()["pr_number"])
+		})
+	}
+}
+
+// One payload can name several PRs, and the trigger key carries no PR number.
+// Without folding the PR number into the source id, the second PR would collide
+// with the first and be silently recorded as its duplicate.
+func TestWebhookHandler_OneDeliverySeveralPRsGetDistinctIdentities(t *testing.T) {
+	t.Parallel()
+
+	h, trigger := newIsolatedHandler(t)
+	ev := &GitHubEvent{
+		Repository: struct {
+			FullName string `json:"full_name"`
+		}{FullName: "hrygo/hotplex"},
+		CheckSuite: &struct {
+			Conclusion   string `json:"conclusion"`
+			HeadSHA      string `json:"head_sha"`
+			PullRequests []struct {
+				Number int `json:"number"`
+			} `json:"pull_requests"`
+		}{Conclusion: "success", HeadSHA: "deadbeef"},
+	}
+	ev.CheckSuite.PullRequests = append(ev.CheckSuite.PullRequests,
+		struct {
+			Number int `json:"number"`
+		}{Number: 7},
+		struct {
+			Number int `json:"number"`
+		}{Number: 9},
+	)
+
+	w := postWebhookDelivery(h, "check_suite", ev, "delivery-abc")
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.Eventually(t, func() bool { return trigger.count() >= 2 }, 2*time.Second, 50*time.Millisecond)
+
+	// Both firings happen, and neither is the other's duplicate: same delivery,
+	// different PR, therefore different occurrence. Compared as a set — the two
+	// triggers run concurrently, so their arrival order is not defined.
+	got := trigger.sourceIDs()
+	require.ElementsMatch(t, []string{"delivery-abc#7", "delivery-abc#9"}, got)
 }

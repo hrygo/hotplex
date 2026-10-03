@@ -151,7 +151,7 @@ func TestScheduler_TriggerJob(t *testing.T) {
 	job := testRecurringJob("trigger-test", "manual")
 
 	// TriggerJob should not block (starts goroutine).
-	require.NoError(t, s.TriggerJob(context.Background(), job))
+	require.NoError(t, s.TriggerJob(context.Background(), job, TriggerRequest{}))
 	// Give goroutine a moment to start.
 	time.Sleep(10 * time.Millisecond)
 }

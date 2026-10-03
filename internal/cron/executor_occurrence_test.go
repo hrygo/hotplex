@@ -93,6 +93,52 @@ func TestExecutorExecute_DuplicateTriggerRunsAgentOnce(t *testing.T) {
 	require.Equal(t, 1, bridge.startCount, "a duplicate trigger must not start a second session")
 }
 
+// GitHub reuses one X-GitHub-Delivery GUID when it redelivers an event, so the
+// same identity arriving twice is one event, not two. This is the acceptance
+// criterion in its most direct form: a webhook delivery has a unique business
+// identity, and a redelivery resolves to the run that already happened.
+func TestExecutorExecute_WebhookRedeliveryIsOneOccurrence(t *testing.T) {
+	t.Parallel()
+
+	store := newOccurrenceStore(t)
+	bridge := &mockBridge{}
+	sm := &mockSessionStateChecker{
+		defaultSession: &session.SessionInfo{State: "terminated"},
+		defaultWorker:  &mockWorker{},
+	}
+	e := newOccurrenceExecutor(t, store, bridge, sm)
+
+	job := testJob()
+	job.PlatformKey = map[string]string{"trigger": "webhook", "pr_number": "42"}
+
+	first, err := e.Execute(context.Background(), job,
+		TriggerIdentity{Kind: TriggerWebhook, JobID: job.ID, SourceID: "delivery-abc#42"},
+		5*time.Second)
+	require.NoError(t, err)
+	require.False(t, first.Duplicate)
+	require.Equal(t, 1, bridge.startCount)
+
+	// Same delivery, redelivered.
+	repeat, err := e.Execute(context.Background(), job,
+		TriggerIdentity{Kind: TriggerWebhook, JobID: job.ID, SourceID: "delivery-abc#42"},
+		5*time.Second)
+	require.NoError(t, err)
+	require.True(t, repeat.Duplicate,
+		"a redelivery carries the sender's own delivery id and must not run again")
+	require.Equal(t, first.OccurrenceID, repeat.OccurrenceID)
+	require.Equal(t, 1, bridge.startCount,
+		"a redelivered webhook must not start a second Agent")
+
+	// A genuinely new delivery of the same PR is a different occurrence.
+	next, err := e.Execute(context.Background(), job,
+		TriggerIdentity{Kind: TriggerWebhook, JobID: job.ID, SourceID: "delivery-def#42"},
+		5*time.Second)
+	require.NoError(t, err)
+	require.False(t, next.Duplicate, "a new delivery is a new event")
+	require.NotEqual(t, first.OccurrenceID, next.OccurrenceID)
+	require.Equal(t, 2, bridge.startCount)
+}
+
 func TestExecutorExecute_ConcurrentDuplicateTriggersStartOneAgent(t *testing.T) {
 	t.Parallel()
 
@@ -286,5 +332,24 @@ func TestRequestedTriggerFor(t *testing.T) {
 		key, err := identity.Key()
 		require.NoError(t, err)
 		require.Equal(t, "manual|cron_test|nonce-9", key)
+	})
+
+	// A job-configured event_id is a constant, so keying on it would collapse
+	// every webhook firing for that job onto one occurrence and silently drop
+	// every delivery after the first. The verified id must come from the
+	// request, never from job configuration.
+	t.Run("a job-configured event_id is never the occurrence identity", func(t *testing.T) {
+		t.Parallel()
+		configured := testJob()
+		configured.PlatformKey = map[string]string{
+			"trigger":  "webhook",
+			"event_id": "hardcoded-in-config",
+		}
+		identity := RequestedTriggerFor(configured, "nonce-1", "")
+		require.Equal(t, TriggerManual, identity.Kind)
+		key, err := identity.Key()
+		require.NoError(t, err)
+		require.Equal(t, "manual|cron_test|nonce-1", key)
+		require.NotContains(t, key, "hardcoded-in-config")
 	})
 }

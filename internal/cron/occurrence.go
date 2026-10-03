@@ -155,6 +155,27 @@ func RequestedTriggerFor(job *CronJob, nonce, verifiedEventID string) TriggerIde
 	}
 }
 
+// TriggerRequest is the request-scoped context of a programmatic firing.
+//
+// Extra is merged into the job's PlatformKey and may be referenced by the
+// prompt template. VerifiedEventID is deliberately NOT one of those keys: it is
+// the caller's assertion that this firing IS one specific external event,
+// carrying that provider's own per-delivery identifier, and it is what the
+// occurrence's idempotency key is built from.
+//
+// Keeping it out of PlatformKey is a correctness requirement, not tidiness. A
+// job-configured `event_id` would be a constant, so every webhook firing for
+// that job would derive the same trigger key and every delivery after the
+// first would be swallowed as a duplicate. Only a value minted per delivery by
+// the sender can carry that meaning.
+type TriggerRequest struct {
+	// Extra is merged into a clone of the job's PlatformKey.
+	Extra map[string]string
+	// VerifiedEventID is the sender's per-delivery identifier. Empty means the
+	// caller has no such proof and the firing is recorded as manual.
+	VerifiedEventID string
+}
+
 // Occurrence is the durable record of one cron firing.
 //
 // Content-free: it stores identity and lifecycle only. The prompt body, worker
