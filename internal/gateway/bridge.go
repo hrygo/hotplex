@@ -128,6 +128,11 @@ type Bridge struct {
 	// store hot-reload machinery is wired.
 	cfgProvider func() *config.Config
 
+	// sharedRuntime refuses an authoritative launch whose process-scoped
+	// profile conflicts with the one a shared-process Worker is already
+	// running under (#946 D3). Nil-safe via the zero value.
+	sharedRuntime *sharedRuntimeGuard
+
 	// catalogInvalidate is invoked on every Worker attach so the session's
 	// command catalog is refreshed (spec §5.2, §8.7). Late-injected via
 	// SetCatalogInvalidator because the Handler (which owns the catalog
@@ -284,6 +289,7 @@ func NewBridge(deps BridgeDeps) *Bridge {
 		repairer:             deps.Repairer,
 		turnTTFT:             newTurnTTFTTracker(),
 		pending:              NewPendingBuffer(),
+		sharedRuntime:        newSharedRuntimeGuard(),
 	}
 	b.mcpConfigJSON.Store(deps.MCPConfigJSON)
 	b.defaultPermissionMode.Store(worker.NormalizePermissionMode(deps.DefaultPermissionMode))

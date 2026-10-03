@@ -190,6 +190,10 @@ type AdminAPI struct {
 	runtimeExec      RuntimeExecutionProvider // Optional: enables /admin/executions fence endpoints (#877); nil → 503
 	runtimeNotifier  RuntimeEventNotifier     // Optional: emits runtime.execution.failed on abandon (#877)
 	runtimeEffects   RuntimeEffectProvider    // Optional: enables /admin/effect endpoints; nil → 503
+	// launchPlans reports the plan each session's current run was ACTUALLY
+	// launched under (#946 D3). nil → the runtime-plan diagnostic re-resolves
+	// against the live config and marks the answer as not-from-launch.
+	launchPlans LaunchPlanProvider
 }
 
 type Deps struct {
@@ -278,6 +282,9 @@ func (a *AdminAPI) SetRuntimeExecution(p RuntimeExecutionProvider, n RuntimeEven
 // operator effect endpoints. nil-safe: they return 503 until wired.
 func (a *AdminAPI) SetRuntimeEffects(p RuntimeEffectProvider) { a.runtimeEffects = p }
 
+// launchPlans exposes the plan each session's current run was actually launched
+// under (#946 D3). nil-safe: the runtime-plan diagnostic then falls back to
+// re-resolution against the live config and marks the answer as such.
 func (a *AdminAPI) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

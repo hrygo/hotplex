@@ -152,9 +152,10 @@ func TestObservedSummaryFor(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name string
-		si   *session.SessionInfo
-		want agentspec.ObservedSummary
+		name      string
+		si        *session.SessionInfo
+		hasLaunch bool
+		want      agentspec.ObservedSummary
 	}{
 		{
 			name: "declared ceiling wins over active state",
@@ -163,6 +164,7 @@ func TestObservedSummaryFor(t *testing.T) {
 				State:             events.StateRunning,
 				PermissionCeiling: "default",
 			},
+			hasLaunch: true,
 			want: agentspec.ObservedSummary{
 				State:             agentspec.ObservedDeclared,
 				WorkerType:        "claude_code",
@@ -170,19 +172,35 @@ func TestObservedSummaryFor(t *testing.T) {
 			},
 		},
 		{
-			name: "active without ceiling is unknown",
-			si:   &session.SessionInfo{WorkerType: worker.TypeCodexCLI, State: events.StateRunning},
-			want: agentspec.ObservedSummary{State: agentspec.ObservedUnknown, WorkerType: "codex_cli"},
+			name:      "active without ceiling is unknown",
+			si:        &session.SessionInfo{WorkerType: worker.TypeCodexCLI, State: events.StateRunning},
+			hasLaunch: true,
+			want:      agentspec.ObservedSummary{State: agentspec.ObservedUnknown, WorkerType: "codex_cli"},
 		},
 		{
-			name: "inactive without ceiling is planned",
-			si:   &session.SessionInfo{State: events.StateTerminated},
-			want: agentspec.ObservedSummary{State: agentspec.ObservedPlanned},
+			name:      "inactive without ceiling is planned",
+			si:        &session.SessionInfo{State: events.StateTerminated},
+			hasLaunch: true,
+			want:      agentspec.ObservedSummary{State: agentspec.ObservedPlanned},
+		},
+		{
+			// D3: with no recorded launch there is nothing observed at all.
+			// Reporting "unknown" here would describe a gap in our knowledge
+			// as a fact about the runtime — and an ACTIVE session that never
+			// launched must not be reported as running under an unproven
+			// bootstrap.
+			name: "no launch is planned even when the session looks active",
+			si: &session.SessionInfo{
+				WorkerType: worker.TypeClaudeCode,
+				State:      events.StateRunning,
+			},
+			hasLaunch: false,
+			want:      agentspec.ObservedSummary{State: agentspec.ObservedPlanned, WorkerType: "claude_code"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, observedSummaryFor(tc.si))
+			require.Equal(t, tc.want, observedSummaryFor(tc.si, tc.hasLaunch))
 		})
 	}
 }

@@ -75,6 +75,12 @@ type launchPlan struct {
 	// BlockedCodes carries bounded fail-closed reasons. Non-empty means the
 	// plan must not be treated as an executable desired state.
 	BlockedCodes []string
+
+	// Applied records that this plan — not the legacy parameters — is what the
+	// Worker was started from. It is false in shadow mode, and it is the only
+	// honest way for a caller to tell "the plan matched what launched anyway"
+	// from "the plan drove the launch".
+	Applied bool
 }
 
 // Blocked reports whether the plan failed closed.

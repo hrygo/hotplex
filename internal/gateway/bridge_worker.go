@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/hrygo/hotplex/internal/agentconfig"
+	"github.com/hrygo/hotplex/internal/agentspec"
+	"github.com/hrygo/hotplex/internal/config"
 	"github.com/hrygo/hotplex/internal/eventstore"
 	"github.com/hrygo/hotplex/internal/observability"
 	"github.com/hrygo/hotplex/internal/worker"
@@ -97,6 +100,37 @@ func (b *Bridge) createAndLaunchWorker(params workerLaunchParams, startFn worker
 		noopw.SetConn(noop.NewConn(sid, params.workerInfo.UserID))
 	}
 
+	// The plan is resolved ONCE here, at the single chokepoint every launch
+	// passes through, and bound to the run below. Resolving it later — from a
+	// diagnostic, or after a config hot-reload — would describe a config the
+	// run never saw.
+	//
+	// It is resolved BEFORE AttachWorker on purpose: in authoritative mode a
+	// blocked plan must refuse the launch, and refusing after attaching would
+	// leave a Worker registered against a session that never runs one.
+	plan := b.prepareLaunchPlan(params)
+	if plan.Mode == config.RuntimePlanModeAuthoritative {
+		if plan.Blocked() {
+			_ = w.Terminate(context.Background())
+			if attachErrFn != nil {
+				attachErrFn(w, fmt.Errorf("%w: %s", ErrPlanLaunchRefused,
+					strings.Join(plan.BlockedCodes, ",")))
+			}
+			return nil, fmt.Errorf("%w: %s", ErrPlanLaunchRefused,
+				strings.Join(plan.BlockedCodes, ","))
+		}
+		if err := b.sharedRuntime.checkAndRecord(params.wt, processScopedProfile(plan)); err != nil {
+			_ = w.Terminate(context.Background())
+			if attachErrFn != nil {
+				attachErrFn(w, err)
+			}
+			return nil, err
+		}
+		// From here the plan, not the legacy parameters, decides what starts.
+		params.workerInfo = applyAuthoritativePlan(plan.Plan.AgentSpec, params.workerInfo)
+		plan.Applied = true
+	}
+
 	if err := b.sm.AttachWorker(params.ctx, sid, w); err != nil {
 		if attachErrFn != nil {
 			attachErrFn(w, err)
@@ -106,13 +140,6 @@ func (b *Bridge) createAndLaunchWorker(params workerLaunchParams, startFn worker
 
 	facts := buildRuntimeFacts(w, params.workerInfo, params.platform, params.scope)
 	b.injectAgentConfig(&params.workerInfo, facts, params.platform, params.botName, params.botID, params.injectExclude, params.workspaceOverrides)
-
-	// The plan is resolved ONCE here, at the single chokepoint every launch
-	// passes through, and bound to the run below. Resolving it later — from a
-	// diagnostic, or after a config hot-reload — would describe a config the
-	// run never saw. In D2 this is shadow: it is prepared and compared, but it
-	// changes nothing about what launches.
-	plan := b.prepareLaunchPlan(params)
 
 	if err := startFn(params.ctx, w, params.workerInfo); err != nil {
 		b.sm.DetachWorker(sid)
@@ -252,6 +279,36 @@ func (b *Bridge) bindWorkerRun(sessionID string, w worker.Worker, runID string, 
 	}
 	b.workerRuns.Store(sessionID, binding)
 	return binding
+}
+
+// LaunchPlanFor returns the plan the session's CURRENT run was launched under.
+//
+// Diagnostics must prefer this over re-resolving the plan against the live
+// config: a re-resolution answers "what would launch now", which is a different
+// question from "what did this run launch under", and presenting the first as
+// the second is how a historical fact turns into a plausible fiction.
+func (b *Bridge) LaunchPlanFor(sessionID string) (agentspec.EffectiveRuntimePlan, bool) {
+	value, ok := b.workerRuns.Load(sessionID)
+	if !ok {
+		return agentspec.EffectiveRuntimePlan{}, false
+	}
+	binding, ok := value.(workerRunBinding)
+	if !ok || binding.launchPlan == nil {
+		return agentspec.EffectiveRuntimePlan{}, false
+	}
+	return binding.launchPlan.Plan, true
+}
+
+// LaunchPlanApplied reports whether the recorded run was actually started from
+// its plan, as opposed to shadow-comparing against it. Without this, a
+// matching plan and an applied plan look identical from outside.
+func (b *Bridge) LaunchPlanApplied(sessionID string) bool {
+	value, ok := b.workerRuns.Load(sessionID)
+	if !ok {
+		return false
+	}
+	binding, ok := value.(workerRunBinding)
+	return ok && binding.launchPlan != nil && binding.launchPlan.Applied
 }
 
 // RecordTurnStart stamps the current turn's start time on the session

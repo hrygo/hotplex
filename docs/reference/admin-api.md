@@ -185,6 +185,15 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 **GET /admin/sessions/{id}/runtime-plan** — 返回会话的 EffectiveRuntimePlan 诊断投影（#946 spec §6.6）：`plan`（redacted view：plan hash、worker_type、permission/sandbox 摘要、env key **名称**、source refs、warnings、blocked codes）与 `observed`（bootstrap 状态：`planned` / `unknown` / `declared` 及 permission ceiling）。投影由会话持久化事实 + 当前 config 按需计算，无 plan 表、无第二份持久化真相；blocked plan 返回 200 并携带 bounded 拦截原因与空 `plan_hash`（blocked 是有效诊断载荷，不是 HTTP 错误）。响应永不包含 prompt、完整命令、model、工具清单或任何值内容。
 
+响应另含两个**来源标记**，用于区分「历史事实」与「当前试算」：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `from_launch` | bool | `true` = `plan` 是该会话**当前 run 实际启动时所用**的计划（取自 run 绑定时捕获的快照）；`false` = `plan` 是按**当前 config 重新试算**的结果。两者回答的是不同问题：前者是「这次运行当时用什么启动」，后者是「现在启动会用什么」。config 在 run 启动后被修改时，这个差别最关键 |
+| `plan_applied` | bool | `true` = 该 run **确实由计划驱动启动**（authoritative rollout 命中）；`false` = 仅做了 shadow 对比。注意：计划与实际启动参数**恰好一致**并不等于 `plan_applied=true`——一致性是观察结果，applied 是事实 |
+
+`observed.state` 只在存在真实 launch 时才会高于 `planned`：没有记录到 launch 的会话一律返回 `planned`，即使它看起来处于 active。把自己知识的缺口说成运行时的状态（「unknown」）是不诚实的。
+
 **外部交付 effect 端点** — 交付 effect 是一次「已向外部渠道投递」的独立事实，与 execution fence 是**两套不相交的 operator 入口**：fence 回答「这次运行还能否接收新输入」，effect 回答「这条消息到底送没送出去」。共用一个端点会让 fence 决策悄悄改写交付历史，或让交付决策解开一个被 fence 的运行。
 
 **GET /admin/effects** — 分页列出交付 effect。参数：`status`（按交付状态过滤）、`limit`（默认 100，上限 500）、`offset`。返回 `{"effects": [...], "limit": N, "offset": N}`。列表项为刻意收窄的无内容投影：`effect_id`、`occurrence_id`、`session_id`、`execution_id`、`delivery_status`、`target_kind`、`target_ref`、`attempt`、`error_code`、`reason`、`provider_ref`、`evidence_ref`、`lease_version`、`created_at`、`updated_at` —— 不含消息正文、payload、凭证或任何由用户内容派生的字段。

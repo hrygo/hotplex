@@ -160,6 +160,12 @@ func setupRoutes(
 	if deps.EffectStore != nil {
 		adminAPI.SetRuntimeEffects(&effectProviderAdapter{store: deps.EffectStore})
 	}
+	// Runtime-plan diagnostics report what a session's current run was ACTUALLY
+	// launched under, not a re-resolution against the live config (#946 D3).
+	// Nil bridge → the diagnostic falls back and marks the answer as such.
+	if bridge != nil {
+		adminAPI.SetLaunchPlanProvider(bridge)
+	}
 
 	if cfg.Admin.RateLimitEnabled {
 		limiter := admin.NewRateLimiter(cfg.Admin.RequestsPerSec, cfg.Admin.Burst)
