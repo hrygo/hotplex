@@ -432,6 +432,13 @@ class InputAckData:
     status: str  # accepted / delivered / unknown / failed
     duplicate: bool = False
     error_code: str | None = None
+    # How the gateway handled the input. Absent on pre-receipt servers.
+    input_mode: str | None = None  # primary / injected / buffered / queued
+    # Recovery guarantee. `accepted` is only durable when this is "durable";
+    # a volatile acceptance is an in-memory staging decision, not a delivery proof.
+    durability: str | None = None  # durable / volatile
+    # Set on injected/buffered receipts to correlate with the running turn.
+    parent_execution_id: str | None = None
 
 
 @dataclass

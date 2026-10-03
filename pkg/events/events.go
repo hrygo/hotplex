@@ -215,15 +215,37 @@ const (
 	ExecutionStatusFailed    ExecutionStatus = "failed"
 )
 
+// InputMode describes how the Gateway handled a client input.
+type InputMode string
+
+const (
+	InputModePrimary  InputMode = "primary"
+	InputModeInjected InputMode = "injected"
+	InputModeBuffered InputMode = "buffered"
+	InputModeQueued   InputMode = "queued"
+)
+
+// InputDurability states whether the Gateway can recover an accepted input
+// after process failure. It does not claim that a Worker received the input.
+type InputDurability string
+
+const (
+	InputDurabilityDurable  InputDurability = "durable"
+	InputDurabilityVolatile InputDurability = "volatile"
+)
+
 // InputAckData correlates a client input envelope with its durable execution.
 // Duplicate is true when the gateway replayed the existing outcome instead of
 // invoking Worker.Input again.
 type InputAckData struct {
-	ClientMessageID string          `json:"client_message_id"`
-	ExecutionID     string          `json:"execution_id"`
-	Status          ExecutionStatus `json:"status"`
-	Duplicate       bool            `json:"duplicate,omitempty"`
-	ErrorCode       ErrorCode       `json:"error_code,omitempty"`
+	ClientMessageID   string          `json:"client_message_id"`
+	ExecutionID       string          `json:"execution_id"`
+	Status            ExecutionStatus `json:"status"`
+	Duplicate         bool            `json:"duplicate,omitempty"`
+	ErrorCode         ErrorCode       `json:"error_code,omitempty"`
+	InputMode         InputMode       `json:"input_mode,omitempty"`
+	Durability        InputDurability `json:"durability,omitempty"`
+	ParentExecutionID string          `json:"parent_execution_id,omitempty"`
 }
 
 // MessageStartData is the payload for MessageStart events.

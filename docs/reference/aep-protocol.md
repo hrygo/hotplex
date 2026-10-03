@@ -116,17 +116,21 @@ payload 会返回 `INVALID_MESSAGE`。消息平台适配器使用平台原生 me
 
 `failed` 或未被 Gateway 补充消息机制接管的 `SESSION_BUSY` 表示本次投递已明确失败，
 后续逻辑重试应使用新 ID。Session 正在执行时，Gateway 可将追加输入注入当前 turn，
-或在内存中暂存并在当前 turn 结束后重投；这两种情况都会返回终态
-`input.ack(delivered)`，重发相同 ID 时返回 `duplicate: true` 且不会再次注入或暂存。
+或在内存中暂存并在当前 turn 结束后重投。注入返回
+`input.ack(delivered, input_mode=injected)`，暂存返回
+`input.ack(accepted, input_mode=buffered, durability=volatile)`——暂存**不是**送达，
+不得据此认为 Agent 已收到输入。重发相同 ID 时返回 `duplicate: true`，并带回原有的
+`input_mode` 与 `durability`，不会再次注入或暂存。
 `unknown` 表示可能已产生副作用：复用原 ID 只会查询现状；若用户明确接受重复风险
 并决定再次执行，则必须创建新 ID。
 
 只有实际投递给 Worker 的普通输入进入持久化账本。忙碌期间的补充消息使用有界的
-进程内去重记录，并直接返回终态 ACK；该记录不会跨 Gateway 重启持久化。Gateway
+进程内去重记录；该记录不会跨 Gateway 重启持久化，因此其 `durability` 为 `volatile`。
+Gateway
 自身处理的帮助、控制和 Worker 命令不产生 `input.ack`。
 
 每个 Session 最多保留 20 条待重放补充（包含正在投递的重放）；容量已满时新补充会
-收到 `SESSION_BUSY` 错误且不会收到 `input.ack(delivered)`，已确认条目不会被驱逐。
+收到 `SESSION_BUSY` 错误且不会收到 `input.ack`，已确认条目不会被驱逐。
 
 ### permission_response（权限响应）
 
@@ -260,7 +264,9 @@ payload 会返回 `INVALID_MESSAGE`。消息平台适配器使用平台原生 me
     "client_message_id": "evt_<uuid>",
     "execution_id": "exec_<uuid>",
     "status": "accepted",
-    "duplicate": false
+    "duplicate": false,
+    "input_mode": "primary",
+    "durability": "durable"
   }
 }
 ```
@@ -270,10 +276,28 @@ Gateway 在输入写入持久化账本后先发送 `accepted`，在 `Worker.Inpu
 
 | Status | 说明 |
 |--------|------|
-| `accepted` | 已持久化，尚未确认 Worker 是否接受 |
+| `accepted` | 已接受，尚未确认 Worker 是否接受；必须结合 `durability` 解释 |
 | `delivered` | Worker 输入端点已接受 |
 | `unknown` | 超时或重启导致结果不确定；为避免重复副作用，Gateway 不自动重投 |
 | `failed` | Worker 明确拒绝或投递失败；`error_code` 提供分类 |
+
+`status: accepted` 本身不区分耐久性与派发，必须结合 `durability`：
+
+| input_mode | status | durability | 含义 |
+|--------|------|------|------|
+| `primary` | `accepted` → `delivered` | `durable` | 普通输入，已进入持久化账本 |
+| `injected` | `delivered` | `volatile` | 已提交至当前运行，不证明效果已完成 |
+| `buffered` | `accepted` | `volatile` | 仅在内存中暂存，尚未派发，重启可能丢失 |
+| `queued` | `accepted` | `durable` | 已进入持久化队列，尚未派发 |
+
+`durability` 只说明 Gateway 能否在进程失败后恢复该输入，不代表 Worker 已经收到。
+`input_mode` 与 `durability` 为 optional：缺失时按旧语义解释，普通输入仍是持久化账本
+路径，客户端不得把字段缺失读作 `volatile`。
+
+`parent_execution_id` 为 optional，仅在 `injected` / `buffered` 且存在正在执行的 turn 时
+返回，用于把补充输入关联到父执行。`injected` 的 `delivered` 表示 Worker 输入端点已接收，
+但 turn 的效果尚未完成；客户端应以 Agent 的 `done` / `runtime.execution.*` 判断完成，
+不要把注入 ACK 当作完成。
 
 `duplicate: true` 表示 Gateway 返回已有记录且未再次调用 Worker。`input.ack`
 使用 control priority，绕过普通 broadcast 背压队列。

@@ -973,7 +973,8 @@ func (h *Handler) handleSupplementOnBusy(ctx context.Context, env *events.Envelo
 	case supplementCapacity:
 		return h.sendErrorf(ctx, env, events.ErrCodeSessionBusy, "too many concurrent supplement attempts")
 	case supplementInjected, supplementBuffered:
-		h.ackSupplement(ctx, env, "", true)
+		h.ackSupplement(ctx, env, supplementReceiptForDisposition(disposition), true,
+			h.activeExecutionID(ctx, env.SessionID))
 		return nil
 	case supplementNormal:
 		unlockSession()
@@ -1007,6 +1008,7 @@ func (h *Handler) handleSupplementOnBusy(ctx context.Context, env *events.Envelo
 			return deliverErr
 		}
 	} else if w := h.sm.GetWorker(env.SessionID); w != nil {
+		parentExecutionID := ""
 		if inj, ok := w.(worker.MidTurnInjector); ok && !w.IsStopped() {
 			// Re-check the active gate immediately before injecting. A race
 			// window exists between the SESSION_BUSY detection (in
@@ -1021,10 +1023,12 @@ func (h *Handler) handleSupplementOnBusy(ctx context.Context, env *events.Envelo
 			// fence so InjectMidTurn rejects writes after Done even if the gate
 			// changes between this check and the stdin write.
 			if h.executionStore != nil {
-				if _, aerr := h.executionStore.ActiveBySession(ctx, env.SessionID); errors.Is(aerr, execution.ErrNotFound) {
+				if active, aerr := h.executionStore.ActiveBySession(ctx, env.SessionID); errors.Is(aerr, execution.ErrNotFound) {
 					if handled, deliverErr := deliverAsNewTurn(); handled {
 						return deliverErr
 					}
+				} else if aerr == nil && active != nil {
+					parentExecutionID = active.ExecutionID
 				}
 			}
 			if err := inj.InjectMidTurn(ctx, content, nil); err == nil {
@@ -1034,7 +1038,7 @@ func (h *Handler) handleSupplementOnBusy(ctx context.Context, env *events.Envelo
 				}
 				lease.Commit(supplementInjected)
 				committed = true
-				h.ackSupplement(ctx, env, "injected", false)
+				h.ackSupplement(ctx, env, supplementInjectedReceipt, false, parentExecutionID)
 				h.notifySupplement(ctx, env.SessionID, "injected")
 				return nil
 			} else {
@@ -1059,31 +1063,76 @@ func (h *Handler) handleSupplementOnBusy(ctx context.Context, env *events.Envelo
 	lease.Commit(supplementBuffered)
 	committed = true
 	observability.SupplementBuffered().Add(ctx, 1)
-	h.ackSupplement(ctx, env, "buffered", false)
+	h.ackSupplement(ctx, env, supplementBufferedReceipt, false,
+		h.activeExecutionID(ctx, env.SessionID))
 	h.notifySupplement(ctx, env.SessionID, "buffered")
 	return nil
+}
+
+type supplementReceipt struct {
+	status     events.ExecutionStatus
+	inputMode  events.InputMode
+	durability events.InputDurability
+}
+
+var (
+	supplementInjectedReceipt = supplementReceipt{
+		status:     events.ExecutionStatusDelivered,
+		inputMode:  events.InputModeInjected,
+		durability: events.InputDurabilityVolatile,
+	}
+	supplementBufferedReceipt = supplementReceipt{
+		status:     events.ExecutionStatusAccepted,
+		inputMode:  events.InputModeBuffered,
+		durability: events.InputDurabilityVolatile,
+	}
+)
+
+func supplementReceiptForDisposition(disposition supplementDisposition) supplementReceipt {
+	if disposition == supplementBuffered {
+		return supplementBufferedReceipt
+	}
+	return supplementInjectedReceipt
+}
+
+func (h *Handler) activeExecutionID(ctx context.Context, sessionID string) string {
+	if h.executionStore == nil {
+		return ""
+	}
+	active, err := h.executionStore.ActiveBySession(ctx, sessionID)
+	if err != nil || active == nil {
+		return ""
+	}
+	return active.ExecutionID
 }
 
 // ackSupplement settles AEP clients for a busy input that was accepted outside
 // the execution ledger. The stable synthetic execution ID mirrors command ACKs;
 // client_message_id remains the authoritative correlation and dedup key.
-func (h *Handler) ackSupplement(ctx context.Context, source *events.Envelope, mode string, duplicate bool) {
+func (h *Handler) ackSupplement(
+	ctx context.Context,
+	source *events.Envelope,
+	receipt supplementReceipt,
+	duplicate bool,
+	parentExecutionID string,
+) {
 	if h.hub == nil {
 		return
 	}
 	clientID := clientMessageID(source)
 	ack := events.NewEnvelope(aep.NewID(), source.SessionID, 0, events.InputAck, events.InputAckData{
-		ClientMessageID: clientID,
-		ExecutionID:     "supplement-" + clientID,
-		Status:          events.ExecutionStatusDelivered,
-		Duplicate:       duplicate,
+		ClientMessageID:   clientID,
+		ExecutionID:       "supplement-" + clientID,
+		Status:            receipt.status,
+		Duplicate:         duplicate,
+		InputMode:         receipt.inputMode,
+		Durability:        receipt.durability,
+		ParentExecutionID: parentExecutionID,
 	})
 	ack.Priority = events.PriorityControl
 	ack.OwnerID = source.OwnerID
 	ack.Metadata = map[string]any{"client_message_id": clientID}
-	if mode != "" {
-		ack.Metadata["supplement_mode"] = mode
-	}
+	ack.Metadata["supplement_mode"] = string(receipt.inputMode)
 	if err := h.hub.SendToSession(context.WithoutCancel(ctx), ack); err != nil {
 		h.log.Warn("gateway: supplement ack delivery failed", "err", err,
 			"session_id", source.SessionID, "client_message_id", clientID)
@@ -1865,6 +1914,8 @@ func (h *Handler) sendInputAck(ctx context.Context, source *events.Envelope, rec
 		Status:          events.ExecutionStatus(record.Status),
 		Duplicate:       duplicate,
 		ErrorCode:       events.ErrorCode(record.ErrorCode),
+		InputMode:       events.InputModePrimary,
+		Durability:      events.InputDurabilityDurable,
 	})
 	ack.Priority = events.PriorityControl
 	ack.OwnerID = source.OwnerID

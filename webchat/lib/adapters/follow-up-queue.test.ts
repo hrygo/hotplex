@@ -127,6 +127,40 @@ describe("FollowUpQueueStore", () => {
         });
     });
 
+    it("releases a sending slot on a volatile acceptance without claiming delivery", () => {
+        const store = createStore();
+        const first = store.enqueue("session-a", "first");
+        store.enqueue("session-a", "second");
+        if (!first.ok) throw new Error("enqueue failed");
+
+        store.markSending("session-a", first.item.id);
+        store.attachClientMessageId("session-a", first.item.id, "client-1");
+
+        expect(store.releaseVolatileAccepted("session-a", "different-client")).toBeNull();
+        expect(store.getSnapshot("session-a")).toHaveLength(2);
+
+        // The gateway owns the input now, so the slot must free up for the next
+        // FIFO item — but nothing may claim the input was delivered.
+        expect(store.releaseVolatileAccepted("session-a", "client-1")?.id).toBe(
+            first.item.id,
+        );
+        expect(store.getSnapshot("session-a")).toHaveLength(1);
+        expect(store.peekDispatchable("session-a")).toMatchObject({
+            text: "second",
+        });
+    });
+
+    it("ignores a volatile acceptance for an item that is not sending", () => {
+        const store = createStore();
+        const result = store.enqueue("session-a", "first");
+        if (!result.ok) throw new Error("enqueue failed");
+
+        expect(
+            store.releaseVolatileAccepted("session-a", "client-1"),
+        ).toBeNull();
+        expect(store.getSnapshot("session-a")).toHaveLength(1);
+    });
+
     it("converges an unknown item when its original delivery is confirmed late", () => {
         const store = createStore();
         const result = store.enqueue("session-a", "first");

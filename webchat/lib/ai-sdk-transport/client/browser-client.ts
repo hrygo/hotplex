@@ -671,12 +671,20 @@ export class BrowserHotPlexClient extends EventEmitter<BrowserClientEvents> {
       case EventKind.InputAck: {
         const ackData = event.data as InputAckData;
         if (this.pendingInput?.clientMessageId === ackData.client_message_id &&
-            ackData.status !== 'accepted') {
+            // A volatile acceptance is the gateway staging the input in process
+            // memory (supplement buffer). Nothing durable owns it, so no second
+            // ACK is coming — leaving the send pending would lock the composer
+            // until the input timeout. Durable accepted is an intermediate state
+            // that delivered still follows, so it must keep waiting.
+            (ackData.status !== 'accepted' ||
+                (ackData.status === 'accepted' && ackData.durability === 'volatile'))) {
           this.pendingInput.retryable = false;
-          if (ackData.status === 'delivered') {
+          if (ackData.status === 'delivered' || ackData.status === 'accepted') {
             // A delivered outcome resolves the pending input — including the
             // duplicate-delivered replay on reconnect — so the client never
             // waits for a Done that the deduplicated path will not send.
+            // A volatile accepted receipt resolves it for the same reason:
+            // no further ACK will arrive for that input.
             this._settlePending({ kind: 'resolve' });
           } else if (ackData.status === 'unknown') {
             this._settlePending({

@@ -180,6 +180,9 @@ func requireInputAcks(t *testing.T, conn *mockPlatformConn, statuses ...events.E
 		require.Equal(t, "evt-client-1", data.ClientMessageID)
 		require.Equal(t, "exec_test", data.ExecutionID)
 		require.Equal(t, statuses[i], data.Status)
+		require.Equal(t, events.InputModePrimary, data.InputMode)
+		require.Equal(t, events.InputDurabilityDurable, data.Durability)
+		require.Empty(t, data.ParentExecutionID)
 	}
 }
 

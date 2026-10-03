@@ -12,6 +12,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import dev.hotplex.protocol.EventKind;
+import dev.hotplex.protocol.InputAckData;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -105,5 +106,35 @@ class AepCorpusConformanceTest {
         }
         assertTrue(missing.isEmpty(),
                 "EventKind enum missing values: " + String.join(", ", missing));
+    }
+
+    @Test
+    @DisplayName("input.ack carries mode and durability so a buffered accept is not read as delivered")
+    void inputAckReportsModeAndDurability() throws IOException {
+        Path buffered = CORPUS_DIR.resolve("93-compatibility-input-ack-buffered.json");
+        Assumptions.assumeTrue(Files.exists(buffered), "buffered fixture not found");
+        JsonNode env = MAPPER.readTree(buffered.toFile());
+        InputAckData ack = MAPPER.treeToValue(env.get("event").get("data"), InputAckData.class);
+
+        assertEquals("accepted", ack.getStatus());
+        assertEquals("buffered", ack.getInputMode());
+        assertEquals("volatile", ack.getDurability());
+        assertEquals("exec_parent_1", ack.getParentExecutionId());
+        // The volatile acceptance is explicitly NOT a delivery.
+        assertNotEquals("delivered", ack.getStatus());
+    }
+
+    @Test
+    @DisplayName("input.ack from a pre-receipt server decodes with the fields absent")
+    void inputAckLegacyPayloadWithoutModeAndDurability() throws IOException {
+        Path legacy = CORPUS_DIR.resolve("94-compatibility-input-ack-legacy.json");
+        Assumptions.assumeTrue(Files.exists(legacy), "legacy fixture not found");
+        JsonNode env = MAPPER.readTree(legacy.toFile());
+        InputAckData ack = MAPPER.treeToValue(env.get("event").get("data"), InputAckData.class);
+
+        assertEquals("delivered", ack.getStatus());
+        assertNull(ack.getInputMode());
+        assertNull(ack.getDurability());
+        assertNull(ack.getParentExecutionId());
     }
 }

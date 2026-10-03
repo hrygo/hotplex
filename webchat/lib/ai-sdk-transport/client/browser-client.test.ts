@@ -1038,6 +1038,65 @@ describe("BrowserHotPlexClient input retry identity", () => {
         expect(() => client.sendInput("second")).not.toThrow();
     });
 
+    it("clears pendingInput on a volatile accepted receipt so a volatile staging decision cannot deadlock the composer", () => {
+        vi.stubGlobal("WebSocket", { OPEN: 1 });
+        const client = new BrowserHotPlexClient({
+            url: "ws://127.0.0.1:8888/ws",
+            workerType: WorkerType.CodexCLI,
+        });
+        const internal = client as unknown as {
+            _sessionId: string;
+            ws: { readyState: number };
+            _send(value: Envelope): void;
+        };
+        internal._sessionId = "session-1";
+        internal.ws = { readyState: 1 };
+        const send = vi.spyOn(internal, "_send").mockImplementation(() => undefined);
+
+        client.sendInput("first");
+        const clientMessageId = send.mock.calls[0][0].id;
+        route(client, envelope(EventKind.InputAck, {
+            client_message_id: clientMessageId,
+            execution_id: `supplement-${clientMessageId}`,
+            status: "accepted",
+            input_mode: "buffered",
+            durability: "volatile",
+        }));
+
+        // A volatile receipt is never followed by a second ACK, so the send
+        // must settle here instead of waiting for the timeout.
+        expect(() => client.sendInput("second")).not.toThrow();
+    });
+
+    it("keeps pendingInput on a durable accepted receipt that will be followed by delivered", () => {
+        vi.stubGlobal("WebSocket", { OPEN: 1 });
+        const client = new BrowserHotPlexClient({
+            url: "ws://127.0.0.1:8888/ws",
+            workerType: WorkerType.CodexCLI,
+        });
+        const internal = client as unknown as {
+            _sessionId: string;
+            ws: { readyState: number };
+            _send(value: Envelope): void;
+        };
+        internal._sessionId = "session-1";
+        internal.ws = { readyState: 1 };
+        const send = vi.spyOn(internal, "_send").mockImplementation(() => undefined);
+
+        client.sendInput("first");
+        const clientMessageId = send.mock.calls[0][0].id;
+        route(client, envelope(EventKind.InputAck, {
+            client_message_id: clientMessageId,
+            execution_id: "exec-1",
+            status: "accepted",
+            input_mode: "primary",
+            durability: "durable",
+        }));
+
+        // durable accepted is an intermediate state — delivered still owes an ACK.
+        expect(() => client.sendInput("second")).toThrow("Input already pending");
+    });
+
     it("clears pendingInput on a non-SESSION_BUSY error so the client is not locked out", () => {
         vi.stubGlobal("WebSocket", { OPEN: 1 });
         const client = new BrowserHotPlexClient({

@@ -7,11 +7,12 @@
   "event": {
     "type": "input.ack",
     "data": {
-      "client_message_id": "evt_client_1",
-      "execution_id": "exec_1",
-      "status": "delivered",
-      "input_mode": "primary",
-      "durability": "durable"
+      "client_message_id": "evt_client_2",
+      "execution_id": "supplement-evt_client_2",
+      "status": "accepted",
+      "input_mode": "buffered",
+      "durability": "volatile",
+      "parent_execution_id": "exec_parent_1"
     }
   }
 }

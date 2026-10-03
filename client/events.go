@@ -89,6 +89,8 @@ type (
 	StateData               = events.StateData
 	InputAckData            = events.InputAckData
 	ExecutionStatus         = events.ExecutionStatus
+	InputMode               = events.InputMode
+	InputDurability         = events.InputDurability
 	ReasoningData           = events.ReasoningData
 	StepData                = events.StepData
 	DoneData                = events.DoneData
@@ -124,6 +126,21 @@ const (
 	ExecutionStatusDelivered = events.ExecutionStatusDelivered
 	ExecutionStatusUnknown   = events.ExecutionStatusUnknown
 	ExecutionStatusFailed    = events.ExecutionStatusFailed
+)
+
+// InputMode values describe how the Gateway handled a client input.
+const (
+	InputModePrimary  = events.InputModePrimary
+	InputModeInjected = events.InputModeInjected
+	InputModeBuffered = events.InputModeBuffered
+	InputModeQueued   = events.InputModeQueued
+)
+
+// InputDurability values state whether an accepted input survives process
+// failure. They never claim that a Worker received the input.
+const (
+	InputDurabilityDurable  = events.InputDurabilityDurable
+	InputDurabilityVolatile = events.InputDurabilityVolatile
 )
 
 // ErrorData is the payload of an error event.
