@@ -149,6 +149,21 @@ func (f *fakeEffectStore) ListDueRetries(
 	return f.dueRetries, nil
 }
 
+// ListForOperator and ApplyOperatorAction are the operator-console half of the
+// ledger interface. The delivery path under test never calls them, so the fake
+// answers plainly instead of inventing state.
+func (f *fakeEffectStore) ListForOperator(
+	context.Context, effect.OperatorListFilter,
+) ([]*effect.Effect, error) {
+	return nil, nil
+}
+
+func (f *fakeEffectStore) ApplyOperatorAction(
+	context.Context, effect.OperatorActionRequest,
+) (*effect.Effect, error) {
+	return nil, effect.ErrEffectNotFound
+}
+
 // recordingSender captures the sends that actually reached the provider.
 type recordingSender struct {
 	result  messaging.SendResult

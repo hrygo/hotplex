@@ -22,6 +22,19 @@ type Input struct {
 	// the contract, MapToSessionInfo tests, and the future bridge slice.
 	WorkspacePerm string
 
+	// SessionPerm is the permission ceiling captured when this session started.
+	// Unlike WorkspacePerm it is immutable for the life of the session, so a
+	// later config edit cannot widen what the session may now do.
+	SessionPerm string
+
+	// RequiredCapabilities lists capabilities the plan cannot run without;
+	// VerifiedCapabilities lists the ones the caller could actually verify
+	// against the backend. A requirement with no verification blocks the plan
+	// (see BlockRequiredCapabilityUnverified) — an unenforced promise is not a
+	// warning.
+	RequiredCapabilities []string
+	VerifiedCapabilities []string
+
 	BotName     string
 	Platform    string // "slack" | "feishu" | "yuanxin" | "webchat" | ""
 	PlatformKey map[string]string
@@ -75,6 +88,15 @@ func (r Resolver) validateWorkerType(workerType string) error {
 // boundary, matching current behavior (webchat passes an empty worker_type
 // through today; REST defaults it before this layer).
 func (r Resolver) Resolve(in Input) (AgentSpec, error) {
+	spec, _, err := r.resolveWithAuthority(in)
+	return spec, err
+}
+
+// resolveWithAuthority is Resolve plus the authority-clamp outcome. Resolve
+// itself must stay a pure "what did the precedence chain produce" function so
+// its equivalence proof keeps working; the clamp REASON is only interesting to
+// the plan, which has to decide between a warning and a blocked plan.
+func (r Resolver) resolveWithAuthority(in Input) (AgentSpec, permissionOutcome, error) {
 	var spec AgentSpec
 
 	// ── Worker ──────────────────────────────────────────────────────────────
@@ -85,25 +107,40 @@ func (r Resolver) Resolve(in Input) (AgentSpec, error) {
 	}
 	if wt != "" {
 		if err := r.validateWorkerType(wt); err != nil {
-			return AgentSpec{}, fmt.Errorf("agentspec: worker type: %w", err)
+			return AgentSpec{}, permissionOutcome{}, fmt.Errorf("agentspec: worker type: %w", err)
 		}
 	}
 	spec.Worker.Type = wt
 	spec.Worker.Model = in.InitMeta.Model
+	spec.Worker.ModelSet = in.InitMeta.Model != ""
 	spec.Worker.Command = resolveCommand(in, wt)
 	// AllowedModels is intentionally NOT injected (finding F1): doing so would
 	// change webchat model visibility. The contract field stays nil in first-cut.
 
 	// ── Policy ──────────────────────────────────────────────────────────────
 	pm := resolvePermissionMode(in, wt)
+	explicitPermission := in.InitMeta.PermissionMode != ""
 	if pm != "" {
 		if err := worker.ValidatePermissionMode(pm); err != nil {
-			return AgentSpec{}, fmt.Errorf("agentspec: permission mode: %w", err)
+			return AgentSpec{}, permissionOutcome{}, fmt.Errorf("agentspec: permission mode: %w", err)
 		}
+	}
+	// The authority clamp runs AFTER precedence resolution and AFTER boundary
+	// validation, so the tier a plan carries is always inside the ceiling.
+	outcome := applyPermissionCeiling(pm, ceilingFor(in), explicitPermission)
+	if outcome.BlockedCode != "" {
+		// Refuse before the value reaches any caller. Plan resolution turns
+		// this into a blocked plan; a direct Resolve caller gets the
+		// strictest tier, never the one it asked for.
+		pm = worker.PermissionModeReadOnly
+	} else {
+		pm = outcome.Effective
 	}
 	spec.Policy.PermissionMode = pm
 	spec.Policy.AllowedTools = in.InitMeta.AllowedTools
+	spec.Policy.AllowedToolsSet = in.InitMeta.AllowedTools != nil
 	spec.Policy.DisallowedTools = in.InitMeta.DisallowedTools
+	spec.Policy.DisallowedToolsSet = in.InitMeta.DisallowedTools != nil
 
 	// ── Sandbox (contract; codex semantics baseline) ────────────────────────
 	spec.Sandbox.Mode = resolveSandbox(in, wt)
@@ -118,7 +155,7 @@ func (r Resolver) Resolve(in Input) (AgentSpec, error) {
 		Platform:    in.Platform,
 	}
 
-	return spec, nil
+	return spec, outcome, nil
 }
 
 // resolvePermissionMode mirrors the bridge's permission inputs for the plan
@@ -179,6 +216,16 @@ func permissionModeFromCodexConfig(sandbox, approval string) string {
 		return worker.PermissionModeReadOnly
 	default:
 		return worker.PermissionModeReadOnly
+	}
+}
+
+// ceilingFor collects every permission upper bound that applies to this launch.
+// The workspace override doubles as a ceiling when it is set: an owner may
+// narrow a session below the operator default, never widen past it.
+func ceilingFor(in Input) AuthorityCeiling {
+	return AuthorityCeiling{
+		Workspace: in.WorkspacePerm,
+		Session:   in.SessionPerm,
 	}
 }
 

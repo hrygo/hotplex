@@ -18,8 +18,9 @@ func MapToStartParams(spec AgentSpec, base worker.SessionStartParams) worker.Ses
 	// WorkerType: AgentSpec owns and authoritatively sets it (the Resolver
 	// already applied the full precedence + boundary validation).
 	out.WorkerType = worker.WorkerType(spec.Worker.Type)
-	// AllowedTools: nil means "not provided / no restriction" → preserve base.
-	if spec.Policy.AllowedTools != nil {
+	// AllowedTools: presence decides, not emptiness. An explicit clear is a
+	// decision ("allow nothing") and must not be mistaken for "inherit".
+	if spec.Policy.AllowedToolsSet || spec.Policy.AllowedTools != nil {
 		out.AllowedTools = spec.Policy.AllowedTools
 	}
 	return out
@@ -45,10 +46,10 @@ func MapToSessionInfo(spec AgentSpec, base worker.SessionInfo) worker.SessionInf
 		out.PermissionMode = spec.Policy.PermissionMode
 	}
 	out.SkipPermissions = spec.Policy.SkipPermissions
-	if spec.Policy.AllowedTools != nil {
+	if spec.Policy.AllowedToolsSet || spec.Policy.AllowedTools != nil {
 		out.AllowedTools = spec.Policy.AllowedTools
 	}
-	if spec.Policy.DisallowedTools != nil {
+	if spec.Policy.DisallowedToolsSet || spec.Policy.DisallowedTools != nil {
 		out.DisallowedTools = spec.Policy.DisallowedTools
 	}
 
