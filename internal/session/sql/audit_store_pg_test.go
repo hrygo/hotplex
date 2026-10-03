@@ -146,17 +146,24 @@ func TestPGAuditStore_AdvisoryLockSerializesTail(t *testing.T) {
 	// tx2 begins concurrently. It must BLOCK on pg_advisory_xact_lock until
 	// tx1 commits/rolls back. Run it in a goroutine and assert it hasn't
 	// completed within a short window while tx1 is still open.
-	tx2Done := make(chan error, 1)
+	type beginResult struct {
+		tx  audit.Tx
+		err error
+	}
+	tx2Done := make(chan beginResult, 1)
 	go func() {
-		_, err := store.BeginTx(ctx)
-		tx2Done <- err
+		tx, err := store.BeginTx(ctx)
+		tx2Done <- beginResult{tx: tx, err: err}
 	}()
 
 	select {
-	case err := <-tx2Done:
-		// If BeginTx returned while tx1 was open, the advisory lock is not
-		// serializing — flag for investigation.
-		t.Logf("note: concurrent BeginTx returned while tx1 open (err=%v); advisory lock serialization is timing-sensitive", err)
+	case res := <-tx2Done:
+		// BeginTx can only return once it holds the lock, and tx1 holds it. A
+		// return here means the lock is not serializing, which is the defect
+		// this test exists to catch — not a timing artefact to be logged.
+		require.NoError(t, res.err)
+		t.Fatal("concurrent BeginTx returned while tx1 still held the advisory lock; " +
+			"the serialization point is not being enforced")
 	case <-time.After(300 * time.Millisecond):
 		// Expected: tx2 is still blocked on the advisory lock held by tx1.
 	}
@@ -164,10 +171,17 @@ func TestPGAuditStore_AdvisoryLockSerializesTail(t *testing.T) {
 	// Releasing tx1 lets tx2 proceed.
 	require.NoError(t, tx1.Commit())
 
-	// tx2 should now complete within a reasonable window.
+	// tx2 should now complete within a reasonable window. Its transaction MUST
+	// be rolled back here: the advisory lock is transaction-scoped, so an
+	// abandoned tx2 goes back into the pool idle-in-transaction still holding
+	// it, and the next BeginTx in this suite then blocks forever. That is not
+	// hypothetical — it hung the package until the test binary's timeout, and
+	// only when -shuffle=on happened to order another BeginTx test after this
+	// one.
 	select {
-	case err := <-tx2Done:
-		require.NoError(t, err, "concurrent BeginTx must succeed after tx1 commits")
+	case res := <-tx2Done:
+		require.NoError(t, res.err, "concurrent BeginTx must succeed after tx1 commits")
+		require.NoError(t, res.tx.Rollback(), "release tx2's advisory lock")
 	case <-time.After(2 * time.Second):
 		t.Fatal("concurrent BeginTx did not complete after tx1 committed")
 	}

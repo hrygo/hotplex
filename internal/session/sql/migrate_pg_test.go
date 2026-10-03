@@ -143,7 +143,7 @@ func TestMigrations_PG_037ExecutionQueue_SchemaAndInvariants(t *testing.T) {
 	const ts = 1700000000000
 	_, err := db.ExecContext(ctx, `INSERT INTO sessions
 		(id, user_id, worker_type, state, created_at, updated_at)
-		VALUES ('s-queue', 'u1', 'claude_code', 'idle', $1, $1)`, ts)
+		VALUES ('s-queue', 'u1', 'claude_code', 'idle', NOW(), NOW())`)
 	require.NoError(t, err, "seed session")
 
 	// 1) Exactly one runtime_status CHECK survives, and it admits 'queued'.
@@ -227,7 +227,7 @@ func TestMigrations_PG_038ExecutionQueuePayloads_ContentFollowsControlFacts(t *t
 
 	_, err := db.ExecContext(ctx, `INSERT INTO sessions
 		(id, user_id, worker_type, state, created_at, updated_at)
-		VALUES ('s-payload', 'u1', 'claude_code', 'idle', $1, $1)`, 1700000000000)
+		VALUES ('s-payload', 'u1', 'claude_code', 'idle', NOW(), NOW())`)
 	require.NoError(t, err)
 
 	_, err = db.ExecContext(ctx, `INSERT INTO execution_inputs

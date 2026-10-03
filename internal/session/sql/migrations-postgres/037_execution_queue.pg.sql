@@ -10,6 +10,10 @@
 -- PostgreSQL can widen a CHECK in place, so unlike SQLite this is two
 -- statements and no table rebuild. The existing constraint is located by what
 -- it checks rather than by the name the server happened to generate.
+-- StatementBegin/End wrap the DO body: the plpgsql block contains its own
+-- semicolons, and goose splits a migration on semicolons unless it is told
+-- the block is one statement.
+-- +goose StatementBegin
 DO $$
 DECLARE
     existing_constraint TEXT;
@@ -27,6 +31,7 @@ BEGIN
     END IF;
 END
 $$;
+-- +goose StatementEnd
 
 ALTER TABLE "execution_inputs"
     ADD CONSTRAINT "execution_inputs_runtime_status_check"

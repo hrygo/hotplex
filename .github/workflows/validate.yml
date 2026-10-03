@@ -557,6 +557,56 @@ jobs:
           # conformance test must fail the gate, not pass silently.
           mvn -B test -Dtest="dev.hotplex.conformance.AepCorpusConformanceTest"
 
+  # PostgreSQL is a supported deployment target, so its migrations and
+  # conditional updates are checked by a gate like any other supported
+  # dialect. The SQLite suite cannot stand in for it: dialect-specific SQL
+  # (DO blocks, CHECK widening, binary parameter encoding) fails only on PG,
+  # which is how a broken PG migration reached main before this job existed.
+  postgres:
+    name: PostgreSQL
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: hotplex_test
+          POSTGRES_PASSWORD: hotplex_test
+          POSTGRES_DB: hotplex_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hotplex_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      HOTPLEX_TEST_PG_DSN: postgres://hotplex_test:hotplex_test@localhost:5432/hotplex_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+
+      - name: Run PostgreSQL-tagged tests
+        run: |
+          set -euo pipefail
+          # -p 1 is required, not a performance choice: every PG test starts by
+          # DROP SCHEMA public CASCADE so it is deterministic, which means two
+          # packages running in parallel would delete each other's schema
+          # mid-test. Serialising the packages is what makes one shared
+          # service container safe.
+          go test -tags pg -p 1 \
+            ./internal/execution \
+            ./internal/session \
+            ./internal/session/sql \
+            -count=1 -race -shuffle=on -timeout=15m
+
   # ── Gate ──────────────────────────────────────────────────────────────
   # `needs:` already stops publish when a check fails, but a check that was
   # skipped, cancelled, or never started leaves the downstream job merely
@@ -581,6 +631,7 @@ jobs:
       - aep-schema-typescript
       - aep-schema-python
       - aep-schema-java
+      - postgres
     steps:
       - name: Require every check to have succeeded
         env:

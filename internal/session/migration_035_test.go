@@ -16,10 +16,14 @@ import (
 
 func insertPreModeOccurrence(t *testing.T, ctx context.Context, db *sql.DB, id, triggerKey string) {
 	t.Helper()
+	// $1/$2 rather than ?1/? — this helper seeds both dialects, and only the
+	// $ form is valid on PostgreSQL. SQLite accepts it as an ordinary named
+	// parameter, so one statement serves both instead of quietly running
+	// SQLite-only SQL against PG.
 	_, err := db.ExecContext(ctx, `INSERT INTO cron_occurrences
 		(occurrence_id, trigger_key, generation, job_id, trigger_kind,
 		 status, created_at, updated_at)
-		VALUES (?, ?, 0, 'job-1', 'scheduled', 'completed', 1, 1)`, id, triggerKey)
+		VALUES ($1, $2, 0, 'job-1', 'scheduled', 'completed', 1, 1)`, id, triggerKey)
 	require.NoError(t, err)
 }
 
