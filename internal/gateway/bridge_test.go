@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/hrygo/hotplex/internal/agentconfig"
+	"github.com/hrygo/hotplex/internal/config"
 	"github.com/hrygo/hotplex/internal/session"
 	"github.com/hrygo/hotplex/internal/worker"
 	"github.com/hrygo/hotplex/pkg/events"
@@ -805,6 +806,52 @@ func TestBuildWorkerInfo_MCPInjection(t *testing.T) {
 			assert.Equal(t, tt.wantStrict, info.StrictMCPConfig, "StrictMCPConfig mismatch")
 		})
 	}
+}
+
+// The strict environment is only strict if the profile actually reaches the
+// Worker. BuildEnv's own tests supply a SessionInfo that already carries one,
+// which means they prove the arithmetic but not the delivery: deleting the
+// assignment in buildWorkerInfo would leave every launch silently on compat
+// and the suite green.
+func TestBuildWorkerInfo_CarriesTheLiveEnvProfileToTheWorker(t *testing.T) {
+	t.Parallel()
+
+	live := &config.Config{}
+	live.Worker.EnvProfile = "strict"
+	live.Worker.EnvAllowKeys = []string{"MY_TOKEN"}
+
+	newBridge := func() *Bridge {
+		b := NewBridge(BridgeDeps{
+			Log: slog.Default(),
+			Hub: newTestHub(t),
+			SM:  new(mockBridgeSM),
+		})
+		b.SetConfigProvider(func() *config.Config { return live })
+		return b
+	}
+
+	info := newBridge().buildWorkerInfo("session-1", "user-1", "/tmp", &session.SessionInfo{})
+	require.Equal(t, "strict", info.EnvProfile,
+		"a strict profile must reach the Worker, or strict env is only arithmetic")
+	require.Equal(t, []string{"MY_TOKEN"}, info.EnvAllowKeys,
+		"explicitly allowed keys must travel with the profile")
+
+	// Read per launch, not frozen when the Bridge was built: a hot-reload has
+	// to take effect at the next start.
+	live.Worker.EnvProfile = "compat"
+	info = newBridge().buildWorkerInfo("session-1", "user-1", "/tmp", &session.SessionInfo{})
+	require.Equal(t, "compat", info.EnvProfile)
+
+	// No live config means no profile at all, which the Worker normalises to
+	// compat. Asserting it here keeps "we could not read the config" from being
+	// mistaken for "the operator asked for strict".
+	bare := NewBridge(BridgeDeps{
+		Log: slog.Default(),
+		Hub: newTestHub(t),
+		SM:  new(mockBridgeSM),
+	})
+	info = bare.buildWorkerInfo("session-1", "user-1", "/tmp", &session.SessionInfo{})
+	require.Empty(t, info.EnvProfile)
 }
 
 func TestHandleInternalReset(t *testing.T) {
