@@ -438,8 +438,13 @@ jobs:
             }
           } finally {
             if (-not $proc.HasExited) {
-              # Graceful shutdown: SIGTERM-equivalent, not a kill.
-              $proc.CloseMainWindow() | Out-Null
+              # CloseMainWindow only posts WM_CLOSE, which a Go console process
+              # does not act on. The v1.51.0 smoke proved it: the gateway sat
+              # through the 30s timeout and was killed, so this asserted
+              # nothing about its shutdown sequence. Ask the binary to stop
+              # itself instead — the path an operator uses, and the one that
+              # runs the ordered teardown.
+              & $env:BINARY gateway stop | Out-Null
               $null = $proc.WaitForExit(30000)
               if (-not $proc.HasExited) { $proc.Kill() }
             }
