@@ -317,24 +317,31 @@ jobs:
 
       - name: Extract
         id: extract
+        # Windows is the only target packaged as a .zip. Every unix target
+        # ships a flat tar.gz and is handled by the unix step below; running
+        # both made this step fail on unix (it looked for a top-level directory
+        # to move, which a flat archive does not have) and left two gateway
+        # smoke runs competing for the same port.
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Set-Location dist
+          New-Item -ItemType Directory -Force -Path extracted | Out-Null
           $archive = Get-ChildItem -Filter 'hotplex-*.zip' | Select-Object -First 1
           if ($archive) {
             Expand-Archive -Path $archive.FullName -DestinationPath extracted
           } else {
             $tar = Get-ChildItem -Filter 'hotplex-*.tar.gz' | Select-Object -First 1
             if (-not $tar) { throw 'no release archive found' }
-            tar -xzf $tar.FullName
-            New-Item -ItemType Directory -Path extracted | Out-Null
-            Get-ChildItem -Directory | Where-Object { $_.Name -ne 'extracted' } |
-              Move-Item -Destination extracted
+            # The binary and its provenance sit at the archive root, so there
+            # is no directory to strip — extract straight into `extracted`.
+            tar -xzf $tar.FullName -C extracted
           }
           $binary = Get-ChildItem -Path extracted -Filter 'hotplex*.exe' -Recurse | Select-Object -First 1
           if (-not $binary) {
-            $binary = Get-ChildItem -Path extracted -Filter 'hotplex*' -File -Recurse | Select-Object -First 1
+            $binary = Get-ChildItem -Path extracted -Filter 'hotplex*' -File -Recurse |
+              Where-Object { $_.Name -notlike '*.provenance' } | Select-Object -First 1
           }
           if (-not $binary) { throw 'no hotplex binary in archive' }
           "BINARY=$($binary.FullName)" >> $env:GITHUB_OUTPUT
@@ -360,6 +367,7 @@ jobs:
           echo "BINARY=$BINARY" >> "$GITHUB_OUTPUT"
 
       - name: Binary starts, migrates a fresh database, serves health, shuts down cleanly
+        if: runner.os == 'Windows'
         shell: pwsh
         env:
           BINARY: ${{ steps.extract.outputs.BINARY }}
