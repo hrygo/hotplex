@@ -259,3 +259,37 @@ func TestMigrations_PG_038ExecutionQueuePayloads_ContentFollowsControlFacts(t *t
 		`SELECT COUNT(*) FROM execution_queue_payloads`).Scan(&n))
 	require.Zero(t, n, "content must not outlive the promise to dispatch it")
 }
+
+// TestMigrations_PG_039EffectReconciledTerminal is the PostgreSQL counterpart
+// of TestMigrations_039EffectReconciledTerminal (#947): the widened CHECK
+// must admit the reconciled/fenced states on PG as well.
+func TestMigrations_PG_039EffectReconciledTerminal(t *testing.T) {
+	ctx := context.Background()
+	db := openTestPGDB(t)
+	defer func() { _ = db.Close() }()
+
+	const ts = 1700000000000
+	_, err := db.ExecContext(ctx, `INSERT INTO sessions
+		(id, user_id, worker_type, state, created_at, updated_at)
+		VALUES ('s-eff39', 'u1', 'claude_code', 'idle', NOW(), NOW())`)
+	require.NoError(t, err, "seed session")
+
+	_, err = db.ExecContext(ctx, `INSERT INTO effects
+		(effect_id, occurrence_id, delivery_ordinal, target_revision, attempt,
+		 session_id, execution_id, worker_run_id, payload_id, payload_sha256,
+		 target_kind, target_ref, status, error_code, reason,
+		 owner_instance_id, lease_version, provider_ref, evidence_ref,
+		 created_at, updated_at)
+		VALUES ('eff-pg39', 'occ-pg39', 0, 'rev-a', 0,
+		 's-eff39', 'exec-pg39', 'run-pg39', 'pay-pg39', 'sha',
+		 'slack', 'C1', 'unknown', '', '',
+		 '', 0, '', '', $1, $1)`, ts)
+	require.NoError(t, err, "seed effect")
+
+	for _, status := range []string{"reconciled_succeeded", "reconciled_failed", "fenced"} {
+		_, err := db.ExecContext(ctx, `UPDATE effects SET status = $1 WHERE effect_id = 'eff-pg39'`, status)
+		require.NoError(t, err, "PG 039 must admit status %s", status)
+	}
+	_, err = db.ExecContext(ctx, `UPDATE effects SET status = 'bogus' WHERE effect_id = 'eff-pg39'`)
+	require.Error(t, err, "PG CHECK must still reject unknown states")
+}

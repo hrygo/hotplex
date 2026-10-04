@@ -41,7 +41,7 @@ CREATE TABLE effects (
     payload_sha256    TEXT NOT NULL DEFAULT '',
     target_kind       TEXT NOT NULL,
     target_ref        TEXT NOT NULL DEFAULT '',
-    status            TEXT NOT NULL CHECK(status IN ('planned','started','delivered','failed','unknown')),
+    status            TEXT NOT NULL CHECK(status IN ('planned','started','delivered','failed','unknown','reconciled_succeeded','reconciled_failed','fenced')),
     next_attempt_at   INTEGER,
     error_code        TEXT NOT NULL DEFAULT '',
     reason            TEXT NOT NULL DEFAULT '',
