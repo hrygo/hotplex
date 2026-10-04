@@ -442,6 +442,28 @@ class InputAckData:
 
 
 @dataclass
+class RuntimeEffectData:
+    """runtime.effect.* event payload (S->C additive). Secret-free."""
+
+    execution_id: str
+    effect_id: str
+    status: str
+    error_code: str | None = None
+    evidence_ref: str | None = None
+    finished_at: int | None = None
+
+
+@dataclass
+class RuntimeOperatorActionData:
+    """runtime.operator.action payload (S->C additive). Secret-free."""
+
+    execution_id: str
+    effect_id: str
+    decision: str
+    status: str
+
+
+@dataclass
 class RuntimeExecutionData:
     """runtime.execution.* event payload (S->C additive)."""
 

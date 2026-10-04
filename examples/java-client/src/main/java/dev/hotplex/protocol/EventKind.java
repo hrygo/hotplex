@@ -39,6 +39,10 @@ public enum EventKind {
     RuntimeExecutionStarted("runtime.execution.started"),
     RuntimeExecutionCompleted("runtime.execution.completed"),
     RuntimeExecutionFailed("runtime.execution.failed"),
+    RuntimeEffectPlanned("runtime.effect.planned"),
+    RuntimeEffectReconciled("runtime.effect.reconciled"),
+    RuntimeEffectFenced("runtime.effect.fenced"),
+    RuntimeOperatorAction("runtime.operator.action"),
     Init("init");
 
     private final String value;

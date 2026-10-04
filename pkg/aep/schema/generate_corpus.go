@@ -205,6 +205,28 @@ func allFixtures() []corpusFixture {
 			ErrorCode:   events.ErrCodeWorkerCrash,
 			FinishedAt:  1710000001000,
 		}), false},
+		{"44-runtime_effect_planned.json", mkEnv(44, events.RuntimeEffectPlanned, events.RuntimeEffectData{
+			ExecutionID: "exec_1",
+			EffectID:    "eff_1",
+			Status:      "planned",
+		}), false},
+		{"45-runtime_effect_reconciled.json", mkEnv(45, events.RuntimeEffectReconciled, events.RuntimeEffectData{
+			ExecutionID: "exec_1",
+			EffectID:    "eff_1",
+			Status:      "reconciled_succeeded",
+			EvidenceRef: "lookup-1",
+		}), false},
+		{"46-runtime_effect_fenced.json", mkEnv(46, events.RuntimeEffectFenced, events.RuntimeEffectData{
+			ExecutionID: "exec_1",
+			EffectID:    "eff_1",
+			Status:      "fenced",
+		}), false},
+		{"47-runtime_operator_action.json", mkEnv(47, events.RuntimeOperatorAction, events.RuntimeOperatorActionData{
+			ExecutionID: "exec_1",
+			EffectID:    "eff_1",
+			Decision:    "abandon",
+			Status:      "failed",
+		}), false},
 
 		// --- Edge cases: forward compatibility ---
 		{"90-compatibility-unknown-kind.json", mkEnv(0, events.Kind("custom.future_event"), map[string]any{

@@ -385,6 +385,40 @@ ACP 专用：映射 `CurrentModeUpdate`，Agent 执行模式切换通知。
 **时序约束**：`started` 在 `input.ack(delivered)` 之后、`done` 之前发送。
 `completed`/`failed` 在 `done` 之后发送（终态通知，与 run 结果分离）。
 
+### runtime.effect.planned / runtime.effect.reconciled / runtime.effect.fenced / runtime.operator.action（外部交付）
+
+四个 additive S→C 事件，通过 `execution_id` 把输入接受关联到外部交付结果，
+通过 `effect_id` 关联 effect 账本行。不携带 content、密钥、metadata 值或原始
+错误，只带账本引用与脱敏证据指针。旧客户端不识别时静默忽略。
+
+```json
+// runtime.effect.planned
+{ "type": "runtime.effect.planned", "data": {
+    "execution_id": "exec_<uuid>", "effect_id": "eff_<uuid>", "status": "planned"
+} }
+
+// runtime.effect.reconciled
+{ "type": "runtime.effect.reconciled", "data": {
+    "execution_id": "exec_<uuid>", "effect_id": "eff_<uuid>",
+    "status": "reconciled_succeeded", "evidence_ref": "lookup-1"
+} }
+
+// runtime.effect.fenced
+{ "type": "runtime.effect.fenced", "data": {
+    "execution_id": "exec_<uuid>", "effect_id": "eff_<uuid>", "status": "fenced"
+} }
+
+// runtime.operator.action
+{ "type": "runtime.operator.action", "data": {
+    "execution_id": "exec_<uuid>", "effect_id": "eff_<uuid>",
+    "decision": "abandon", "status": "failed"
+} }
+```
+
+**时序约束**：`planned` 在 effect 落账后发送；`reconciled`/`fenced`/
+`operator.action` 在对应账本终态写入后发送。`reconciled_succeeded` 与
+`delivered` 的区别：前者是晚到证据收敛 unknown，后者是 attempt 当场回执。
+
 ### state（状态变更）
 
 ```json
