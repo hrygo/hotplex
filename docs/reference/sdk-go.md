@@ -134,6 +134,13 @@ c.State()      // 当前 SessionState
 
 `Events()` 返回 `<-chan Event`，支持多 listener。使用 `Unsubscribe(ch)` 停止接收并释放资源：
 
+`Events()` 每调用一次都会注册一个新的 listener，请只调用一次并持续排空；
+只注册不排空的通道会填满（容量 `SendChannelCap`），此后 SDK 为保证
+`done` / `error` / `state` 不丢而阻塞投递，接收泵随之停滞。
+`Unsubscribe` 只停止投递，不关闭该通道（关闭通道会与正在投递的事件竞争，
+导致向已关闭通道发送而 panic）；通道由 `Close()` 在接收泵停止后统一关闭，
+所以 `for range ch` 仍会随 `Close()` 结束。
+
 ```go
 ch := c.Events()
 defer c.Unsubscribe(ch)

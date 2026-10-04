@@ -58,9 +58,18 @@ type Client struct {
 	wg     sync.WaitGroup
 
 	sendCh    chan []byte
-	listeners []chan Event
+	listeners []*subscriber
 
 	logger *slog.Logger
+}
+
+// subscriber pairs an event channel with a done signal. deliver() sends
+// outside c.mu, so a subscriber that is removed concurrently would otherwise
+// race a channel close — a send on a closed channel panics the process, and
+// Unsubscribe is reachable from ordinary use (SendInputAsync defers it).
+type subscriber struct {
+	ch   chan Event
+	done chan struct{}
 }
 
 // Event is an inbound event delivered via the Events() channel.
@@ -358,23 +367,28 @@ func (c *Client) doConnect(ctx context.Context, sessionID string, isResume bool)
 
 // Events returns a receive-only channel of inbound events.
 // Each call to Events() returns a new channel that receives all subsequent events.
-// To stop receiving events and free resources, call Unsubscribe(ch).
+// To stop receiving events and free resources, call Unsubscribe(ch). Call it
+// once, not per event: a channel that is never drained stops the receive pump.
 func (c *Client) Events() <-chan Event {
 	ch := make(chan Event, SendChannelCap)
 	c.mu.Lock()
-	c.listeners = append(c.listeners, ch)
+	c.listeners = append(c.listeners, &subscriber{ch: ch, done: make(chan struct{})})
 	c.mu.Unlock()
 	return ch
 }
 
-// Unsubscribe stops delivering events to the given channel and closes it.
+// Unsubscribe stops delivering events to the given channel. The channel is not
+// closed: deliver() sends outside the client lock, so closing it here would
+// race an in-flight send and panic. Close() still closes every outstanding
+// channel once the receive pump has stopped, so a `for range` over a channel
+// still terminates on client shutdown.
 func (c *Client) Unsubscribe(ch <-chan Event) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for i, l := range c.listeners {
-		if l == ch {
+	for i, s := range c.listeners {
+		if (<-chan Event)(s.ch) == ch {
 			c.listeners = append(c.listeners[:i], c.listeners[i+1:]...)
-			close(l)
+			close(s.done)
 			return
 		}
 	}
@@ -544,8 +558,8 @@ func (c *Client) Close() error {
 	c.wg.Wait()
 
 	c.mu.Lock()
-	for _, ch := range c.listeners {
-		close(ch)
+	for _, s := range c.listeners {
+		close(s.ch)
 	}
 	c.listeners = nil
 	c.mu.Unlock()
@@ -634,7 +648,19 @@ func (c *Client) recvPump() {
 			Data:    env.Event.Data,
 		})
 
-		if aep.IsTerminalEvent(env.Event.Type) {
+		// `done` terminates a TURN, not the AEP session. A session that
+		// received a supplement/injected input runs a second turn and the
+		// gateway emits a second `done`; returning here made the client blind
+		// to every event after the first turn, so a multi-turn session looked
+		// hung to any caller waiting on the second turn's result. Proven live
+		// against a real Worker: frames seq 12 and 13 were on the wire and
+		// never surfaced. Only a closed connection ends this pump.
+		//
+		// `error` still ends it. That is unverified end-to-end — a retryable
+		// turn error also leaves the session alive (autoRetry), so it likely
+		// belongs here too, but no live run has shown it yet and changing it
+		// blind would trade one unproven behaviour for another.
+		if env.Event.Type == events.Error {
 			return
 		}
 	}
@@ -682,23 +708,31 @@ func (c *Client) pingPump() {
 
 func (c *Client) deliver(evt Event) {
 	c.mu.Lock()
-	listeners := make([]chan Event, len(c.listeners))
-	copy(listeners, c.listeners)
+	subscribers := make([]*subscriber, len(c.listeners))
+	copy(subscribers, c.listeners)
 	c.mu.Unlock()
 
-	for _, ch := range listeners {
+	for _, s := range subscribers {
+		// Skip anyone who unsubscribed while this event was in flight.
+		select {
+		case <-s.done:
+			continue
+		default:
+		}
 		// Critical events (done/error/state) must never be dropped — block until
 		// delivered or the client is shutting down.
 		if evt.Type == EventDone || evt.Type == EventError || evt.Type == EventState {
 			select {
-			case ch <- evt:
+			case s.ch <- evt:
+			case <-s.done:
 			case <-c.ctx.Done():
 			}
 			continue
 		}
 		// Non-critical events (delta, raw, etc.) are silently dropped under backpressure.
 		select {
-		case ch <- evt:
+		case s.ch <- evt:
+		case <-s.done:
 		default:
 			// log skip if needed
 		}
