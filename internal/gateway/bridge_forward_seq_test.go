@@ -137,6 +137,12 @@ func TestProcessForwardedEvent_NoCollectorPreservesWorkerSeq(t *testing.T) {
 // TestProcessForwardedEvent_DoneArrivesAfterTheRuntimeFactItOvertakes pins the
 // client-visible seq invariant for the one worker event whose own handling
 // emits another client-visible event before the Done itself is enqueued.
+//
+// The order asserted below is the order the gateway emits today, NOT the order
+// docs/reference/aep-protocol.md:385-386 specifies (completed after done). This
+// test pins the invariant that clients depend on — seq increases with arrival —
+// and leaves the ordering deviation to
+// docs/issues/2026-10-04-live-run/D01.
 func TestProcessForwardedEvent_DoneArrivesAfterTheRuntimeFactItOvertakes(t *testing.T) {
 	t.Parallel()
 

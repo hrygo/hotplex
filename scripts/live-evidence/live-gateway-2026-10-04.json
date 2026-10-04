@@ -1,0 +1,57 @@
+{
+  "recorded_at": "2026-10-04",
+  "branch": "codex/trusted-runtime-delivery",
+  "commits_under_test": ["1698d2c2", "60b7be7a"],
+  "environment": {
+    "gateway": "bin/hotplex-darwin-arm64, built from the branch",
+    "database": "PostgreSQL (dev stack, configs/config-dev.local.yaml)",
+    "worker": "claude_code (real Claude Code CLI, paid)",
+    "channel": "webchat over WebSocket",
+    "origin_header": "absent for SDK clients; security.allowed_origins=* for this run (see D05)",
+    "notes": "no credentials are recorded in this file"
+  },
+  "scenarios": [
+    {
+      "id": "single-turn-durable",
+      "status": "pass",
+      "detail": "One durable primary input. input.ack accepted(seq 4) -> delivered(seq 5), message.delta, runtime.execution.completed(seq 7), done(seq 8). SDK reported dones=1. Cost USD 0.0456."
+    },
+    {
+      "id": "done-seq-inversion",
+      "status": "found-defect-fixed",
+      "issue": "docs/issues/2026-10-04-live-run/D01",
+      "before": "done carried seq 7 but arrived after runtime.execution.completed seq 8; the monotonic-seq SDK dropped it and the driver timed out with dones=0",
+      "after": "runtime.execution.completed seq 7, done seq 8, in arrival order; SDK dones=1",
+      "reproduced_on_origin_main": true,
+      "regression": "internal/gateway.TestProcessForwardedEvent_DoneArrivesAfterTheRuntimeFactItOvertakes (red before the fix: \"1\" is not greater than \"2\")"
+    },
+    {
+      "id": "supplement-injected-second-turn",
+      "status": "pass-with-caveat",
+      "detail": "A second input sent mid-turn is accepted as input_mode=injected, durability=volatile, with parent_execution_id set, and is replayed into a genuine second turn: delta + done for turn 1, then delta + done for turn 2.",
+      "caveat": "The Go SDK initially surfaced only turn 1 (issue D02). With that fixed, both turns are observable. The gateway-side ordering deviation in D01 remains."
+    },
+    {
+      "id": "go-sdk-multi-turn-blindness",
+      "status": "found-defect-fixed",
+      "issue": "docs/issues/2026-10-04-live-run/D02",
+      "evidence": "A recording proxy observed seq 12 (message.delta) and seq 13 (done) on the wire at 09:44:06 while the SDK's last surfaced event was done seq 11 at 09:44:06.320.",
+      "regression": "client.TestClientSurfacesEventsAfterTheFirstDone (red before the fix: collected [])"
+    },
+    {
+      "id": "admin-console-on-live-data",
+      "status": "pass",
+      "detail": "GET /admin/executions returned delivery_status, runtime_status, worker_run_id, fence_version and a keyset next_cursor for real executions. GET /admin/sessions/pool and DELETE /admin/sessions/{id} behaved as documented."
+    }
+  ],
+  "not_verified": [
+    "Cron -> occurrence -> execution end to end: no cron jobs are configured in this environment (GET /admin/cron/jobs returned []).",
+    "Provider delivery receipts: only the Slack adapter implements receipts (internal/messaging/slack/receipt.go); the configured Feishu bot is legacy-only, so no real external delivery could be observed.",
+    "Release: blocked until a human approves PR #1021; gh is authenticated as the PR author, so self-approval is impossible."
+  ],
+  "open_defects": [
+    "docs/issues/2026-10-04-live-run/D01",
+    "docs/issues/2026-10-04-live-run/D04",
+    "docs/issues/2026-10-04-live-run/D05"
+  ]
+}
