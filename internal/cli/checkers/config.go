@@ -28,6 +28,10 @@ func SetConfigPath(path string) {
 // concurrent reads race-free even when multiple parallel tests exercise
 // checkers at once. Writers must still stay serial: a mid-check swap would
 // only produce a logically inconsistent diagnostic, which no lock can fix.
+// hotplexHome is the single indirection point for config.HotplexHome in
+// checker registrations (#978). Tests override it via ... (see provider note).
+func hotplexHome() string { return config.HotplexHome() }
+
 func getConfigPath() string {
 	v := configPath.Load()
 	if s, ok := v.(string); ok {

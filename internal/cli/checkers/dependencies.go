@@ -160,5 +160,5 @@ func (c sqlitePathChecker) Check(ctx context.Context) cli.Diagnostic {
 
 func init() {
 	cli.DefaultRegistry.Register(workerBinaryChecker{})
-	cli.DefaultRegistry.Register(sqlitePathChecker{dbPath: filepath.Join(config.HotplexHome(), "data", "hotplex.db")})
+	cli.DefaultRegistry.Register(sqlitePathChecker{dbPath: filepath.Join(hotplexHome(), "data", "hotplex.db")})
 }

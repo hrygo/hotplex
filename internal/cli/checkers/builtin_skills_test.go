@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/hrygo/hotplex/internal/cli"
+	"github.com/hrygo/hotplex/internal/config"
+	"github.com/hrygo/hotplex/internal/skills/builtin"
 	"github.com/hrygo/hotplex/internal/skills/reconcile"
 )
 
@@ -92,4 +94,47 @@ func TestBuiltinSkillsCheckerIsRegisteredUnderSkills(t *testing.T) {
 		require.Equal(t, "skills", checker.Category())
 	}
 	require.True(t, found, "skills.builtin must be registered")
+}
+
+// #978: 真实构造逻辑经 provider 注入 TempDir 可单测，不再只能 mock statusFn。
+func TestSkillsStatusProviderBuildsRealPipeline(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	hotplexHome := t.TempDir()
+	var gotPaths reconcile.Paths
+	provider := &skillsStatusProvider{
+		loadConfig:  func() (*config.Config, error) { return &config.Config{}, nil },
+		userHome:    home,
+		hotplexHome: hotplexHome,
+		newRegistry: func() (*builtin.Registry, error) { return &builtin.Registry{}, nil },
+		newRunner: func(registry *builtin.Registry, paths reconcile.Paths) (skillsStatusRunner, error) {
+			gotPaths = paths
+			return stubSkillsRunner{}, nil
+		},
+	}
+	report, err := provider.Status(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, report.Items)
+	require.Equal(t, builtinSkillsPaths(home, hotplexHome), gotPaths)
+}
+
+// #978: 无 worker 目标时沿用 ErrNoWorkerTargets，不触碰文件系统。
+func TestSkillsStatusProviderRejectsEmptyWorkers(t *testing.T) {
+	t.Parallel()
+	provider := &skillsStatusProvider{
+		loadConfig:  func() (*config.Config, error) { return &config.Config{}, nil },
+		userHome:    t.TempDir(),
+		hotplexHome: t.TempDir(),
+		newRegistry: func() (*builtin.Registry, error) {
+			return &builtin.Registry{}, nil
+		},
+	}
+	_, err := provider.Status(context.Background())
+	require.ErrorIs(t, err, reconcile.ErrNoWorkerTargets)
+}
+
+type stubSkillsRunner struct{}
+
+func (stubSkillsRunner) Status(context.Context, reconcile.Options) (reconcile.Report, error) {
+	return reconcile.Report{}, nil
 }
