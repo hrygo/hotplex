@@ -22,6 +22,7 @@ v1.51.0 是一次 minor 版本更新，核心主题是 **可信运行与交付**
 - **Go SDK 订阅竞争**：`Unsubscribe` 在锁内关闭事件通道，而投递在锁外发送，交错即向已关闭通道发送（进程 panic）。监听者改为携带 done 信号，取消订阅只停止投递。
 - **运行期审计十项**：Codex 订阅通道多方关闭与发送竞态、Codex reference 生命周期释放、Codex 传输代际冻结、Codex 进程回收、OpenCode reset 404、飞书关闭期限、Codex pending 在断连时的结算、Codex 中断 RPC、Codex 生命周期响应校验、交互超时代际隔离。
 - **消息与事件身份**（#997/#998/#999）：delta 合并保留消息身份与 metadata；终态写回执只完成一次；克隆 envelope 时隔离可变类型载荷。
+- **`gateway stop` 如实报告结果**：停止信号发出后不再直接清除 PID 状态并宣告成功，而是等待进程真正退出，超时则升级强杀，仍未退出则返回错误。此前在 Windows 上 `Terminate` 是发给目标可能并不所属的进程组的 `CTRL_BREAK_EVENT`，调用无论是否送达都返回，于是网关仍在运行而 CLI 打印「gateway stopped」——由本次发布的 Windows smoke 实测发现。
 
 ### Changed
 

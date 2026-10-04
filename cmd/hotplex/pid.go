@@ -128,6 +128,13 @@ func gatewayStoppedMessage(inst *gatewayInstance) string {
 }
 
 func stopGateway(inst *gatewayInstance) error {
+	return stopGatewayWithin(inst, proc.DefaultGracePeriod)
+}
+
+// stopGatewayWithin stops a pid-managed gateway and waits up to grace for it to
+// actually leave before escalating. The grace period is a parameter so tests
+// can exercise the escalation path without waiting the production window.
+func stopGatewayWithin(inst *gatewayInstance, grace time.Duration) error {
 	switch inst.Source {
 	case sourcePID:
 		// Use Terminate (direct PID signal) instead of GracefulTerminate (process
@@ -135,6 +142,22 @@ func stopGateway(inst *gatewayInstance) error {
 		// in foreground mode (PGID inherited from parent shell).
 		if err := proc.Terminate(inst.PID); err != nil {
 			return fmt.Errorf("stop PID %d: %w", inst.PID, err)
+		}
+		// Signalling is not proof that the process stopped. On Windows Terminate
+		// is a best-effort CTRL_BREAK_EVENT aimed at a process group the target
+		// may not belong to, and GenerateConsoleCtrlEvent returns whether or not
+		// the signal was delivered — so a gateway that kept running was reported
+		// as stopped. Wait for the process to actually leave, then escalate, and
+		// only clear the recorded state once it is gone.
+		waitForProcessExit(inst.PID, grace)
+		if proc.IsProcessAlive(inst.PID) == nil {
+			if err := proc.ForceKillProcess(inst.PID); err != nil {
+				return fmt.Errorf("gateway PID %d did not stop and could not be killed: %w", inst.PID, err)
+			}
+			waitForProcessExit(inst.PID, grace)
+			if proc.IsProcessAlive(inst.PID) == nil {
+				return fmt.Errorf("gateway PID %d is still running after a forced stop", inst.PID)
+			}
 		}
 		removeGatewayState()
 	case sourceService:
