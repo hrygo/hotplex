@@ -116,11 +116,35 @@ func reasonForError(err error) string {
 	}
 }
 
-// defaultBuiltinSkillsStatus is deliberately read-only. It is used by the
-// self-registered doctor checker; synchronization remains available only via
+// skillsStatusProvider builds the reconcile status for the builtin-skills
+// checker from explicitly injected environment roots (#978). Production
+// resolves userHome/hotplexHome from the process; tests inject t.TempDir()
+// trees to exercise the real construction path instead of mocking statusFn.
+type skillsStatusProvider struct {
+	// loadConfig resolves the active config; nil falls back to loadConfig.
+	loadConfig func() (*config.Config, error)
+	// userHome and hotplexHome override os.UserHomeDir/config.HotplexHome.
+	userHome    string
+	hotplexHome string
+	// newRegistry and newRunner construct the reconcile pipeline; nil keeps
+	// the production builtin.NewRegistry/reconcile.New behaviour.
+	newRegistry func() (*builtin.Registry, error)
+	newRunner   func(registry *builtin.Registry, paths reconcile.Paths) (skillsStatusRunner, error)
+}
+
+// skillsStatusRunner is the subset of reconcile behaviour the checker needs.
+type skillsStatusRunner interface {
+	Status(ctx context.Context, opts reconcile.Options) (reconcile.Report, error)
+}
+
+// Status is deliberately read-only. Synchronization remains available only via
 // explicit skills sync/lifecycle flags.
-func defaultBuiltinSkillsStatus(ctx context.Context) (reconcile.Report, error) {
-	cfg, err := loadConfig()
+func (p *skillsStatusProvider) Status(ctx context.Context) (reconcile.Report, error) {
+	load := p.loadConfig
+	if load == nil {
+		load = loadConfig
+	}
+	cfg, err := load()
 	if err != nil {
 		return reconcile.Report{}, err
 	}
@@ -131,31 +155,38 @@ func defaultBuiltinSkillsStatus(ctx context.Context) (reconcile.Report, error) {
 	if err != nil {
 		return reconcile.Report{}, err
 	}
-	if len(workerTypes) == 0 {
-		return reconcile.Report{}, reconcile.ErrNoWorkerTargets
+	userHome := p.userHome
+	if userHome == "" {
+		userHome, err = os.UserHomeDir()
+		if err != nil {
+			return reconcile.Report{}, err
+		}
 	}
-	userHome, err := os.UserHomeDir()
+	hotplexHome := p.hotplexHome
+	if hotplexHome == "" {
+		hotplexHome = config.HotplexHome()
+	}
+	newRegistry := p.newRegistry
+	if newRegistry == nil {
+		newRegistry = builtin.NewRegistry
+	}
+	registry, err := newRegistry()
 	if err != nil {
 		return reconcile.Report{}, err
 	}
-	hotplexHome := config.HotplexHome()
-	registry, err := builtin.NewRegistry()
-	if err != nil {
-		return reconcile.Report{}, err
+	paths := builtinSkillsPaths(userHome, hotplexHome)
+	var runner skillsStatusRunner
+	if p.newRunner != nil {
+		runner, err = p.newRunner(registry, paths)
+	} else {
+		runner, err = reconcile.New(registry, paths, reconcile.NewOSFileSystem())
 	}
-	runner, err := reconcile.New(registry, builtinSkillsPaths(userHome, hotplexHome), reconcile.NewOSFileSystem())
 	if err != nil {
 		return reconcile.Report{}, err
 	}
 	return runner.Status(ctx, reconcile.Options{Profile: builtin.ProfileRuntime, WorkerTypes: workerTypes})
 }
 
-// builtinSkillsPaths keeps the doctor checker on the same root contract as
-// skills status/sync and onboard: the .agents root is canonical and Claude
-// receives per-package links under .claude. A hand-rolled Paths literal here
-// once set Claude's native root to .claude/skills, which normalizePaths
-// rejects, so doctor kept failing with ErrRootOutsideHome even after a clean
-// sync.
 func builtinSkillsPaths(userHome, hotplexHome string) reconcile.Paths {
 	return reconcile.DefaultPaths(userHome, hotplexHome)
 }
@@ -173,5 +204,5 @@ func parseConfiguredWorkerTypes(values []string) ([]reconcile.WorkerType, error)
 }
 
 func init() {
-	cli.DefaultRegistry.Register(builtinSkillsChecker{statusFn: defaultBuiltinSkillsStatus})
+	cli.DefaultRegistry.Register(builtinSkillsChecker{statusFn: (&skillsStatusProvider{}).Status})
 }

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/hrygo/hotplex/internal/cli"
-	"github.com/hrygo/hotplex/internal/config"
 	"github.com/hrygo/hotplex/internal/dbutil"
 	"github.com/hrygo/hotplex/internal/sqlutil"
 )
@@ -153,6 +152,6 @@ func countFencedExecutions(ctx context.Context, dbPath string) (int64, int64, er
 
 func init() {
 	cli.DefaultRegistry.Register(fencedExecutionsChecker{
-		defaultDBPath: filepath.Join(config.HotplexHome(), "data", "hotplex.db"),
+		defaultDBPath: filepath.Join(hotplexHome(), "data", "hotplex.db"),
 	})
 }
