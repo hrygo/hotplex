@@ -657,6 +657,18 @@ func effectItem(eff *effect.Effect, rec *execution.Record, observedAt int64) Tim
 		item.Evidence = eff.ProviderRef
 	case effect.StatusUnknown:
 		item.Evidence = string(effect.StatusUnknown)
+	case effect.StatusReconciledSucceeded, effect.StatusReconciledFailed:
+		// #868: reconciled is late evidence converging an unknown effect,
+		// not an on-attempt receipt. The evidence ref names what proved it.
+		item.Evidence = eff.EvidenceRef
+		if item.Evidence == "" {
+			item.Evidence = string(eff.Status)
+		}
+	case effect.StatusFenced:
+		// A quarantined effect never dispatches again; the error code names
+		// the fence, not a provider outcome.
+		item.Phase = "fenced"
+		item.Evidence = eff.ErrorCode
 	default:
 		item.Evidence = eff.ErrorCode
 	}
