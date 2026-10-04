@@ -549,6 +549,18 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Check out the released source
+        # The publish job verifies the artifacts with a script from the tree
+        # being released. Without a checkout it failed with
+        # "can't open file scripts/ci/verify_release_artifacts.py" — after the
+        # artifacts were already built, signed and attested. Sparse because
+        # that script is the only repo content this job reads.
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
       - name: Download all binaries
         uses: actions/download-artifact@v7
         with:
