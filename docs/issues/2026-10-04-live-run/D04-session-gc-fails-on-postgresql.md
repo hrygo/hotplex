@@ -9,7 +9,7 @@ description: "delete_terminated 清理任务入队持续报 driver: bad connecti
 - 优先级：P2
 - 基准：`1698d2c2`
 - 证据：Live（真实 PostgreSQL dev 库）
-- 状态：未修
+- 状态：已修（`1a3672c8`，待验证）
 - 位置：`internal/session/manager.go:1757`（gc）、远端清理 outbox 入队路径
 
 ## 实测
@@ -39,6 +39,20 @@ ERROR session: gc (delete_terminated) failed
 - `bad connection` 来自连接池中的失效连接，还是 `pgx` 在事务外使用的连接；
 - 与 SQLite 路径的差异（SQLite 下不复现）；
 - 入队失败是否应使本地删除失败，或至少在响应与指标中可见。
+
+## 根因（2026-10-04 实测确认）
+
+`DELETE ... RETURNING` 的结果集被扫描后未关闭，同一事务上的
+`session_cleanup_tasks` INSERT 随即执行。pgx（database/sql）每个
+`*sql.Tx` 复用一个服务端连接，未关闭的结果集会占用它，后续语句以
+`driver: bad connection` 失败而非等待。modernc/sqlite 在客户端缓冲
+行数据，所以相同代码在 SQLite 下正常。最小探针（同一 tx 上“开着
+rows 做 INSERT”）精确复现：关闭 rows 则成功，开着则失败。
+
+修复：扫描完成后先关闭结果集再执行 INSERT；删除 + 入队仍在同一事务
+提交。`ClaimCleanupTasks` 先收集行再更新、无需改动。回归测试
+`TestPGStore_DeleteTerminatedEnqueuesCleanupTask`（`pg` tag，需
+`HOTPLEX_TEST_PG_DSN`）走真实 PG 路径，变异验证通过。
 
 ## 验收条件
 

@@ -9,7 +9,7 @@ description: "网关要求 Origin 匹配，gorilla 客户端不发送 Origin，�
 - 优先级：P2
 - 基准：`1698d2c2`
 - 证据：Live
-- 状态：未修
+- 状态：已修（`f896c630`，待验证）
 - 位置：`internal/gateway/hub.go:219`（`CheckOrigin`）、`client/client.go`（dial）
 
 ## 实测
@@ -31,6 +31,24 @@ Go SDK 连接 `ws://127.0.0.1:8888/ws` 返回 403。gorilla 的 dialer 不发送
 - 客户端：是否应默认发送 `Origin`。
 
 两种取向的安全含义不同，应先定契约再改，不宜在实测中顺手放宽。
+
+## 契约决策与修复（2026-10-04，`f896c630`）
+
+修服务端，不放宽 CORS：浏览器升级必带 Origin，非浏览器客户端（Go SDK、
+CLI）不带。`Origin` 的作用是让服务端区分浏览器来源，而非认证原生客户端
+（它们走 AEP / 应用层鉴权）。单一规则收敛在
+`security.CheckWebSocketOrigin`，网关 upgrader 直接调用：
+
+- `*` 允许一切（含缺失 Origin）；
+- 精确匹配允许浏览器升级；
+- 缺失 Origin 在固定名单下允许；
+- 出现但不在名单的 Origin 仍拒绝；空名单拒绝一切。
+
+CORS（浏览器）侧不变：`ResolveOrigin` 对固定名单仍拒绝空 Origin。
+`docs/reference/sdk-go.md` 新增「连接与 Origin 校验」一节。
+
+实测（真实网关，白名单固定为 `https://app.example.com`）：无 Origin 连接
+成功（此前 403）、匹配 Origin 连接成功、`https://evil.com` 仍 403。
 
 ## 验收条件
 
