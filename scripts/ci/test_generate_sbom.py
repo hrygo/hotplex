@@ -98,6 +98,30 @@ class GenerateSbomTest(unittest.TestCase):
         names = [c["name"] for c in document["components"]]
         self.assertIn("oh-my-opencode", names)
 
+    def test_bundle_payloads_are_found_under_a_top_level_directory(self):
+        # pack-offline-bundle.sh tars from the bundle's parent directory, so
+        # every payload sits inside one top-level directory. Scanning only
+        # the top level finds nothing at all here, which is how the first
+        # version of this script passed locally and failed in CI.
+        bundle = self.dir / "hotplex-offline-bundle-linux-x64.tar.gz"
+        make_tarball(
+            bundle,
+            {
+                "hotplex-offline-bundle-linux-x64/opencode.tar.gz": b"\x1f\x8b",
+                "hotplex-offline-bundle-linux-x64/oh-my-opencode-5.1.13.tgz": b"\x1f\x8b",
+                "hotplex-offline-bundle-linux-x64/install.sh": b"#!/bin/sh\n",
+            },
+        )
+        document = self.generate(
+            bundle,
+            {
+                "oh-my-opencode-5.1.13.tgz": [
+                    component("oh-my-opencode", "pkg:npm/oh-my-opencode@5.1.13")
+                ]
+            },
+        )
+        self.assertEqual(["oh-my-opencode"], [c["name"] for c in document["components"]])
+
     def test_document_names_the_artifact_it_describes(self):
         bundle = self.dir / "hotplex-offline-bundle-linux-x64.tar.gz"
         make_tarball(bundle, {"opencode.tar.gz": b"\x1f\x8b"})

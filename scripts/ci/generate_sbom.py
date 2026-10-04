@@ -120,9 +120,20 @@ def main() -> int:
             print(f"::error::cannot read {archive.name}: {exc}")
             return 1
 
-        members = sorted(p for p in extracted.iterdir() if p.is_file())
-        # "._name" AppleDouble entries are filesystem metadata, not payload.
-        members = [p for p in members if not p.name.startswith("._")]
+        # The two archive shapes do not agree on layout. A binary archive
+        # puts the executable at the root, but pack-offline-bundle.sh tars
+        # from the bundle's parent directory, so every payload sits inside one
+        # top-level directory. Walking only the top level finds the binaries
+        # and nothing at all in a bundle.
+        members = sorted(
+            path
+            for path in extracted.rglob("*")
+            if path.is_file()
+            # "._name" AppleDouble entries and __MACOSX are filesystem
+            # metadata, not payload.
+            and not path.name.startswith("._")
+            and "__MACOSX" not in path.parts
+        )
         if not members:
             print(f"::error::{archive.name} contains no files to describe")
             return 1
