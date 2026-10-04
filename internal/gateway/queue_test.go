@@ -288,3 +288,33 @@ func TestCancelQueuedInput_SettlesOneUndispatchedInput(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, cancelled, "an input that is already settled is not cancelled again")
 }
+
+// TestQueueSettle_EmitsTerminalRuntimeEvent proves #851: a queue settlement
+// reaches the client as a terminal runtime event correlated by execution_id,
+// so a queued input that never ran is observable, not silent.
+func TestQueueSettle_EmitsTerminalRuntimeEvent(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h, _, conn, _, db := newQueueHandler(t, "s-exec")
+
+	_, _, err := h.EnqueueBusyInput(ctx, queuedInputEnv("s-exec", "old", "old"), "old", nil)
+	require.NoError(t, err)
+	ageQueue(t, db, "s-exec", time.Now().Add(-time.Hour))
+	require.Equal(t, 1, h.SweepExpiredQueue(ctx))
+
+	var found *events.Envelope
+	require.Eventually(t, func() bool {
+		for _, env := range conn.envelopes() {
+			if env.Event.Type == events.RuntimeExecutionFailed {
+				found = env
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond, "expired queue settlement must emit a terminal runtime event")
+	data, ok := found.Event.Data.(events.RuntimeExecutionData)
+	require.True(t, ok, "settlement event carries RuntimeExecutionData, got %T", found.Event.Data)
+	require.NotEmpty(t, data.ExecutionID)
+	require.Equal(t, string(execution.RuntimeFailed), data.Status)
+}

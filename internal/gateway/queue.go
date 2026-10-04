@@ -317,6 +317,29 @@ func (h *Handler) settleUndispatchable(ctx context.Context, record *execution.Re
 	if err := h.finishInputExecution(ctx, record, execution.StatusFailed, events.ErrorCode(reason)); err != nil {
 		h.log.Warn("gateway: settle undispatchable queued input failed",
 			observability.KeyExecutionID, record.ExecutionID, "err", err)
+		return
+	}
+	// The input crossed the claim boundary but never ran. The durable write
+	// above is the truth; this event only exposes it so the client can
+	// correlate the queued input with its terminal outcome (#851).
+	h.emitQueueSettled(ctx, record, string(events.RuntimeExecutionFailed), events.ErrorCode(reason))
+}
+
+// emitQueueSettled exposes a queue settlement on the wire. Best-effort: a
+// delivery failure is logged, never retried — the ledger row already holds
+// the terminal state and a retry would risk a duplicate terminal event.
+func (h *Handler) emitQueueSettled(ctx context.Context, record *execution.Record, status string, code events.ErrorCode) {
+	if h.hub == nil || record == nil {
+		return
+	}
+	rtEnv := events.NewEnvelope(aep.NewID(), record.SessionID, 0, events.RuntimeExecutionFailed, events.RuntimeExecutionData{
+		ExecutionID: record.ExecutionID,
+		Status:      status,
+		ErrorCode:   code,
+	})
+	if err := h.hub.SendToSession(context.WithoutCancel(ctx), rtEnv); err != nil {
+		h.log.Warn("gateway: queue settled event delivery failed", "err", err,
+			"session_id", record.SessionID, observability.KeyExecutionID, record.ExecutionID)
 	}
 }
 
@@ -356,6 +379,11 @@ func (h *Handler) SweepExpiredQueue(ctx context.Context) int {
 	observability.ExecutionQueueSettled().Add(ctx, int64(len(expired)),
 		label("reason", "expired"))
 	observability.ExecutionQueueDepth().Add(ctx, int64(-len(expired)))
+	for _, rec := range expired {
+		if rec != nil {
+			h.emitQueueSettled(ctx, rec, string(execution.RuntimeFailed), events.ErrorCode(execution.QueueReasonExpired))
+		}
+	}
 	h.log.Info("gateway: expired queued inputs settled", "count", len(expired))
 	return len(expired)
 }
