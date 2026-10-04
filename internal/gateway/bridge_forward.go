@@ -429,7 +429,14 @@ func (b *Bridge) processForwardedEvent(env *events.Envelope, w worker.Worker, op
 		}
 	}()
 
-	if b.collector != nil {
+	// A Done is the one worker event whose own handling enqueues another
+	// client-visible event — the runtime execution fact — BEFORE the Done
+	// itself reaches the wire. Stamping it here would hand it a LOWER seq than
+	// the event that overtakes it, so a client enforcing monotonic seq drops
+	// the terminal Done and the turn never finishes. Its seq is therefore
+	// assigned at enqueue time instead, under this same held lease.
+	deferDoneSeq := b.collector != nil && env.Event.Type == events.Done
+	if b.collector != nil && !deferDoneSeq {
 		env.Seq = b.hub.NextSeqHeld(sessionID)
 	}
 
@@ -577,6 +584,12 @@ func (b *Bridge) processForwardedEvent(env *events.Envelope, w worker.Worker, op
 		// Error. The Done already owns the bridge fence, so sending it first
 		// would otherwise make flushPendingError discard the real error.
 		b.sendPendingError(fc)
+		// The failed Done is never sent to the client (the Error is the one
+		// user-visible terminal), but it is still persisted, so it needs its seq
+		// before capture — allocated here, after finishRuntimeOnDone had its turn.
+		if deferDoneSeq {
+			env.Seq = b.hub.NextSeqHeld(sessionID)
+		}
 		b.captureForwardedEvent(env, deltaContent, reasoningContent, fc)
 		b.finishRuntimeOnDone(sessionID, fc, env)
 		b.finishTurnTTFT(sessionID, terminalStatus)
@@ -586,6 +599,11 @@ func (b *Bridge) processForwardedEvent(env *events.Envelope, w worker.Worker, op
 		return
 	}
 
+	// Allocate a deferred Done seq immediately before enqueueing, so the seq a
+	// client observes always increases in the order frames reach it.
+	if deferDoneSeq {
+		env.Seq = b.hub.NextSeqHeld(sessionID)
+	}
 	if err := b.hub.SendToSession(context.Background(), env); err != nil {
 		b.flogOf(fc).Warn("bridge: forward event failed", "err", err, "session_id", sessionID, "worker_type", workerType, "event_type", env.Event.Type)
 	}
