@@ -183,6 +183,14 @@ for evt := range ch {
 
 **关闭顺序**：`cancel ctx` → `close ws` → `close sendCh` → `wg.Wait` → `close listeners`。
 
+### 连接与 Origin 校验
+
+Go SDK 基于 gorilla WebSocket 实现，握手默认不发送 `Origin` 头。网关把缺失
+`Origin` 视为非浏览器客户端（SDK、CLI 工具），在白名单固定为具体域名时也
+允许连接；浏览器升级必带 `Origin`，仍按 `security.allowed_origins` 校验，
+名单外来源一律拒绝。非浏览器客户端的身份与权限仍由 AEP / 应用层鉴权保证，
+`Origin` 只用于区分浏览器来源，不做客户端认证。
+
 ## 事件类型
 
 ### AEP v1 事件类型一览

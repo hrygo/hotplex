@@ -9,6 +9,12 @@ import "net/http"
 //   - If the request Origin exactly matches an entry, returns that Origin
 //     (echo-back mode for production with specific domains).
 //   - Otherwise returns "" (no CORS headers → browser blocks the request).
+//
+// WebSocket note: non-browser clients (Go SDK, CLI tools) send no Origin
+// header, and the gateway's CheckOrigin treats a missing Origin as
+// non-browser — see CheckWebSocketOrigin. ResolveOrigin is the CORS
+// (browser) half of the same policy and keeps rejecting an empty Origin
+// against a pinned list, so a browser that omits Origin is still refused.
 func ResolveOrigin(requestOrigin string, allowedOrigins []string) string {
 	for _, o := range allowedOrigins {
 		if o == "*" {
@@ -19,6 +25,30 @@ func ResolveOrigin(requestOrigin string, allowedOrigins []string) string {
 		}
 	}
 	return ""
+}
+
+// CheckWebSocketOrigin reports whether a WebSocket upgrade request may
+// proceed under the configured allowed origins. It is the single rule for
+// both the gateway upgrader and its tests:
+//
+//   - "*" allows everything, including a missing Origin;
+//   - an exact Origin match allows browser upgrades;
+//   - a MISSING Origin is allowed against a pinned list: browsers always
+//     send Origin on upgrades, so its absence marks a non-browser client
+//     (Go SDK, CLI tooling). Origin exists to let a server distinguish
+//     origins a browser would enforce, not to authenticate native clients —
+//     those authenticate at the AEP/application layer instead.
+//   - a PRESENT but non-matching Origin is refused.
+//
+// An empty allowed list refuses everything, including missing origins.
+func CheckWebSocketOrigin(requestOrigin string, allowedOrigins []string) bool {
+	if len(allowedOrigins) == 0 {
+		return false
+	}
+	if requestOrigin == "" {
+		return true
+	}
+	return ResolveOrigin(requestOrigin, allowedOrigins) != ""
 }
 
 // CORSMiddleware returns an HTTP middleware that injects CORS response headers

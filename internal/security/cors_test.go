@@ -82,6 +82,61 @@ func TestResolveOrigin(t *testing.T) {
 	}
 }
 
+func TestCheckWebSocketOrigin(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		requestOrigin string
+		allowed       []string
+		want          bool
+	}{
+		{
+			name:          "missing origin allowed against pinned list (D05: non-browser SDK)",
+			requestOrigin: "",
+			allowed:       []string{"http://127.0.0.1:8888", "http://localhost:8888"},
+			want:          true,
+		},
+		{
+			name:          "missing origin allowed under wildcard",
+			requestOrigin: "",
+			allowed:       []string{"*"},
+			want:          true,
+		},
+		{
+			name:          "matching origin allowed",
+			requestOrigin: "https://app.example.com",
+			allowed:       []string{"https://app.example.com"},
+			want:          true,
+		},
+		{
+			name:          "non-matching origin refused",
+			requestOrigin: "https://evil.com",
+			allowed:       []string{"https://app.example.com"},
+			want:          false,
+		},
+		{
+			name:          "empty allowed list refuses even a missing origin",
+			requestOrigin: "",
+			allowed:       nil,
+			want:          false,
+		},
+		{
+			name:          "empty allowed list refuses a present origin",
+			requestOrigin: "https://app.example.com",
+			allowed:       nil,
+			want:          false,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.want, CheckWebSocketOrigin(tt.requestOrigin, tt.allowed))
+		})
+	}
+}
+
 func TestCORSMiddleware(t *testing.T) {
 	t.Parallel()
 

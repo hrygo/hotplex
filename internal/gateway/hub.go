@@ -217,13 +217,13 @@ func NewHub(log *slog.Logger, cfgStore *config.ConfigStore) *Hub {
 		ReadBufferSize:  cfg.Gateway.ReadBufferSize,
 		WriteBufferSize: cfg.Gateway.WriteBufferSize,
 		CheckOrigin: func(r *http.Request) bool {
-			origin := r.Header.Get("Origin")
-			for _, allowed := range h.cfgStore.Load().Security.AllowedOrigins {
-				if allowed == "*" || allowed == origin {
-					return true
-				}
-			}
-			return false
+			// Non-browser clients (Go SDK, CLI tooling) send no Origin; a
+			// missing Origin is allowed and only a present-but-unlisted one
+			// is refused. See security.CheckWebSocketOrigin (D05).
+			return security.CheckWebSocketOrigin(
+				r.Header.Get("Origin"),
+				h.cfgStore.Load().Security.AllowedOrigins,
+			)
 		},
 	}
 	go h.Run()

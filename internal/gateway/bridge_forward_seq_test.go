@@ -135,14 +135,14 @@ func TestProcessForwardedEvent_NoCollectorPreservesWorkerSeq(t *testing.T) {
 }
 
 // TestProcessForwardedEvent_DoneArrivesAfterTheRuntimeFactItOvertakes pins the
-// client-visible seq invariant for the one worker event whose own handling
-// emits another client-visible event before the Done itself is enqueued.
-//
-// The order asserted below is the order the gateway emits today, NOT the order
-// docs/reference/aep-protocol.md:385-386 specifies (completed after done). This
-// test pins the invariant that clients depend on — seq increases with arrival —
-// and leaves the ordering deviation to
-// docs/issues/2026-10-04-live-run/D01.
+// client-visible order AND seq invariant for the terminal pair: the Done
+// arrives first and the terminal runtime fact follows it, with seq increasing
+// in arrival order. This is the order docs/reference/aep-protocol.md:385-386
+// specifies (completed after done); the pre-D01 gateway emitted them
+// reversed, which this test now rejects. The seq invariant is what clients
+// depend on — a Done arriving with a LOWER seq than an event the client has
+// already seen is dropped by monotonic-seq clients and the turn never ends
+// (found by a live run against a real Worker).
 func TestProcessForwardedEvent_DoneArrivesAfterTheRuntimeFactItOvertakes(t *testing.T) {
 	t.Parallel()
 
@@ -169,19 +169,16 @@ func TestProcessForwardedEvent_DoneArrivesAfterTheRuntimeFactItOvertakes(t *test
 	b.processForwardedEvent(done, fw, forwardOpts{}, fc)
 
 	first := tryReadEnvelope(t, server)
-	require.NotNil(t, first, "the runtime fact must reach the client")
-	require.Equal(t, events.RuntimeExecutionCompleted, first.Event.Type,
-		"the runtime fact is emitted while the Done is still being processed, so it arrives first")
+	require.NotNil(t, first, "the Done must reach the client first")
+	require.Equal(t, events.Done, first.Event.Type,
+		"AEP requires done before runtime.execution.completed")
 
 	second := tryReadEnvelope(t, server)
-	require.NotNil(t, second, "the Done itself must still reach the client")
-	require.Equal(t, events.Done, second.Event.Type)
+	require.NotNil(t, second, "the terminal runtime fact must follow the Done")
+	require.Equal(t, events.RuntimeExecutionCompleted, second.Event.Type)
 
 	// The invariant every seq-enforcing client depends on: arrival order and
-	// seq order agree. A Done stamped before the runtime fact is emitted but
-	// enqueued after it arrives carrying a LOWER seq than an event the client
-	// has already seen, and monotonic-seq clients drop it — the turn then never
-	// terminates. Found by a live run against a real Worker.
+	// seq order agree.
 	require.Greater(t, second.Seq, first.Seq,
 		"client-visible seq must increase with arrival order")
 }

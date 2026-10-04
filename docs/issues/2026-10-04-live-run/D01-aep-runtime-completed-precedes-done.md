@@ -9,7 +9,7 @@ description: "契约要求终态事实在 done 之后送达；实测相反，并
 - 优先级：P1
 - 基准：`1698d2c2`（在 `origin/main` 上同样复现，非本分支引入）
 - 证据：Live（真实 PostgreSQL + 真实 Claude Code Worker）＋ 契约文档 ＋ Source
-- 状态：seq 倒置症状已修（`60b7be7a`）；顺序本身仍与契约不符，未修
+- 状态：已修（`668aa36c`，待验证）
 - 位置：`internal/gateway/bridge_forward.go`（`processForwardedEvent` / `finishRuntimeOnDone`）
 
 ## 契约
@@ -52,6 +52,20 @@ done                       seq=11
 1. `FinishRuntime` 持久化写入；
 2. `replayPending` —— 释放 active gate 并重放缓冲的补入输入（第二轮的驱动力）；
 3. 投递 `runtime.execution.{completed,failed}`。
+
+## 修复（2026-10-04，`668aa36c`）
+
+把「持久化 + 放行」和「投递终态事实」拆开：`finishRuntimeOnDone` 仍在
+`done` 发送前持久化 `FinishRuntime` 并释放 active gate（`replayPending` +
+`dispatchQueued`，第二轮的驱动力不变），但不再直接发送终态事实，而是
+返回 `pendingRuntimeFact`，由 `processForwardedEvent` 在 `done` 上线后投递。
+失败轮次（`done.success=false` ＋ pending Error）中 Error 是用户可见终态，
+失败事实跟在 Error 之后。持久化失败仍不投递、走 repairer 重试；被重试取代
+的 Done 仍不持久化（执行归属最终终止的那次尝试）。
+
+既有 seq 测试此前显式 pin 住旧顺序（注释写明“当前网关的发送顺序，非契约
+顺序”），现已改为断言契约顺序：done 先、completed 后、seq 同序递增。
+变异验证：stash 修复后测试红，`completed` 先到——正是线上症状。
 
 ## 验收条件
 

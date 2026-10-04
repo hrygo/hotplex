@@ -534,13 +534,18 @@ func (b *Bridge) processForwardedEvent(env *events.Envelope, w worker.Worker, op
 	shouldRetry := false
 	retryAttempt := 0
 	deferRuntimeFinish := env.Event.Type == events.Done && isDone && !doneData.Success && fc.pendingError != nil
+	// The durable terminal write happens before the Done is sent (so the
+	// client is never told "completed" while the record is non-terminal),
+	// but the terminal runtime FACT is delivered after the Done (AEP order:
+	// done → runtime.execution.{completed,failed}). D01.
+	var runtimeFact *pendingRuntimeFact
 	// Done processing: mark received.
 	if env.Event.Type == events.Done {
 		fc.doneReceived = true
 		b.resetCrashLoop(sessionID)
 		b.maybeTransitionIdleAfterDone(sessionID, fc)
 		if !deferRuntimeFinish {
-			b.finishRuntimeOnDone(sessionID, fc, env)
+			runtimeFact = b.finishRuntimeOnDone(sessionID, fc, env)
 		}
 		terminalStatus = "completed"
 		if isDone && !doneData.Success {
@@ -553,7 +558,12 @@ func (b *Bridge) processForwardedEvent(env *events.Envelope, w worker.Worker, op
 
 	if shouldRetry {
 		if deferRuntimeFinish {
-			b.finishRuntimeOnDone(sessionID, fc, env)
+			// A retry continues the same accepted input with a fresh worker
+			// attempt: the durable runtime finish belongs to the attempt that
+			// finally terminates, not to this superseded Done. Persisting
+			// here would mark the execution terminal while the retry is
+			// still running, so no fact is produced either.
+			_ = b.finishRuntimeOnDone(sessionID, fc, env)
 		}
 		fc.pendingError = nil
 		fc.reopenTerminal()
@@ -591,7 +601,12 @@ func (b *Bridge) processForwardedEvent(env *events.Envelope, w worker.Worker, op
 			env.Seq = b.hub.NextSeqHeld(sessionID)
 		}
 		b.captureForwardedEvent(env, deltaContent, reasoningContent, fc)
-		b.finishRuntimeOnDone(sessionID, fc, env)
+		// The Error is the user-visible terminal, so the failed runtime fact
+		// follows it — never the hidden Done. finishRuntimeOnDone persists
+		// the failed runtime and releases the gate; the fact is emitted
+		// after the Error reaches the wire.
+		runtimeFact = b.finishRuntimeOnDone(sessionID, fc, env)
+		b.emitRuntimeFactOnDone(sessionID, runtimeFact)
 		b.finishTurnTTFT(sessionID, terminalStatus)
 		fc.turnText.Reset()
 		fc.hasRealText = false
@@ -629,6 +644,9 @@ func (b *Bridge) processForwardedEvent(env *events.Envelope, w worker.Worker, op
 		// `fc.turnStartTime = time.Now()` at Done, which started the NEXT turn's
 		// clock at this Done — so inter-turn idle was billed to the next turn.
 		// Turn start is now recorded by the input path (Fix D) and read on Done.
+		// Deliver the persisted terminal runtime fact AFTER the Done, per
+		// the AEP contract (done → runtime.execution.{completed,failed}).
+		b.emitRuntimeFactOnDone(sessionID, runtimeFact)
 	}
 
 }
@@ -645,19 +663,26 @@ func isTurnStartEvent(kind events.Kind) bool {
 }
 
 // finishRuntimeOnDone correlates the terminal runtime status when a Done event
-// arrives. It queries the active execution for the session and calls
-// FinishRuntime to persist the terminal state. Runtime events are emitted to
-// the client for execution_id correlation. Spec 2026-07-14 lines 259-275.
-func (b *Bridge) finishRuntimeOnDone(sessionID string, fc *forwardContext, env *events.Envelope) {
+// arrives. It queries the active execution for the session, persists the
+// terminal state with FinishRuntime, and releases the active gate (replay +
+// dispatch of the queued durable head). It does NOT emit the terminal runtime
+// fact: AEP requires runtime.execution.{completed,failed} AFTER done
+// (docs/reference/aep-protocol.md), so the fact is emitted by
+// emitRuntimeFactOnDone after the Done itself is on the wire (D01). The
+// durable write still happens first, so a client is never told the execution
+// completed while the record is in a non-terminal state. When the durable
+// write fails, nothing is emitted and the repairer retries; the pending fact
+// is re-emitted by HandleRepairSuccess. Spec 2026-07-14 lines 259-275.
+func (b *Bridge) finishRuntimeOnDone(sessionID string, fc *forwardContext, env *events.Envelope) *pendingRuntimeFact {
 	if b.executionStore == nil {
-		return
+		return nil
 	}
 
 	// OpenBySession covers pending/running/unknown so a late Done can still
 	// converge an execution that lease recovery already marked unknown.
 	rec, err := b.executionStore.OpenBySession(context.Background(), sessionID)
 	if err != nil {
-		return
+		return nil
 	}
 
 	success := true
@@ -685,7 +710,7 @@ func (b *Bridge) finishRuntimeOnDone(sessionID string, fc *forwardContext, env *
 		b.flogOf(fc).Debug("bridge: finish runtime on done", "err", err,
 			"session_id", sessionID, observability.KeyExecutionID, rec.ExecutionID, "status", rtStatus)
 		if errors.Is(err, execution.ErrRunMismatch) {
-			return
+			return nil
 		}
 		if b.repairer != nil {
 			b.repairer.Enqueue(execution.RepairIntent{
@@ -699,7 +724,7 @@ func (b *Bridge) finishRuntimeOnDone(sessionID string, fc *forwardContext, env *
 		// Do not emit a terminal runtime event when the durable write failed:
 		// the client must not be told the execution completed while the record
 		// is still in a non-terminal state.
-		return
+		return nil
 	}
 
 	// Replay buffered supplements now that the active gate is released. This
@@ -731,6 +756,32 @@ func (b *Bridge) finishRuntimeOnDone(sessionID string, fc *forwardContext, env *
 			time.Since(time.UnixMilli(*rec.StartedAt)).Seconds())
 	}
 
+	return &pendingRuntimeFact{
+		executionID: rec.ExecutionID,
+		status:      string(rtStatus),
+		kind:        eventKind,
+		ownerID:     fc.sessOwner,
+	}
+}
+
+// pendingRuntimeFact is the terminal runtime fact whose durable write has
+// succeeded but whose client delivery is deferred until after the Done itself
+// is on the wire (AEP: done → runtime.execution.{completed,failed}).
+type pendingRuntimeFact struct {
+	executionID string
+	status      string
+	kind        events.Kind
+	ownerID     string
+}
+
+// emitRuntimeFactOnDone delivers a previously persisted terminal runtime fact.
+// It runs after the Done envelope has been sent, so the client observes the
+// contract order. The seq is allocated at enqueue time under the caller's
+// held lease, keeping arrival order and seq order identical.
+func (b *Bridge) emitRuntimeFactOnDone(sessionID string, fact *pendingRuntimeFact) {
+	if fact == nil {
+		return
+	}
 	var seq int64
 	preallocated := b.collector != nil
 	if preallocated {
@@ -742,11 +793,11 @@ func (b *Bridge) finishRuntimeOnDone(sessionID string, fc *forwardContext, env *
 	if preallocated && seq == 0 {
 		return
 	}
-	rtEnv := events.NewEnvelope(aep.NewID(), sessionID, seq, eventKind, events.RuntimeExecutionData{
-		ExecutionID: rec.ExecutionID,
-		Status:      string(rtStatus),
+	rtEnv := events.NewEnvelope(aep.NewID(), sessionID, seq, fact.kind, events.RuntimeExecutionData{
+		ExecutionID: fact.executionID,
+		Status:      fact.status,
 	})
-	rtEnv.OwnerID = fc.sessOwner
+	rtEnv.OwnerID = fact.ownerID
 	_ = b.hub.SendToSession(context.Background(), rtEnv)
 }
 
