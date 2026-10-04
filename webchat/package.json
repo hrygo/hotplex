@@ -1,6 +1,6 @@
 {
   "name": "hotplex-webchat",
-  "version": "1.50.2",
+  "version": "1.51.0",
   "private": true,
   "packageManager": "pnpm@11.4.0",
   "scripts": {

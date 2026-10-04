@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.51.0] - 2026-10-04
+
+### Summary
+
+v1.51.0 是一次 minor 版本更新，核心主题是 **可信运行与交付**。本版本把「输入是否被受理、实际生效的是哪份配置、是否仍在运行、结果是否真的送达、失败后能否安全继续」这五件事从推断变成可核验的事实，并把一批运行期审计发现一并修复。发布前在真实 PostgreSQL 与真实 Claude Code Worker 上完成了端到端运行验证。
+
+### Added
+
+- **输入生命周期**：Gateway 先持久化受理再向 Worker 投递，由 owner 租约与 active gate 保证同一轮次只有一次有效执行。`accepted` 只能前进到 `delivered` / `unknown` / `failed`；租约过期置为 `unknown` 并围栏，晚到的完成事件只能收敛状态；`unknown` 永不自动重投。`execution` 只保存 SHA-256 payload 指纹，不保存 prompt、metadata 值或凭证。
+- **权威运行时计划**：每个会话启动都记录带指纹的 launch plan，配置差异以结构化字段暴露，事后可回答「实际生效的是哪份配置」。
+- **执行与效果分离**：执行记录与投递效果各自持久化，投递回执独立于 Agent 的 `done`；仅 Slack 适配器实现了 provider receipt，其余渠道的效果只能作为尝试记录。
+- **执行台**：Admin 控制台基于同一份运行时存储提供执行列表、时间线与队列操作（取消 / 清空），并暴露 keyset 分页游标。
+- **Cron 与 Webhook 身份**：Cron 具备 occurrence 与投递模式记录；Webhook 以经校验的身份去重，缺少可验证 ID 的来源退化为逐请求 occurrence，不会静默合并。
+- **数据库迁移**：SQLite 与 PostgreSQL 成对新增 033–038（cron_occurrences、effect_ledger、occurrence_delivery_mode、effect_attempts、execution_queue、execution_queue_payloads），启动时自动应用。
+
+### Fixed
+
+- **终态事件丢失**：Gateway 处理 `done` 时会先发出 `runtime.execution.completed`，而 `done` 的 seq 在更早处分配，导致终态 `done` 携带比客户端已见事件更小的 seq；依赖 seq 单调递增的客户端会丢弃它，回合永不结束。`done` 的 seq 现改为入队前分配，与到达顺序一致。该缺陷在修复前的 `main` 上同样复现。
+- **Go SDK 多回合不可观测**：`recvPump` 在收到第一个 `done` 后即退出，但 `done` 是回合终态而非会话终态；补入输入会触发真正的第二轮并产生第二个 `done`，此前客户端对第二轮完全不可见。
+- **Go SDK 订阅竞争**：`Unsubscribe` 在锁内关闭事件通道，而投递在锁外发送，交错即向已关闭通道发送（进程 panic）。监听者改为携带 done 信号，取消订阅只停止投递。
+- **运行期审计十项**：Codex 订阅通道多方关闭与发送竞态、Codex reference 生命周期释放、Codex 传输代际冻结、Codex 进程回收、OpenCode reset 404、飞书关闭期限、Codex pending 在断连时的结算、Codex 中断 RPC、Codex 生命周期响应校验、交互超时代际隔离。
+- **消息与事件身份**（#997/#998/#999）：delta 合并保留消息身份与 metadata；终态写回执只完成一次；克隆 envelope 时隔离可变类型载荷。
+
+### Changed
+
+- **AEP 契约**：`input.ack` 新增 `input_mode`、`durability`、`parent_execution_id` 三个可选字段，全部 `omitempty`，向后兼容；`pkg/events` 未新增或修改 Kind，`docs/reference/{aep-protocol,events}.md` 与四语言 SDK、双向协议测试同步更新。
+- **Go SDK 订阅语义**：`Unsubscribe` 不再关闭事件通道（关闭会与正在投递的事件竞争），通道改由 `Close()` 在接收泵停止后统一关闭，`for range` 的终止语义不变。`Events()` 应只调用一次并持续排空：只注册不排空的通道填满后，SDK 为保证 `done` / `error` / `state` 不丢而阻塞投递，接收泵随之停滞。
+- **PR 分支规则**：CI 的 pr-checks 接受 Codex 桌面端创建的 `codex/` 前缀，原有 `<type>/[<id>-]<desc>` 形态与可选数字 ID 要求不变。
+
+### Known Issues
+
+- `runtime.execution.completed` 仍先于 `done` 送达，与 `docs/reference/aep-protocol.md` 规定的顺序不符；seq 症状已修复，顺序本身待调整（#1022）。
+- PostgreSQL 下会话 GC 每 60 秒失败一次（`session cleanup: enqueue: driver: bad connection`），会导致空闲会话占满额度（#1022）。
+- Go SDK 在默认 `allowed_origins` 配置下无法连接网关：网关要求 Origin 匹配，而 gorilla 不发送 Origin（#1022）。
+
 ## [1.50.2] - 2026-09-05
 
 ### Summary

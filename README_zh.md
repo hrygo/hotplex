@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://github.com/hrygo/hotplex/actions/workflows/ci.yml"><img src="https://github.com/hrygo/hotplex/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/Version-v1.50.2-10B981?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-v1.51.0-10B981?style=flat-square" alt="Version">
   <a href="https://github.com/hrygo/hotplex/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-3B82F6?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go" alt="Go">
   <img src="https://img.shields.io/badge/Protocol-AEP%20v1-7C3AED?style=flat-square" alt="AEP v1">
@@ -135,11 +135,13 @@ HotPlex 把“用户在哪里对话”和“哪个 Agent 执行任务”分离�
 
 Worker 可以按 Bot 或平台指定，其余场景继承部署级共享默认值。
 
-## ✨ 最新版本：v1.50.2
+## ✨ 最新版本：v1.51.0
 
-- **停止语义真实可靠。** Gateway 等待 Worker run、连接和事件转发器完全静默后，才确认 `stopped_by_user`，避免旧输出污染下一轮会话。
-- **跨 Worker 生命周期隔离。** ACP、Claude Code、Codex CLI 和 OpenCode Server 的停止、重试与共享单例清理统一经过 run 级屏障和 dispatch gate。
-- **失败反馈可操作。** OpenCode 配额/限流失败返回明确错误码，WebChat 显示可执行的重试与凭据检查建议。
+- **输入生命周期可证明。** 输入先持久化受理再投递 Worker，由 owner 租约与 active gate 保证同一轮次只有一次有效执行；租约过期置为 `unknown` 并围栏，`unknown` 永不自动重投。
+- **权威运行时计划。** 每次会话启动都记录带指纹的 launch plan，事后可回答"实际生效的是哪份配置"，而不是靠复现推测。
+- **交付与 Agent 完成分离。** 执行记录与投递效果各自持久化：Agent 的 `done` 不等于用户已收到结果，投递回执独立可查。
+- **执行台。** Admin 控制台基于同一份运行时存储提供执行列表、时间线与队列操作。
+- **真实链路验证。** 本版本在真实 PostgreSQL 与真实 Claude Code Worker 上完成端到端运行，并据此修复了终态事件丢失与多回合不可观测两个缺陷。
 
 完整版本历史见[更新记录](CHANGELOG.md)。
 
