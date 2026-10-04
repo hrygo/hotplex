@@ -8,6 +8,8 @@ import (
 	"unicode"
 
 	"golang.org/x/text/unicode/norm"
+
+	"github.com/hrygo/hotplex/internal/security"
 )
 
 // RequiredPlatformKey maps each platform to the PlatformKey field required
@@ -129,6 +131,14 @@ func ValidateJob(job *CronJob) error {
 	}
 	if job.OwnerID == "" {
 		return errors.New("cron: owner_id is required")
+	}
+	// #870: an explicit unsafe workdir fails closed at plan time, not at
+	// run time. Empty keeps the executor's resolveWorkDir fallback; a
+	// relative or forbidden path must never become a worker's cwd.
+	if job.WorkDir != "" {
+		if err := security.ValidateWorkDir(job.WorkDir); err != nil {
+			return fmt.Errorf("cron: invalid work_dir: %w", err)
+		}
 	}
 	if job.BotID == "" {
 		return errors.New("cron: bot_id is required")
