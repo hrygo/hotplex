@@ -109,6 +109,16 @@ func TestValidateJob(t *testing.T) {
 	}{
 		{name: "valid job", job: validJob()},
 		{
+			name:    "unsafe relative workdir rejected at plan time",
+			job:     func() *CronJob { j := validJob(); j.WorkDir = "../escape"; return j }(),
+			wantErr: true,
+			errPart: "invalid work_dir",
+		},
+		{
+			name: "absolute workdir accepted",
+			job:  func() *CronJob { j := validJob(); j.WorkDir = "/tmp/cron-work"; return j }(),
+		},
+		{
 			name:    "missing name",
 			job:     func() *CronJob { j := validJob(); j.Name = ""; return j }(),
 			wantErr: true,
