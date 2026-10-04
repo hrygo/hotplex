@@ -260,18 +260,27 @@ func (s *pgStore) DeleteTerminated(ctx context.Context, cronCutoff, defaultCutof
 				_ = deletedRows.Close()
 				return nil, fmt.Errorf("session store: scan deleted session: %w", err)
 			}
+			// The scanned rows must be closed before the cleanup INSERT runs
+			// on the same transaction. pgx (database/sql) multiplexes one
+			// server connection per *sql.Tx, and an open result set holds it:
+			// any further statement on the tx fails with
+			// "driver: bad connection" instead of waiting. modernc/sqlite
+			// buffers rows client-side, which is why this only fails on PG.
+			if err := deletedRows.Close(); err != nil {
+				return nil, fmt.Errorf("session store: close deleted session rows: %w", err)
+			}
 			deleted = append(deleted, info)
 			if err := insertCleanupTask(ctx, pgExec{tx: tx, rebind: s.dialect.Rebind}, info, now); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := deletedRows.Err(); err != nil {
 				_ = deletedRows.Close()
 				return nil, err
 			}
-		}
-		if err := deletedRows.Err(); err != nil {
-			_ = deletedRows.Close()
-			return nil, err
-		}
-		if err := deletedRows.Close(); err != nil {
-			return nil, err
+			if err := deletedRows.Close(); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {
