@@ -620,12 +620,28 @@ jobs:
           echo "${COUNT} provenance file(s) declare ${SHA}"
 
       - name: Generate SBOMs
-        uses: anchore/sbom-action@v0.24.3
-        with:
-          path: dist
-          format: cyclonedx-json
-          output-file: sbom
-          artifact-name: sbom
+        # anchore/sbom-action was given the whole dist/ directory, so it
+        # described the directory as one subject and uploaded the result as a
+        # workflow artifact. Nothing landed in dist/, so
+        # verify_release_artifacts.py correctly refused the release with
+        # "has no CycloneDX SBOM" for all 14 artifacts. An SBOM a downloader
+        # cannot get next to the file it describes is not evidence, so scan
+        # each shipped artifact and write <artifact>.sbom.json beside it.
+        uses: anchore/sbom-action/download-syft@v0.24.3
+
+      - name: Describe every shipped artifact
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          artifacts=(dist/hotplex-*.tar.gz dist/hotplex-*.zip)
+          if [ "${#artifacts[@]}" -eq 0 ]; then
+            echo "::error::no artifacts to describe"
+            exit 1
+          fi
+          for artifact in "${artifacts[@]}"; do
+            syft scan "$artifact" -o "cyclonedx-json=${artifact}.sbom.json" -q
+            echo "described ${artifact}"
+          done
 
       - name: Sign the checksums
         uses: sigstore/cosign-installer@v4.1.2
@@ -647,6 +663,52 @@ jobs:
         uses: actions/attest-build-provenance@v4.2.2
         with:
           subject-path: dist/hotplex-*.tar.gz
+
+      - name: Attest build provenance (Windows archives)
+        # The Windows artifacts ship as .zip, so the tar.gz glob above leaves
+        # them unattested. A downloader verifying hotplex-windows-amd64.zip
+        # would find no attestation for it.
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: dist/hotplex-*.zip
+
+      - name: Record verifiable attestation evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          artifacts=(dist/hotplex-*.tar.gz dist/hotplex-*.zip)
+          out=dist/attestations.jsonl
+          : > "$out"
+          for artifact in "${artifacts[@]}"; do
+            # Exactly what a downloader runs. If an attestation was never
+            # published or cannot be verified, the release is not
+            # trustworthy and must not be created. jq -c keeps one JSON
+            # object per line whatever shape gh emits. The retry covers the
+            # short window before a freshly written attestation is readable
+            # through the API.
+            verified=""
+            for attempt in 1 2 3 4 5; do
+              if verified=$(gh attestation verify "$artifact" --repo "$REPO" \
+                --format json 2>/dev/null | jq -c .); then
+                break
+              fi
+              echo "attempt ${attempt}: attestation for ${artifact} not readable yet"
+              sleep 10
+            done
+            if [ -z "$verified" ]; then
+              echo "::error::no verifiable attestation for ${artifact} in ${REPO}"
+              exit 1
+            fi
+            printf '%s\n' "$verified" >> "$out"
+          done
+          if [ ! -s "$out" ]; then
+            echo "::error::no attestation could be verified against ${REPO}"
+            exit 1
+          fi
+          echo "$(wc -l < "$out") attestation record(s) captured"
 
       - name: Verify what is about to be published
         env:
@@ -670,7 +732,10 @@ jobs:
             dist/hotplex-*.zip
             dist/hotplex-offline-bundle-*.tar.gz
             dist/hotplex-offline-bundle-*.zip
+            dist/hotplex-*.sbom.json
             dist/checksums.txt
+            dist/checksums.txt.sigstore
             dist/source-sha.txt
+            dist/attestations.jsonl
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
