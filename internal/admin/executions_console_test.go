@@ -496,3 +496,33 @@ func TestGetExecutionTimeline_FinishedDeliveryOffersNoAction(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &tl))
 	require.Empty(t, tl.Actions, "a settled delivery has nothing left to decide")
 }
+
+// TestGetExecutionTimeline_ReconciledAndFencedAreDistinct proves #868:
+// reconciled_* shows the late evidence (not the error code), fenced gets
+// its own phase — unknown, delivered, reconciled and fenced never blur.
+func TestGetExecutionTimeline_ReconciledAndFencedAreDistinct(t *testing.T) {
+	t.Parallel()
+	rec := record("exec-1", "sess-1", "delivered", "completed")
+	effects := &mockExecutionEffects{effects: []*effect.Effect{
+		{EffectID: "eff-r", Status: effect.StatusReconciledSucceeded, EvidenceRef: "lookup-1", ErrorCode: "reconciled_succeeded", UpdatedAtMs: 1800},
+		{EffectID: "eff-f", Status: effect.StatusFenced, ErrorCode: "fenced", UpdatedAtMs: 1900},
+	}}
+	api := consoleAPI(&mockExecutionReader{records: []*execution.Record{rec}}, nil, effects)
+
+	w := timelineRequest(api, "exec-1", "", ScopeRuntimeRead)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var tl ExecutionTimeline
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &tl))
+	byID := map[string]TimelineItem{}
+	for _, item := range tl.Items {
+		if item.EffectID != "" {
+			byID[item.EffectID] = item
+		}
+	}
+	r := byID["eff-r"]
+	require.Equal(t, "delivery", r.Phase)
+	require.Equal(t, "lookup-1", r.Evidence, "reconciled shows late evidence, not the error code")
+	f := byID["eff-f"]
+	require.Equal(t, "fenced", f.Phase)
+}
