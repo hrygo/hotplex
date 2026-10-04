@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"reflect"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -279,6 +281,11 @@ func (e *pcEntry) writeLoop() {
 	}()
 	var timerCh <-chan time.Time
 	var pendingSID string // tracks SessionID for pending coalesced deltas
+	// pendingKey is the coalescing identity of the buffered deltas: envelopes
+	// are only merged while message ID, session and owner stay identical.
+	// Any identity change flushes first (#997).
+	var pendingKey coalesceKey
+	var pendingMeta map[string]any
 	var runeCount int
 
 	flush := func(sid string) {
@@ -289,15 +296,19 @@ func (e *pcEntry) writeLoop() {
 			Version:   events.Version,
 			ID:        aep.NewID(),
 			SessionID: sid,
+			OwnerID:   pendingKey.owner,
+			Metadata:  pendingMeta,
 			Event: events.Event{
 				Type: events.MessageDelta,
 				Data: events.MessageDeltaData{
-					Content: db.String(),
+					MessageID: pendingKey.messageID,
+					Content:   db.String(),
 				},
 			},
 		}
 		observability.GatewayDeltaFlush().Add(e.ctx, 1)
 		db.Reset()
+		pendingMeta = nil
 		runeCount = 0
 		if timer != nil {
 			timer.Stop()
@@ -316,13 +327,13 @@ func (e *pcEntry) writeLoop() {
 			env := write.env
 
 			if isCoalesciblePlatformEvent(env.Event.Type) {
-				content := extractDeltaContent(env)
-				if db.Len() == 0 {
-					pendingSID = env.SessionID
+				if ok, meta := appendCoalescible(write, &pendingSID, &pendingKey, pendingMeta, &db, &runeCount, flush); !ok {
+					flush(pendingSID)
+					e.writeOne(write)
+				} else {
+					pendingMeta = meta
+					observability.GatewayDeltaCoalesced().Add(e.ctx, 1)
 				}
-				db.WriteString(content)
-				runeCount += utf8.RuneCountInString(content)
-				observability.GatewayDeltaCoalesced().Add(e.ctx, 1)
 
 				if runeCount >= e.cfg.CoalesceSize {
 					flush(pendingSID)
@@ -353,12 +364,12 @@ func (e *pcEntry) writeLoop() {
 				select {
 				case write := <-e.ch:
 					if isCoalesciblePlatformEvent(write.env.Event.Type) {
-						if db.Len() == 0 {
-							pendingSID = write.env.SessionID
+						if ok, meta := appendCoalescible(write, &pendingSID, &pendingKey, pendingMeta, &db, &runeCount, flush); !ok {
+							flush(pendingSID)
+							e.writeOne(write)
+						} else {
+							pendingMeta = meta
 						}
-						content := extractDeltaContent(write.env)
-						db.WriteString(content)
-						runeCount += utf8.RuneCountInString(content)
 					} else {
 						flush(pendingSID)
 						e.writeOne(write)
@@ -375,12 +386,12 @@ func (e *pcEntry) writeLoop() {
 						select {
 						case write := <-e.ch:
 							if isCoalesciblePlatformEvent(write.env.Event.Type) {
-								if db.Len() == 0 {
-									pendingSID = write.env.SessionID
+								if ok, meta := appendCoalescible(write, &pendingSID, &pendingKey, pendingMeta, &db, &runeCount, flush); !ok {
+									flush(pendingSID)
+									e.writeOne(write)
+								} else {
+									pendingMeta = meta
 								}
-								content := extractDeltaContent(write.env)
-								db.WriteString(content)
-								runeCount += utf8.RuneCountInString(content)
 							} else {
 								flush(pendingSID)
 								e.writeOne(write)
@@ -465,4 +476,93 @@ func extractDeltaContent(env *events.Envelope) string {
 		return s
 	}
 	return ""
+}
+
+// coalesceKey is the identity under which text deltas may be merged (#997).
+// A change in any field means a different logical message and forces a flush
+// before the new envelope is buffered.
+type coalesceKey struct {
+	messageID string
+	sessionID string
+	owner     string
+	kind      events.Kind
+}
+
+// coalesceParts extracts the merge identity, metadata scope and text content
+// of a coalescible envelope. An empty content means there is no text to merge
+// (e.g. an unrecognized raw shape): the caller must forward the original
+// envelope untouched rather than swallowing it.
+func coalesceParts(env *events.Envelope) (coalesceKey, map[string]any, string) {
+	key := coalesceKey{sessionID: env.SessionID, owner: env.OwnerID, kind: env.Event.Type}
+	var meta map[string]any
+	if env.Metadata != nil {
+		meta = maps.Clone(env.Metadata)
+	}
+	switch env.Event.Type {
+	case events.MessageDelta:
+		switch d := env.Event.Data.(type) {
+		case events.MessageDeltaData:
+			key.messageID = d.MessageID
+			return key, meta, d.Content
+		case map[string]any:
+			if mid, _ := d["message_id"].(string); mid != "" {
+				key.messageID = mid
+			}
+			if c, _ := d["content"].(string); c != "" {
+				return key, meta, c
+			}
+		case string:
+			if d != "" {
+				return key, meta, d
+			}
+		}
+	case events.Raw:
+		if d, ok := env.Event.Data.(events.RawData); ok {
+			if m, ok := d.Raw.(map[string]any); ok {
+				if t, _ := m["text"].(string); t != "" {
+					return key, meta, t
+				}
+			}
+		}
+		if str, ok := env.Event.Data.(string); ok && str != "" {
+			return key, meta, str
+		}
+	}
+	return key, meta, extractDeltaContent(env)
+}
+
+// equalMetadataScope reports whether two buffered metadata scopes are the same.
+// A nil/empty scope only merges with nil/empty; any key difference is a new
+// logical message and forces a flush.
+func equalMetadataScope(a, b map[string]any) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return len(a) == 0 && len(b) == 0
+	}
+	return maps.EqualFunc(a, b, reflect.DeepEqual)
+}
+
+// appendCoalescible buffers one envelope's text into db, flushing first when
+// the coalescing identity changes. It returns false when the envelope carries
+// no mergeable text and must be forwarded as-is. The timer/size flush policy
+// stays with the caller; only the identity boundary lives here so the normal,
+// timer and close-drain paths share one rule (#997).
+func appendCoalescible(write platformWrite, pendingSID *string, pendingKey *coalesceKey, pendingMeta map[string]any, db *strings.Builder, runeCount *int, flush func(string)) (bool, map[string]any) {
+	env := write.env
+	key, meta, content := coalesceParts(env)
+	if content == "" {
+		return false, pendingMeta
+	}
+	if db.Len() == 0 {
+		*pendingSID = env.SessionID
+		*pendingKey = key
+		pendingMeta = meta
+	} else if *pendingKey != key || !equalMetadataScope(pendingMeta, meta) {
+		flush(*pendingSID)
+		*pendingSID = env.SessionID
+		*pendingKey = key
+		pendingMeta = meta
+	}
+	db.WriteString(content)
+	*runeCount += utf8.RuneCountInString(content)
+	return true, pendingMeta
 }
