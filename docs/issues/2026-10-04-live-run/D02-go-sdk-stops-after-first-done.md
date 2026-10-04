@@ -21,11 +21,11 @@ description: "done 是回合终态而非会话终态；SDK 读到第一个 done 
 代理抓帧证实第二轮的两帧确实在链路上：
 
 ```
-09:44:02.902  message.delta  seq=9
+09:44:02.902  message.delta               seq=9
 09:44:02.902  runtime.execution.completed seq=10
-09:44:06.320  done           seq=11   ← SDK 收到的最后一个事件
-09:44:06.479  message.delta  seq=12   ← SDK 从未投递
-09:44:06.479  done           seq=13   ← SDK 从未投递
+09:44:02.902  done                        seq=11   ← SDK 收到的最后一个事件
+09:44:06.320  message.delta               seq=12   ← SDK 从未投递
+09:44:06.479  done                        seq=13   ← SDK 从未投递
 ```
 
 `recvPump` 在读到第一个 `done` 后 `return`，第二轮对调用方完全不可见，
@@ -51,4 +51,3 @@ AEP 中 `done` 是**回合**终态，会话生命周期等于 WebSocket 生命�
 - 同会话内多个 `done` 全部可观测；
 - `Close()` 后接收泵退出、通道关闭，`for range` 正常结束；
 - TS / Python / Java 示例 SDK 若存在同类终止判定，需同样核对。
-
