@@ -96,7 +96,14 @@ runs:
     - name: Generate swagger (if not cached)
       if: steps.swagger-cache.outputs.cache-hit != 'true'
       shell: bash
-      run: make swagger
+      run: |
+        # Self-heal when swagger-cache misses but swag was never installed
+        # (e.g. docs-cache hit skips the Install step above): without this,
+        # `make swagger` fails with "swag not found".
+        if ! command -v swag > /dev/null 2>&1; then
+          go install github.com/swaggo/swag/cmd/swag@v1.16.4
+        fi
+        make swagger
 
     - name: Build docs
       if: steps.docs-cache.outputs.cache-hit != 'true'
