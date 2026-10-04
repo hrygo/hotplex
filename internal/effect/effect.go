@@ -39,6 +39,16 @@ const (
 	// StatusUnknown means the outcome could not be determined — typically a
 	// lost response. It must never be treated as safe to resend.
 	StatusUnknown Status = "unknown"
+	// StatusReconciledSucceeded means late evidence proved the provider had
+	// accepted the delivery. It is terminal and distinct from delivered:
+	// delivered was seen on the attempt, reconciled_succeeded converged later.
+	StatusReconciledSucceeded Status = "reconciled_succeeded"
+	// StatusReconciledFailed means late evidence proved the provider never
+	// committed. Terminal, distinct from failed for the same reason.
+	StatusReconciledFailed Status = "reconciled_failed"
+	// StatusFenced means an operator quarantined the effect. Terminal: a
+	// fenced effect is never claimed, retried, reconciled or decided again.
+	StatusFenced Status = "fenced"
 )
 
 // Sentinel errors returned by the planner. Callers classify a refusal with
