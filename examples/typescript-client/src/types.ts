@@ -302,6 +302,24 @@ export interface RuntimeExecutionData {
   finished_at?: number;
 }
 
+// Runtime effect event payload (from pkg/events/events.go)
+export interface RuntimeEffectData {
+  execution_id: string;
+  effect_id: string;
+  status: string;
+  error_code?: string;
+  evidence_ref?: string;
+  finished_at?: number;
+}
+
+// Runtime operator action payload (from pkg/events/events.go)
+export interface RuntimeOperatorActionData {
+  execution_id: string;
+  effect_id: string;
+  decision: string;
+  status: string;
+}
+
 // Worker in-place reset notification (from pkg/events/events.go)
 export interface InternalResetData {
   generation: number;
@@ -450,6 +468,10 @@ export interface ServerEventDataMap {
   [EventKind.RuntimeExecutionStarted]: RuntimeExecutionData;
   [EventKind.RuntimeExecutionCompleted]: RuntimeExecutionData;
   [EventKind.RuntimeExecutionFailed]: RuntimeExecutionData;
+  [EventKind.RuntimeEffectPlanned]: RuntimeEffectData;
+  [EventKind.RuntimeEffectReconciled]: RuntimeEffectData;
+  [EventKind.RuntimeEffectFenced]: RuntimeEffectData;
+  [EventKind.RuntimeOperatorAction]: RuntimeOperatorActionData;
 }
 
 export interface ServerEventEnvelopeMap {

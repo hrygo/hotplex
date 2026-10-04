@@ -178,6 +178,37 @@ type RuntimeExecutionData struct {
 发送。`runtime.execution.completed` 或 `runtime.execution.failed` 在 `done` 之后
 发送（作为 execution 账本的终态通知，与 run 结果分离）。
 
+#### `runtime.effect.{planned,reconciled,fenced}` / `runtime.operator.action` — 外部交付
+
+四个 S→C additive 事件，通过 `execution_id` 关联输入接受，通过 `effect_id`
+关联 effect 账本行。只带账本引用与脱敏证据指针，不带 content、密钥、
+metadata 值或原始错误。
+
+```go
+type RuntimeEffectData struct {
+    ExecutionID string    `json:"execution_id"`
+    EffectID    string    `json:"effect_id"`
+    Status      string    `json:"status"`       // planned / reconciled_* / fenced / delivered / failed / unknown
+    ErrorCode   ErrorCode `json:"error_code,omitempty"`
+    EvidenceRef string    `json:"evidence_ref,omitempty"`
+    FinishedAt  int64     `json:"finished_at,omitempty"`  // Unix 毫秒
+}
+
+type RuntimeOperatorActionData struct {
+    ExecutionID string `json:"execution_id"`
+    EffectID    string `json:"effect_id"`
+    Decision    string `json:"decision"`   // abandon / mark_delivered / requeue
+    Status      string `json:"status"`     // 决策后的 effect 状态
+}
+```
+
+| 事件 | 语义 |
+|------|------|
+| `runtime.effect.planned` | effect 已落账，等待派发 |
+| `runtime.effect.reconciled` | unknown 经晚到证据收敛（`reconciled_succeeded`/`reconciled_failed`） |
+| `runtime.effect.fenced` | effect 被 operator 隔离，永不派发 |
+| `runtime.operator.action` | operator 决策已应用（abandon/mark_delivered/requeue） |
+
 #### `internal_reset` — Worker 原地重置通知
 
 `additive` 的 worker→gateway **内部协调事件，绝不转发给客户端**（`bridge_forward.go`

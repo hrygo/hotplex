@@ -54,6 +54,11 @@ const (
 	RuntimeExecutionStarted   Kind = "runtime.execution.started"   // execution dispatch started (S→C additive)
 	RuntimeExecutionCompleted Kind = "runtime.execution.completed" // execution completed (S→C additive)
 	RuntimeExecutionFailed    Kind = "runtime.execution.failed"    // execution failed (S→C additive)
+
+	RuntimeEffectPlanned    Kind = "runtime.effect.planned"    // effect durably planned, keyed by execution (S→C additive)
+	RuntimeEffectReconciled Kind = "runtime.effect.reconciled" // unknown effect converged on late evidence (S→C additive)
+	RuntimeEffectFenced     Kind = "runtime.effect.fenced"     // effect quarantined by operator (S→C additive)
+	RuntimeOperatorAction   Kind = "runtime.operator.action"   // operator decision applied (S→C additive)
 )
 
 // Priority levels for message delivery.
@@ -325,6 +330,29 @@ type RuntimeExecutionData struct {
 	ErrorCode   ErrorCode `json:"error_code,omitempty"`
 	StartedAt   int64     `json:"started_at,omitempty"`
 	FinishedAt  int64     `json:"finished_at,omitempty"`
+}
+
+// RuntimeEffectData is the payload for runtime.effect.* events (S→C additive).
+// It correlates an input acceptance to its external-delivery outcome via
+// execution_id, and names the effect row without carrying content, secrets,
+// metadata values or raw provider errors. Old clients ignore unknown kinds.
+type RuntimeEffectData struct {
+	ExecutionID string    `json:"execution_id"`
+	EffectID    string    `json:"effect_id"`
+	Status      string    `json:"status"`
+	ErrorCode   ErrorCode `json:"error_code,omitempty"`
+	EvidenceRef string    `json:"evidence_ref,omitempty"`
+	FinishedAt  int64     `json:"finished_at,omitempty"`
+}
+
+// RuntimeOperatorActionData is the payload for runtime.operator.action
+// (S→C additive): which operator decision moved which effect, and to what.
+// The reason is bounded and human-readable; never provider truth.
+type RuntimeOperatorActionData struct {
+	ExecutionID string `json:"execution_id"`
+	EffectID    string `json:"effect_id"`
+	Decision    string `json:"decision"`
+	Status      string `json:"status"`
 }
 
 // MessageData is the payload for Message events (S→C — complete message, non-streaming).
