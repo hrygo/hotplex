@@ -442,18 +442,24 @@ jobs:
               # does not act on. The v1.51.0 smoke proved it: the gateway sat
               # through the 30s timeout and was killed, so this asserted
               # nothing about its shutdown sequence. Ask the binary to stop
-              # itself instead — the path an operator uses, and the one that
-              # runs the ordered teardown.
+              # itself instead — the path an operator uses.
               & $env:BINARY gateway stop | Out-Null
+              if ($LASTEXITCODE -ne 0) {
+                Get-Content "$env:RUNNER_TEMP\err.log" -Tail 40
+                throw "gateway stop failed with $LASTEXITCODE"
+              }
               $null = $proc.WaitForExit(30000)
               if (-not $proc.HasExited) { $proc.Kill() }
             }
           }
-          if ($proc.ExitCode -ne 0) {
-            Get-Content "$env:RUNNER_TEMP\err.log" -Tail 40
-            throw "gateway exited with $($proc.ExitCode)"
-          }
-          Write-Host 'graceful shutdown OK'
+          # Windows cannot verify the ordered teardown. proc.Terminate here is
+          # a CTRL_BREAK_EVENT aimed at a process group this gateway does not
+          # lead, so the CLI always escalates to TerminateProcess and the
+          # process exits non-zero — the exit code proves nothing. What this
+          # asserts is that `gateway stop` returned success, which it does only
+          # once the process is actually gone. The teardown itself is covered by
+          # the unix smokes, where SIGTERM is deliverable.
+          Write-Host 'gateway stopped (Windows stops by force kill; teardown is covered by the unix smokes)'
 
       - name: Binary starts, migrates a fresh database, serves health, shuts down cleanly (unix)
         if: runner.os != 'Windows'

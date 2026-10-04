@@ -56,13 +56,33 @@ func forceKillProcess(pid int) error {
 	return windows.TerminateProcess(handle, 1)
 }
 
-// IsProcessAlive checks if a process exists using OpenProcess.
+// stillActive is the exit code Win32 reports for a process that has not exited.
+// x/sys/windows does not export the constant.
+const stillActive = 259
+
+// IsProcessAlive reports whether a process is still running.
+//
+// A successful OpenProcess does not prove that: a process that has exited
+// stays openable for as long as any handle to it remains open, and whoever
+// started it usually holds one. The exit code is the reliable signal —
+// STILL_ACTIVE while the process runs, the real code once it is gone. Reading
+// only the open result made an already-stopped gateway look alive to
+// `hotplex gateway stop`, which escalated to a kill and then reported a stop
+// that had in fact already happened.
 func IsProcessAlive(pid int) error {
 	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
 		return fmt.Errorf("process %d check: %w", pid, err)
 	}
 	defer windows.CloseHandle(handle)
+
+	var code uint32
+	if err := windows.GetExitCodeProcess(handle, &code); err != nil {
+		return fmt.Errorf("process %d exit code: %w", pid, err)
+	}
+	if code != stillActive {
+		return fmt.Errorf("process %d has exited (code %d)", pid, code)
+	}
 	return nil
 }
 
