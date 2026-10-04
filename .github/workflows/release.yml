@@ -639,7 +639,10 @@ jobs:
             exit 1
           fi
           for artifact in "${artifacts[@]}"; do
-            syft scan "$artifact" -o "cyclonedx-json=${artifact}.sbom.json" -q
+            python3 scripts/ci/generate_sbom.py \
+              --archive "$artifact" \
+              --output "${artifact}.sbom.json" \
+              --syft syft
             echo "described ${artifact}"
           done
 
