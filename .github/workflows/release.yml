@@ -299,6 +299,17 @@ jobs:
             runner: windows-latest
             artifact: dist-windows-amd64
     steps:
+      - name: Check out the released source
+        # The smoke seeds a database from before the bounded input queue, so it
+        # needs one file from the tree that was released — not from whatever
+        # ref the workflow was dispatched on. Sparse because that fixture is
+        # the only thing the smoke reads.
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          sparse-checkout: internal/session/testdata
+          persist-credentials: false
+
       - name: Download the built artifact
         uses: actions/download-artifact@v7
         with:
@@ -363,6 +374,9 @@ jobs:
             find extracted -type f | head -20
             exit 1
           fi
+          # The consumer step starts in the workspace root, not in dist/, so a
+          # path relative to dist/ does not resolve there. Record it absolute.
+          BINARY="$PWD/$BINARY"
           chmod +x "$BINARY"
           echo "BINARY=$BINARY" >> "$GITHUB_OUTPUT"
 
