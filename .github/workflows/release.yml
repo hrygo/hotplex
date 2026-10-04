@@ -623,7 +623,13 @@ jobs:
           DIGEST: ${{ needs.resolve.outputs.sha }}
         run: |
           set -euo pipefail
-          cosign sign-blob --yes --output-signature dist/checksums.txt.sig dist/checksums.txt
+          # The installed cosign signs with the new bundle format and ignores
+          # --output-signature ("WARNING: --output-signature is deprecated when
+          # using --new-bundle-format and will be ignored"), then tries to write
+          # the bundle to an empty --bundle path and dies with
+          # "create bundle file: open : no such file or directory". Name the
+          # bundle explicitly; verify_release_artifacts.py accepts *.sigstore.
+          cosign sign-blob --yes --bundle dist/checksums.txt.sigstore dist/checksums.txt
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4.2.2
