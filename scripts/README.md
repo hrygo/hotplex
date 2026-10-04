@@ -12,6 +12,7 @@ This directory contains installation and deployment scripts for HotPlex Worker G
 | `uninstall.sh` | Complete uninstallation | `sudo ./scripts/uninstall.sh` |
 | `validate-acpx-spec.sh` | Validate ACPX spec via acpx CLI | `./scripts/validate-acpx-spec.sh` |
 | `verify_worker_native_commands.py` | Run bounded Live probes for four Worker native command paths | `python scripts/verify_worker_native_commands.py` |
+| `ci/select_go_tests.py` | Select the Go packages affected by a change set | `python scripts/ci/select_go_tests.py --full` |
 | `hotplex.service` | Systemd service unit | Install via `install.sh` |
 
 ## Installation Scripts
@@ -255,6 +256,19 @@ python scripts/verify_worker_native_commands.py --worker codex_cli --codex-model
 Exit codes are `0` when every selected Worker passes, `1` for a protocol or
 assertion failure, and `2` when no failure occurs but an environment block is
 present.
+
+### ci/select_go_tests.py
+
+Computes the reverse dependency closure over runtime, internal-test and
+external-test imports. The CI Test job feeds NUL-separated `git diff` paths and
+uses the result for coverage/sharding; packages previously excluded from that
+set are returned separately so they still receive a dedicated test run.
+
+```bash
+python -m unittest discover -s scripts/ci -p 'test_*.py' -v
+git diff --name-only -z origin/main...HEAD |
+  python scripts/ci/select_go_tests.py --repo-root .
+```
 
 **What it validates:**
 

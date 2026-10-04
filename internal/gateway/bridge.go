@@ -96,13 +96,14 @@ type Bridge struct {
 	// for workers that lack mid-turn support (acp/ocs fallback). PendingBuffer
 	// has its own internal mu, so no separate guard here. Initialized in
 	// NewBridge; nil-safe proxy methods (BufferPending/ClearPending/...).
-	pending        *PendingBuffer
-	replayer       PendingReplayer // late-injected (Bridge built before Handler)
-	replayMu       sync.Mutex
-	replayWG       sync.WaitGroup
-	replayClosed   bool
-	supplementGate sync.RWMutex
-	replayFences   [64]sync.RWMutex // fixed stripes; serialize replay/supplement with reset/terminate
+	pending         *PendingBuffer
+	replayer        PendingReplayer // late-injected (Bridge built before Handler)
+	queueDispatcher QueueDispatcher // late-injected durable queue dispatcher
+	replayMu        sync.Mutex
+	replayWG        sync.WaitGroup
+	replayClosed    bool
+	supplementGate  sync.RWMutex
+	replayFences    [64]sync.RWMutex // fixed stripes; serialize replay/supplement with reset/terminate
 
 	crashTracker   map[string]*crashHistory // per-session crash loop detection
 	crashTrackerMu sync.Mutex
@@ -121,6 +122,18 @@ type Bridge struct {
 	workerRuns     sync.Map            // sessionID -> workerRunBinding; updated on each successful attach
 	turnTTFT       *turnTTFTTracker
 
+	// cfgProvider returns the live config snapshot for runtime-plan resolution
+	// (#946 D2). Nil means plan resolution runs with no config snapshot, which
+	// the plan's coverage flags record honestly rather than treating as a
+	// complete plan. Injected because the Bridge is built before the config
+	// store hot-reload machinery is wired.
+	cfgProvider func() *config.Config
+
+	// sharedRuntime refuses an authoritative launch whose process-scoped
+	// profile conflicts with the one a shared-process Worker is already
+	// running under (#946 D3). Nil-safe via the zero value.
+	sharedRuntime *sharedRuntimeGuard
+
 	// catalogInvalidate is invoked on every Worker attach so the session's
 	// command catalog is refreshed (spec §5.2, §8.7). Late-injected via
 	// SetCatalogInvalidator because the Handler (which owns the catalog
@@ -135,6 +148,17 @@ type workerRunBinding struct {
 	worker    worker.Worker
 	id        string
 	lifecycle *workerRunLifecycle
+	// launchPlan is the plan this run was actually launched under (#946 D2).
+	// It is captured at bind time and never recomputed, so a diagnostic can
+	// report the run's historical plan instead of re-resolving against the
+	// current config and passing the result off as what actually ran.
+	//
+	// It is a POINTER on purpose: workerRunBinding values are stored in a
+	// sync.Map and removed with CompareAndDelete, which compares the whole
+	// struct. An embedded launchPlan would carry slices and make the binding
+	// uncomparable, so every run teardown would panic at runtime. The pointer
+	// also avoids copying the plan on each store.
+	launchPlan *launchPlan
 }
 
 // workerRunLifecycle is private to one local Worker wrapper/process run. It
@@ -266,6 +290,7 @@ func NewBridge(deps BridgeDeps) *Bridge {
 		repairer:             deps.Repairer,
 		turnTTFT:             newTurnTTFTTracker(),
 		pending:              NewPendingBuffer(),
+		sharedRuntime:        newSharedRuntimeGuard(),
 	}
 	b.mcpConfigJSON.Store(deps.MCPConfigJSON)
 	b.defaultPermissionMode.Store(worker.NormalizePermissionMode(deps.DefaultPermissionMode))
@@ -365,6 +390,51 @@ type PendingReplayer interface {
 // leaves done-time replay disabled (supplements buffered but not replayed).
 func (b *Bridge) SetPendingReplayer(r PendingReplayer) { b.replayer = r }
 
+// QueueDispatcher promotes a session's durable input queue once the active gate
+// releases. It is late-injected for the same reason as the replayer: the
+// Bridge is built before the Handler.
+type QueueDispatcher interface {
+	DispatchQueued(ctx context.Context, sessionID string)
+	// ClearSessionQueue settles every undispatched input for a session. /reset
+	// calls it because a reset establishes a new conversation context: a queue
+	// belonging to the abandoned one must never dispatch into the new one.
+	ClearSessionQueue(ctx context.Context, sessionID string) (int64, error)
+}
+
+// SetQueueDispatcher late-injects the durable queue dispatcher. Nil leaves the
+// queue undispatched, which is one reason the queue itself is off by default.
+func (b *Bridge) SetQueueDispatcher(d QueueDispatcher) { b.queueDispatcher = d }
+
+// dispatchQueued wakes the durable queue for one session. It runs ASYNC for
+// the same reason replayPending does: it is called while the forwarding path
+// holds a seq lease, and the delivery path re-enters that barrier.
+func (b *Bridge) dispatchQueued(ctx context.Context, sessionID string) {
+	if b.queueDispatcher == nil || b.closed.Load() || sessionID == "" {
+		return
+	}
+	b.replayMu.Lock()
+	if b.replayClosed {
+		b.replayMu.Unlock()
+		return
+	}
+	b.replayWG.Add(1)
+	b.replayMu.Unlock()
+
+	go func() {
+		defer b.replayWG.Done()
+		fence := b.replayFence(sessionID)
+		fence.RLock()
+		defer fence.RUnlock()
+		b.queueDispatcher.DispatchQueued(ctx, sessionID)
+	}()
+}
+
+// SetConfigProvider wires the live config snapshot used to resolve the runtime
+// plan at launch (#946 D2). Called once during gateway init, after the config
+// store exists. Nil clears the provider; plan resolution then runs with no
+// config snapshot and reports the resulting coverage gap honestly.
+func (b *Bridge) SetConfigProvider(fn func() *config.Config) { b.cfgProvider = fn }
+
 // SetCatalogInvalidator registers the callback invoked on every Worker attach
 // (StartSession / ResumeSession / StartFreshWorker / crash-recovery fresh
 // start), so the session-scoped command catalog is invalidated and its
@@ -446,6 +516,7 @@ func (b *Bridge) ClearAllPending() {
 func (b *Bridge) HandleRepairSuccess(intent execution.RepairIntent) {
 	if intent.Kind == execution.RepairRuntime && intent.SessionID != "" {
 		b.replayPending(intent.SessionID)
+		b.dispatchQueued(context.Background(), intent.SessionID)
 	}
 }
 
@@ -625,6 +696,7 @@ func (b *Bridge) startPreparedSession(ctx context.Context, p worker.SessionStart
 		forwardOpts:        &forwardOpts{workDir: p.WorkDir},
 		injectExclude:      p.InjectExclude,
 		workspaceOverrides: b.resolveWorkspaceOverrides(ctx, p.WorkspaceID),
+		facts:              launchFactsForStart(&p),
 	},
 		func(ctx context.Context, w worker.Worker, info worker.SessionInfo) error {
 			if err := w.Start(ctx, info); err != nil {
@@ -743,6 +815,7 @@ func (b *Bridge) StartFreshWorker(ctx context.Context, sessionID string) (string
 		botName:            si.BotName,
 		forwardOpts:        &opts,
 		workspaceOverrides: b.resolveWorkspaceOverrides(ctx, si.WorkspaceID),
+		facts:              launchFactsFor(si),
 	}, func(ctx context.Context, w worker.Worker, info worker.SessionInfo) error {
 		if err := w.Start(ctx, info); err != nil {
 			return fmt.Errorf("bridge: start fresh worker: %w", err)
@@ -827,6 +900,7 @@ func (b *Bridge) resumeWithOpts(ctx context.Context, id, workDir string, opts fo
 		botName:            si.BotName,
 		forwardOpts:        &opts,
 		workspaceOverrides: b.resolveWorkspaceOverrides(ctx, si.WorkspaceID),
+		facts:              launchFactsFor(si),
 	},
 		func(ctx context.Context, w worker.Worker, info worker.SessionInfo) error {
 			if si.State != events.StateRunning {
@@ -1051,13 +1125,39 @@ func (b *Bridge) ResetSession(ctx context.Context, sessionID string) error {
 	if b.pending != nil {
 		b.pending.Clear(sessionID)
 	}
+	if b.queueDispatcher != nil {
+		if _, err := b.queueDispatcher.ClearSessionQueue(context.WithoutCancel(ctx), sessionID); err != nil {
+			b.log.Warn("gateway: reset could not clear queued inputs",
+				"session_id", sessionID, "err", err)
+		}
+	}
 	workerRunID := ""
 	var replacementBinding workerRunBinding
 	if result.ConnReplaced {
 		if b.sm.GetWorker(sessionID) != w {
 			return fmt.Errorf("bridge: reset worker changed before run binding")
 		}
-		replacementBinding = b.bindWorkerRun(sessionID, w, "")
+		// A reset replaces the CONNECTION, not the process: no new Worker was
+		// launched, so re-resolving the plan here would claim this run was
+		// launched under a config it never saw. The previous run's plan is
+		// carried forward as the historical fact, and the carry is logged so a
+		// later diagnostic does not mistake it for a fresh resolution.
+		carried := launchPlan{SessionID: sessionID}
+		if suspendedBinding.launchPlan != nil {
+			carried = *suspendedBinding.launchPlan
+		}
+		if carried.Fingerprint == "" {
+			// The previous run predates plan capture (or was bound before this
+			// code shipped, e.g. a binding made by a test). Drop the partial
+			// value rather than keeping a half-populated plan that would read
+			// like "resolved and empty".
+			carried = launchPlan{SessionID: sessionID}
+		}
+		replacementBinding = b.bindWorkerRun(sessionID, w, "", carried)
+		b.log.Debug("bridge: reset carried the previous launch plan forward",
+			"session_id", sessionID,
+			"plan_fingerprint", carried.Fingerprint,
+			"worker_type", carried.WorkerType)
 		workerRunID = replacementBinding.id
 	} else if bindingSuspended {
 		b.restoreWorkerRun(sessionID, suspendedBinding)
@@ -1520,6 +1620,15 @@ func (b *Bridge) buildWorkerInfo(sessionID, userID, workDir string, si *session.
 		PermissionMode:  permissionMode,
 		// TODO: platform adapters (Slack/Feishu) need to populate ForkSession/JSONSchema
 		// into PlatformKey for this wiring to take effect; tracked in UX follow-up.
+	}
+
+	// Environment profile (#946 E). Read from the LIVE config on every launch
+	// so a hot-reload takes effect at the next start rather than being frozen
+	// at gateway boot. Shared-process Workers take their profile from their own
+	// worker config instead — there is no per-session environment to describe.
+	if cfg := b.currentConfig(); cfg != nil {
+		info.EnvProfile = cfg.Worker.EnvProfile
+		info.EnvAllowKeys = cfg.Worker.EnvAllowKeys
 	}
 
 	// MCP config injection — 3 scenarios:

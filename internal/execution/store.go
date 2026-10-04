@@ -6,6 +6,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // Status is the durable delivery state of an input execution.
@@ -24,6 +25,13 @@ const (
 type RuntimeStatus string
 
 const (
+	// RuntimeQueued is accepted, durable, and NOT yet handed to a worker. It
+	// holds no owner lease and occupies no active slot, so a session with a
+	// backlog still presents exactly one active execution to the dispatcher.
+	// Recovery treats it as safely resumable; pending/running never are,
+	// because those already crossed the dispatch boundary where a lost
+	// response becomes unknown plus a fence.
+	RuntimeQueued    RuntimeStatus = "queued"
 	RuntimePending   RuntimeStatus = "pending"
 	RuntimeRunning   RuntimeStatus = "running"
 	RuntimeCompleted RuntimeStatus = "completed"
@@ -66,6 +74,26 @@ type FenceActionRequest struct {
 	Decision             FenceDecision
 }
 
+// ListFilter bounds one operator-console query over execution records. Every
+// field is optional and they combine with AND.
+//
+// The zero value is NOT a valid unbounded query: Limit<=0 means "use the store
+// default", so a caller cannot accidentally ask for every execution ever
+// recorded. The cursor is (BeforeCreatedAt, BeforeExecutionID) so pagination
+// stays stable while new executions arrive.
+type ListFilter struct {
+	SessionID      string
+	DeliveryStatus Status
+	RuntimeStatus  RuntimeStatus
+	// SinceMs/UntilMs bound created_at (inclusive lower, exclusive upper).
+	SinceMs int64
+	UntilMs int64
+	// BeforeCreatedAt/BeforeExecutionID form the keyset cursor.
+	BeforeCreatedAt   int64
+	BeforeExecutionID string
+	Limit             int
+}
+
 var (
 	// ErrNotFound means the execution does not exist.
 	ErrNotFound = errors.New("execution: record not found")
@@ -89,6 +117,33 @@ var (
 	// (another operator or gateway instance acted first). The caller must
 	// re-inspect; the store never auto-retries.
 	ErrFenceConflict = errors.New("execution: fence version conflict")
+	// ErrQueueFull means a bounded queue limit would be exceeded. The store
+	// refuses the input instead of evicting something already accepted:
+	// dropping an acknowledged input to make room for a new one turns a
+	// durable promise into a silent loss.
+	ErrQueueFull = errors.New("execution: input queue is full")
+	// ErrQueuePayloadTooLarge means one payload exceeds the per-item byte
+	// bound. It is reported separately from ErrQueueFull because the fix is to
+	// send less, not to retry later.
+	ErrQueuePayloadTooLarge = errors.New("execution: queued payload exceeds the size limit")
+	// ErrQueueNotQueued means the execution is not an undispatched queue item,
+	// so a queued cancel cannot apply. It is a conflict, not a failure: the
+	// input already crossed the dispatch boundary and is governed by the
+	// unknown / fence rules instead.
+	ErrQueueNotQueued = errors.New("execution: execution is not queued")
+	// ErrQueueLifecycleStale means the queue entry belongs to an older session
+	// lifecycle than the dispatcher holds. Dispatching it would resurrect a
+	// turn from before a /reset or a delete.
+	ErrQueueLifecycleStale = errors.New("execution: queue entry is from an older session lifecycle")
+	// ErrQueueHeadMoved means another dispatcher claimed or settled the queue
+	// head between the caller reading it and claiming it. The caller must
+	// re-read and re-validate rather than dispatching an item it never checked.
+	ErrQueueHeadMoved = errors.New("execution: queue head changed since it was read")
+	// ErrPayloadContentUnavailable means a queued input's content is gone even
+	// though its control row survived. It is reported separately from
+	// ErrNotFound because the input is still recorded as recoverable, and the
+	// honest response is to settle it rather than dispatch an empty turn.
+	ErrPayloadContentUnavailable = errors.New("execution: queued payload content unavailable")
 )
 
 // Record is the secret-free durable representation of an input delivery.
@@ -212,6 +267,19 @@ type Store interface {
 	// default; offset supports pagination.
 	ListFences(ctx context.Context, sessionID string, limit, offset int) ([]*Record, error)
 
+	// ByID returns one execution record. The console's detail view needs a
+	// single historical run, and every session-scoped accessor here answers a
+	// question about "now" — which is exactly what a timeline must not do.
+	// Returns ErrNotFound when the execution does not exist.
+	ByID(ctx context.Context, executionID string) (*Record, error)
+
+	// ListRecent returns executions newest-first under a bounded filter, for
+	// the operator console's list view. Every field is optional; the caller is
+	// responsible for bounding Limit, because an unbounded list of every
+	// execution ever recorded is not something this method should be able to
+	// return by accident.
+	ListRecent(ctx context.Context, filter ListFilter) ([]*Record, error)
+
 	// RenewLeases batch-renews all pending/running executions owned by ownerID,
 	// extending lease_until to now + ttl. Returns the number of renewed records.
 	// No-op when the owner has no active executions.
@@ -226,4 +294,72 @@ type Store interface {
 	// TerminateOwnerLeases marks all active (pending/running) executions owned by
 	// ownerID as unknown with a fence_reason. Used during graceful shutdown.
 	TerminateOwnerLeases(ctx context.Context, ownerID, reason string) (int64, error)
+
+	// AcceptQueued durably accepts an input into the bounded persistent queue
+	// with runtime status queued. The canonical execution row, the queue row
+	// and every capacity check commit in one transaction, so a returned record
+	// is already durable and already known to be within bounds.
+	//
+	// The same (session_id, client_message_id) key with the same payload hash
+	// returns the existing record with duplicate=true; with a different hash it
+	// returns ErrPayloadConflict. Capacity pressure returns ErrQueueFull rather
+	// than evicting anything.
+	AcceptQueued(ctx context.Context, request QueuedRequest, limits QueueLimits) (
+		record *Record, entry *QueueEntry, duplicate bool, err error)
+
+	// QueueByExecution returns the scheduling state of one queued input, or
+	// ErrNotFound when that execution is not queued (including after it has
+	// been dispatched, cancelled or expired).
+	QueueByExecution(ctx context.Context, executionID string) (*QueueEntry, error)
+
+	// QueuePayload returns the content a dispatcher needs to deliver a queued
+	// input. ErrPayloadContentUnavailable means the control row exists but its
+	// content does not, which must be settled rather than dispatched empty.
+	QueuePayload(ctx context.Context, executionID string) (*QueuedPayload, error)
+
+	// QueueBySession returns a session's undispatched inputs in dispatch order.
+	// limit<=0 uses the store default.
+	QueueBySession(ctx context.Context, sessionID string, limit int) ([]*QueueEntry, error)
+
+	// QueuedByClientMessage returns the execution record for one queued input
+	// identified by the client's own message ID, or ErrNotFound when no queued
+	// input carries that key. It exists so a retried submission can be answered
+	// with the durable record it already has instead of a weaker synthetic one.
+	QueuedByClientMessage(ctx context.Context, sessionID, clientMessageID string) (*Record, error)
+
+	// QueueDepth returns the number of undispatched inputs across the instance.
+	// It is read from the queue itself rather than from a maintained counter,
+	// so no delete path can leak capacity by forgetting to report.
+	QueueDepth(ctx context.Context) (int64, error)
+
+	// ClaimQueued promotes the session's queue head to pending and takes the
+	// owner lease, in one transaction. That transition is the dispatch
+	// boundary: past it, a lost response is unknown plus a fence, never a
+	// silent resend.
+	//
+	// ErrNotFound means the queue is empty, ErrSessionBusy means the single
+	// active slot is taken (the item stays queued for a later attempt), and
+	// ErrQueueLifecycleStale means the item belongs to a superseded lifecycle.
+	ClaimQueued(ctx context.Context, request ClaimQueuedRequest) (*Record, *QueueEntry, error)
+
+	// CancelQueued settles one undispatched input as failed with the given
+	// bounded reason (QUEUE_CANCELLED, QUEUE_EXPIRED, ...). It refuses with
+	// ErrQueueNotQueued once the item has been dispatched: pretending a running
+	// input never ran would be a lie, so the caller must use the ordinary stop
+	// path instead.
+	CancelQueued(ctx context.Context, executionID, reason string) (*Record, error)
+
+	// ClearQueue settles every undispatched input for a session. It is what
+	// /reset and session delete call: a queue belonging to a turn the user
+	// abandoned must not dispatch afterwards. Returns the number settled.
+	ClearQueue(ctx context.Context, sessionID, reason string) (int64, error)
+
+	// ExpireQueued settles undispatched inputs whose TTL has elapsed, oldest
+	// first, up to limit. A queued input that waited longer than its bound is
+	// no longer what the user asked for, so it is settled rather than sent.
+	ExpireQueued(ctx context.Context, now time.Time, limit int) ([]*Record, error)
+
+	// QueueDepthBySession returns the number of undispatched inputs for one
+	// session.
+	QueueDepthBySession(ctx context.Context, sessionID string) (int64, error)
 }

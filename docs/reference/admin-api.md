@@ -54,8 +54,8 @@ admin:
 | `stats:read` | - | - | 🟢 Read | - | - | - | `GET /admin/stats`<br>`GET /admin/metrics`<br>`GET /admin/sessions/pool` |
 | `config:read` | - | - | - | 🟢 Read | - | - | `POST /admin/config/validate` |
 | `config:write` | - | - | - | 🟠 Write | - | - | `POST /admin/config/rollback` |
-| `runtime:read` | - | - | - | - | - | - | `GET /admin/executions/fences`<br>`GET /admin/sessions/{id}/runtime-plan`（需与 `session:read` 同时持有） |
-| `runtime:write` | - | - | - | - | - | - | `POST /admin/executions/{id}/fence-action` |
+| `runtime:read` | - | - | - | - | - | - | `GET /admin/executions`<br>`GET /admin/executions/{id}/timeline`<br>`GET /admin/executions/fences`<br>`GET /admin/effects`<br>`GET /admin/effects/{id}`<br>`GET /admin/sessions/{id}/runtime-plan`（需与 `session:read` 同时持有） |
+| `runtime:write` | - | - | - | - | - | - | `POST /admin/executions/{id}/fence-action`<br>`POST /admin/executions/{id}/queue-cancel`<br>`POST /admin/sessions/{id}/queue-clear`<br>`POST /admin/effects/{id}/action` |
 | `admin:read` | - | - | - | - | 🟢 Read | 🟢 Read | `GET /admin/logs`<br>`GET /admin/debug/...`<br>`GET /admin/bots`<br>`GET /admin/cron/jobs` |
 | `admin:write` | - | - | - | - | - | 🟠 Write | `POST/PATCH/DELETE /admin/cron/jobs`<br>`POST /admin/cron/jobs/{id}/run` |
 
@@ -105,6 +105,7 @@ Rate Limit 和 IP Whitelist 支持配置热重载，无需重启生效。
 | Audit | `audit.identity_link.create` / `audit.identity_link.delete` |
 | Config | `config.rollback` / `config.validate` |
 | Runtime Fence（#877） | `runtime.fence.action`（middleware slog，decision 无关）<br>`runtime.fence.resolve` / `runtime.fence.abandon`（`user_activity` 行，含 reason/evidence_ref） |
+| Runtime Effect | `runtime.effect.action`（middleware slog，decision 无关）<br>`runtime.effect.abandon` / `runtime.effect.mark_delivered` / `runtime.effect.requeue`（`user_activity` 行，含 reason/evidence_ref；永不记录消息正文） |
 | 多租户成员/邀请 | `member.status.update` / `invitation.create` / `invitation.delete` |
 | 认证拒绝 | `auth.denied` |
 
@@ -154,9 +155,49 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 | 方法 | 路径 | Scope | 说明 |
 |------|------|-------|------|
+| GET | `/admin/executions` | `runtime:read` | 执行控制台列表：按键集游标分页的有界 execution 页 |
+| GET | `/admin/executions/{id}/timeline` | `runtime:read` | 单次 execution 的有界、脱敏时间线与可用动作 |
 | GET | `/admin/executions/fences` | `runtime:read` | 列出阻塞新输入的 fenced executions |
 | POST | `/admin/executions/{id}/fence-action` | `runtime:write` | 应用 operator 决策（resolve/abandon），以 fence_version 为条件 |
+| POST | `/admin/executions/{id}/queue-cancel` | `runtime:write` | 撤销一条**尚未派发**的排队输入；已派发返回 `409` |
+| POST | `/admin/sessions/{id}/queue-clear` | `runtime:write` | 撤销该 session 全部尚未派发的排队输入 |
 | GET | `/admin/sessions/{id}/runtime-plan` | `runtime:read` + `session:read` | 会话的 desired-state plan（redacted）与 observed bootstrap 摘要 |
+| GET | `/admin/effects` | `runtime:read` | 列出外部交付 effect 及其生命周期状态 |
+| GET | `/admin/effects/{id}` | `runtime:read` | 单个 effect 及其逐次发送尝试历史 |
+| POST | `/admin/effects/{id}/action` | `runtime:write` | 对不确定交付应用 operator 决策（abandon/mark_delivered/requeue），以 `expected_status` 为条件 |
+
+**执行控制台（#868）** — 两个只读端点，把一次运行的事实按阶段拼成一条时间线。它们**不做决策**：真正的动作仍在 fence、queue、effect 端点上，控制台只展示服务端按当前状态和版本计算出的可选项。
+
+**GET /admin/executions** — 按 `created_at DESC, execution_id DESC` 返回一页 execution。参数：`session_id`、`delivery_status`、`runtime_status`、`since_ms`、`until_ms`、`limit`（默认 50，上限 100）、`before_created_at` + `before_execution_id`（键集游标）。响应 `{"executions": [...], "next_cursor": {...} | null}`。
+
+分页使用**键集游标而非 OFFSET**：有新 execution 写入时，OFFSET 窗口会整体位移，导致某页静默跳过或重复记录。`limit` 超过上限返回 `400` 而不是静默截断——被悄悄削小的请求看起来和被满足了一样。列表项为无内容投影：`execution_id`、`session_id`、`delivery_status`、`runtime_status`、`runtime_error_code`、`worker_run_id`、`fence_reason`、`fence_version`、各类时间戳。
+
+**GET /admin/executions/{id}/timeline** — 一次 execution 的历史投影。参数：`since_ms`、`until_ms`（窗口上限 7 天，超出返回 `400`）。响应：
+
+| 字段 | 说明 |
+|------|------|
+| `execution` | 与列表同款的窄投影 |
+| `items[]` | 时间线条目：`phase`、`source`（`execution_store` / `event_store` / `effect_store`）、`kind`、`fact_time`、`observed_at`、`worker_run_id`、`effect_id`、`evidence`、`evidence_state`、`truncated` |
+| `actions[]` | **服务端**按当前状态计算出的可用动作，含 `requires_version` 条件令牌 |
+| `plan_evidence` | 启动计划的证据状态，见下 |
+| `effect_evidence` | 外部交付的证据状态 |
+| `truncated` / `notes[]` | 是否被截断，以及为什么（`notes` 是**稳定代码**而非句子，便于各语言渲染） |
+
+三条硬约束：
+
+- **有界**：每个来源单次有界读取，事件上限 200、effect 上限 50；被截断时 `truncated=true` 并在 `notes` 中说明，而不是静默返回前 N 条。
+- **历史**：`plan_evidence` 通常是 `not_recorded_for_this_run`。启动计划按 session 记录**当前 run**，历史 execution 没有对应快照；用 session 现在的计划顶替等于改写历史，因此这里如实标注缺失。
+- **无内容**：事件只投影类型、方向、来源与时间，`Data` 永不过界——AEP 载荷可能携带 assistant 正文或 tool 参数。
+
+`fact_time` 与 `observed_at` 分开保留：延迟到达的事实（effect 回执、晚到的 done）两者本就不同，合并会掩盖 operator 正在排查的延迟。
+
+`notes[]` 取值为固定代码：`events_unavailable`、`events_not_configured`、`events_truncated`、`effects_unavailable`、`effects_not_configured`、`effects_truncated`、`no_delivery_planned`。**不返回英文散文**：客户端要用自己的语言渲染，且同一字符串在两次运行之间必须含义一致。遇到未知代码应原样显示，而不是丢弃。
+
+Agent 完成、提供方接受与外部可核验是**分开的条目**：一个 `runtime=completed` 的 execution 和一条 `status=unknown` 的交付在时间线上是两条独立事实。
+
+可用动作只有三类：`fence_resolve` / `fence_abandon`（带 `fence_version` 条件）、`queue_cancel`（仅 `runtime=queued`）、`effect_abandon` / `effect_mark_delivered` / `effect_requeue`（仅 `status=unknown` 的交付）。**任何状态都不提供「强制成功」**。UI 只渲染服务端返回的列表，不自行判断哪个可重试。
+
+错误码：`400 BAD_REQUEST`（筛选或窗口非法）/ `403 INSUFFICIENT_SCOPE` / `404 EXECUTION_NOT_FOUND` / `503 SERVICE_UNAVAILABLE`（控制台未接线）。
 
 **GET /admin/executions/fences** — 列出运行时结局不明（runtime unknown）并触发 fence 的 execution。fenced execution 会阻塞同 session 的新输入，直至 operator 决策。
 
@@ -179,7 +220,48 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 错误码：`400 BAD_REQUEST`（字段校验）/ `403 INSUFFICIENT_SCOPE` / `404 FENCE_NOT_FOUND` / `409 FENCE_CONFLICT` / `503 SERVICE_UNAVAILABLE`（store 未配置或超时）。收到 409 必须重新 inspect 当前 fence 状态后审慎重试 —— 并发 operator 或 inspect 与 action 之间的网关重启都会触发冲突，服务端不自动重试。`abandon` 成功后 best-effort 通知在线连接终态。
 
+**持久输入队列端点** — 队列里的输入是网关对客户端已经许下的承诺：「已存下，稍后派发」。这两个入口让 operator 在**还能撤回的时候**撤回它。跨过派发边界之后就不一样了：那条输入已经是一次正在运行的 execution，停止它属于另一件事，冒充成「已取消」只会让 operator 以为自己撤销了一次从未发生的操作。
+
+**POST /admin/executions/{id}/queue-cancel** — 撤销单条尚未派发的排队输入。请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|:---:|------|
+| `reason` | string | ✅ | operator 理由，1–512 字符；仅进入审计层，队列与 execution store 永不保存 |
+| `evidence_ref` | string | - | 工单/run 引用指针，≤256 字符；仅指针，不允许内联输入内容 |
+
+成功返回 `{"execution_id": "...", "cancelled": true}`。若该输入已跨过派发边界（正在运行、已结束或已被fence），返回 `409 INPUT_NOT_QUEUED`，并提示改用 stop —— 服务端不会为一次没有发生的取消返回 200。
+
+**POST /admin/sessions/{id}/queue-clear** — 撤销该 session 全部尚未派发的排队输入，请求体同上。成功返回 `{"session_id": "...", "cleared": N}`，`N` 为实际结算条数。队列为空是**成功的 no-op**（`cleared: 0`），与清除失败不同：后者返回 `503`，绝不以 `cleared: 0` 冒充「已确认队列为空」。正在运行或已派发的轮次不受影响。
+
+两个端点都需要 `runtime:write`。actor 取自鉴权上下文，绝不来自请求体。错误码：`400 BAD_REQUEST` / `403 INSUFFICIENT_SCOPE` / `409 INPUT_NOT_QUEUED` / `503 SERVICE_UNAVAILABLE`（dispatcher 未配置或超时）。队列默认关闭；关闭时这两个端点报告「没有可撤销的输入」，而不是伪造一次取消。
+
 **GET /admin/sessions/{id}/runtime-plan** — 返回会话的 EffectiveRuntimePlan 诊断投影（#946 spec §6.6）：`plan`（redacted view：plan hash、worker_type、permission/sandbox 摘要、env key **名称**、source refs、warnings、blocked codes）与 `observed`（bootstrap 状态：`planned` / `unknown` / `declared` 及 permission ceiling）。投影由会话持久化事实 + 当前 config 按需计算，无 plan 表、无第二份持久化真相；blocked plan 返回 200 并携带 bounded 拦截原因与空 `plan_hash`（blocked 是有效诊断载荷，不是 HTTP 错误）。响应永不包含 prompt、完整命令、model、工具清单或任何值内容。
+
+响应另含两个**来源标记**，用于区分「历史事实」与「当前试算」：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `from_launch` | bool | `true` = `plan` 是该会话**当前 run 实际启动时所用**的计划（取自 run 绑定时捕获的快照）；`false` = `plan` 是按**当前 config 重新试算**的结果。两者回答的是不同问题：前者是「这次运行当时用什么启动」，后者是「现在启动会用什么」。config 在 run 启动后被修改时，这个差别最关键 |
+| `plan_applied` | bool | `true` = 该 run **确实由计划驱动启动**（authoritative rollout 命中）；`false` = 仅做了 shadow 对比。注意：计划与实际启动参数**恰好一致**并不等于 `plan_applied=true`——一致性是观察结果，applied 是事实 |
+
+`observed.state` 只在存在真实 launch 时才会高于 `planned`：没有记录到 launch 的会话一律返回 `planned`，即使它看起来处于 active。把自己知识的缺口说成运行时的状态（「unknown」）是不诚实的。
+
+**外部交付 effect 端点** — 交付 effect 是一次「已向外部渠道投递」的独立事实，与 execution fence 是**两套不相交的 operator 入口**：fence 回答「这次运行还能否接收新输入」，effect 回答「这条消息到底送没送出去」。共用一个端点会让 fence 决策悄悄改写交付历史，或让交付决策解开一个被 fence 的运行。
+
+**GET /admin/effects** — 分页列出交付 effect。参数：`status`（按交付状态过滤）、`limit`（默认 100，上限 500）、`offset`。返回 `{"effects": [...], "limit": N, "offset": N}`。列表项为刻意收窄的无内容投影：`effect_id`、`occurrence_id`、`session_id`、`execution_id`、`delivery_status`、`target_kind`、`target_ref`、`attempt`、`error_code`、`reason`、`provider_ref`、`evidence_ref`、`lease_version`、`created_at`、`updated_at` —— 不含消息正文、payload、凭证或任何由用户内容派生的字段。
+
+**GET /admin/effects/{id}** — 返回 `{"effect": {...}, "attempts": [...]}`，attempts 按发送次序给出每次尝试实际建立了什么：`attempt`、`owner_instance_id`、`lease_version`、`started_at`、`finished_at`、`in_flight`、`outcome`、`rejection_class`、`provider_ref`、`error_code`、`reason`。**lease token 是写凭据，永不投影**；正文与 tool args 同样不返回。`in_flight: true` 表示该次尝试的租约仍有效，不表示消息已送达。
+
+**POST /admin/effects/{id}/action** — 对不确定交付的人工决策入口。请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|:---:|------|
+| `decision` | string | ✅ | `abandon`（放弃这笔交付，置 failed）/ `mark_delivered`（operator 依据外部证据确认已送达）/ `requeue`（允许再次发送，产生新的 attempt，**不产生新的 effect**） |
+| `expected_status` | string | ✅ | 必须是 `unknown`：只有结局不明的交付才接受人工决策，其余状态一律 `400` |
+| `reason` | string | ✅ | operator 理由，1–512 字符；进入审计层与 effect 的 operator 归因字段，绝不冒充 provider 说法 |
+| `evidence_ref` | string | - | 工单/run 引用指针，≤256 字符；仅指针，不允许内联消息内容 |
+
+actor 取自鉴权上下文（`ActorFromRequest`），**绝不来自请求体**。错误码：`400 BAD_REQUEST` / `403 INSUFFICIENT_SCOPE` / `404 EFFECT_NOT_FOUND` / `409 EFFECT_CONFLICT` / `503 SERVICE_UNAVAILABLE`（effect store 未配置或超时）。收到 409 必须重新 inspect 后再决定 —— 并发 operator 或后台恢复流程已经改动了这笔交付的状态，服务端不自动重试。
 
 ### 监控指标
 
@@ -550,10 +632,14 @@ zip 格式、文件类型白名单与安全约束同上方「Skill 管理（admi
 | 403 | `PERMISSION_DENIED` | 非 admin 试图在 workspace Create/Update 设置或修改 `permission_mode`（admin-only 字段，r3 #804） |
 | 404 | `NOT_FOUND` | Session/Cron Job/Invitation 未找到 |
 | 404 | `WORKSPACE_NOT_FOUND` | workspace id 不存在 |
+| 404 | `EXECUTION_NOT_FOUND` | 控制台时间线目标 execution 不存在 |
 | 404 | `FENCE_NOT_FOUND` | fence-action 目标 execution 不存在 |
+| 404 | `EFFECT_NOT_FOUND` | effect 端点目标 effect 不存在 |
 | 409 | `CONFLICT` | 资源状态冲突 |
 | 409 | `RESTART_REJECTED` | 已有 Gateway 重启事务 |
 | 409 | `FENCE_CONFLICT` | fence_version 条件更新失败；重新 inspect 后审慎重试，勿自动重试（#877） |
+| 409 | `EFFECT_CONFLICT` | effect 条件更新失败（已不再是 unknown）；重新 inspect 后审慎重试，勿自动重试 |
+| 409 | `INPUT_NOT_QUEUED` | queue-cancel 目标输入已跨过派发边界；改用 stop，服务端不会伪造一次取消 |
 | 409 | `WORKSPACE_VERSION_MISMATCH` | PATCH workspace 乐观并发冲突（`updated_at` CAS 失败，re-fetch 后重试） |
 | 409 | `WORKSPACE_NOT_EMPTY` | workspace 存在活跃会话，拒绝改 `work_dir` / 删除 |
 | 409 | `WORK_DIR_TAKEN` | workspace `work_dir` 已被该 owner 的其他 workspace 占用 |
@@ -603,7 +689,27 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   -d '{"decision":"abandon","expected_fence_version":3,"reason":"worker host lost, verified via run log","evidence_ref":"OPS-1234"}' \
   http://localhost:9999/admin/executions/exec-abc/fence-action
 
+# 列出 execution（键集分页；limit 上限 100）
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9999/admin/executions?limit=50&runtime_status=unknown"
+
+# 打开一次 execution 的时间线（含服务端计算出的可用动作）
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9999/admin/executions/exec-abc/timeline
+
 # 查看会话的 effective runtime plan（#946）
 curl -H "Authorization: Bearer $TOKEN" \
   http://localhost:9999/admin/sessions/abc-123/runtime-plan
+
+# 撤销一条尚未派发的排队输入（已派发返回 409 INPUT_NOT_QUEUED）
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"operator selected the wrong batch","evidence_ref":"OPS-1234"}' \
+  http://localhost:9999/admin/executions/exec-abc/queue-cancel
+
+# 清空某 session 全部尚未派发的排队输入（cleared:0 表示本就为空，不是失败）
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"session intent changed before dispatch"}' \
+  http://localhost:9999/admin/sessions/abc-123/queue-clear
 ```

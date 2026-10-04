@@ -6,6 +6,7 @@ import (
 
 	"github.com/hrygo/hotplex/internal/admin"
 	"github.com/hrygo/hotplex/internal/config"
+	"github.com/hrygo/hotplex/internal/effect"
 	"github.com/hrygo/hotplex/internal/eventstore"
 	"github.com/hrygo/hotplex/internal/execution"
 	"github.com/hrygo/hotplex/internal/gateway"
@@ -183,6 +184,36 @@ func (a *executionProviderAdapter) ApplyFenceDecision(ctx context.Context, reque
 	return a.store.ApplyFenceDecision(ctx, request)
 }
 
+// effectProviderAdapter exposes the delivery ledger to the Admin API for the
+// operator effect console. Pass-through only — the store owns every
+// conditional-update semantic, so the adapter cannot introduce a second way to
+// move an effect.
+type effectProviderAdapter struct {
+	store effect.Store
+}
+
+func (a *effectProviderAdapter) ListForOperator(
+	ctx context.Context, f effect.OperatorListFilter,
+) ([]*effect.Effect, error) {
+	return a.store.ListForOperator(ctx, f)
+}
+
+func (a *effectProviderAdapter) GetByID(ctx context.Context, effectID string) (*effect.Effect, error) {
+	return a.store.GetByID(ctx, effectID)
+}
+
+func (a *effectProviderAdapter) ListAttempts(
+	ctx context.Context, effectID string,
+) ([]*effect.Attempt, error) {
+	return a.store.ListAttempts(ctx, effectID)
+}
+
+func (a *effectProviderAdapter) ApplyOperatorAction(
+	ctx context.Context, req effect.OperatorActionRequest,
+) (*effect.Effect, error) {
+	return a.store.ApplyOperatorAction(ctx, req)
+}
+
 // runtimeEventNotifier emits the additive runtime.execution.failed event with
 // OPERATOR_ABANDONED after an abandon decision, so connected clients observe
 // the terminal state. Best-effort by contract: fenced sessions rarely have
@@ -205,4 +236,85 @@ func (n *runtimeEventNotifier) NotifyExecutionAbandoned(ctx context.Context, ses
 		ErrorCode:   events.ErrCodeOperatorAbandoned,
 	})
 	_ = n.hub.SendToSession(ctx, env)
+}
+
+// executionConsoleAdapter exposes the read side of the execution store to the
+// operator console (#868). *execution.SQLStore already satisfies the two
+// methods, so this only exists to keep the Admin API coupled to its own narrow
+// interfaces rather than to the whole store.
+type executionConsoleAdapter struct {
+	store execution.Store
+}
+
+func (a *executionConsoleAdapter) ListRecent(
+	ctx context.Context, filter execution.ListFilter,
+) ([]*execution.Record, error) {
+	return a.store.ListRecent(ctx, filter)
+}
+
+func (a *executionConsoleAdapter) ByID(ctx context.Context, executionID string) (*execution.Record, error) {
+	return a.store.ByID(ctx, executionID)
+}
+
+// consoleEventAdapter projects stored events into the content-free shape the
+// console renders.
+//
+// It deliberately drops eventstore.StoredEvent.Data: an AEP payload can carry
+// assistant text, tool arguments or metadata values. Only the type,
+// direction, source and time cross this boundary.
+type consoleEventAdapter struct {
+	store eventStoreProvider
+}
+
+func (a *consoleEventAdapter) RecentEvents(
+	ctx context.Context, sessionID string, limit int,
+) (events []admin.EventFact, hasMore bool, err error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	// Ask for one extra row so "is there more" is a fact rather than a guess.
+	page, err := a.store.QueryBySession(ctx, sessionID, 0, eventstore.CursorLatest, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	if page == nil {
+		return []admin.EventFact{}, false, nil
+	}
+	if len(page.Events) > limit {
+		page.Events = page.Events[:limit]
+		hasMore = true
+	}
+	out := make([]admin.EventFact, 0, len(page.Events))
+	for _, ev := range page.Events {
+		out = append(out, admin.EventFact{
+			Seq:       ev.Seq,
+			Type:      ev.Type,
+			Direction: ev.Direction,
+			Source:    ev.Source,
+			CreatedAt: ev.CreatedAt,
+		})
+	}
+	return out, hasMore, nil
+}
+
+// consoleEffectAdapter returns the bounded external deliveries of one run.
+type consoleEffectAdapter struct {
+	store effect.Store
+}
+
+func (a *consoleEffectAdapter) EffectsForExecution(
+	ctx context.Context, executionID string, limit int,
+) ([]*effect.Effect, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	f := effect.OperatorListFilter{ExecutionID: executionID, Limit: limit + 1}
+	effects, err := a.store.ListForOperator(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	if len(effects) > limit {
+		effects = effects[:limit]
+	}
+	return effects, nil
 }

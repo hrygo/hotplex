@@ -44,6 +44,12 @@ type WorkerSpec struct {
 	Command string
 	// Model is the requested/default model (contract).
 	Model string
+	// ModelSet records that Model was explicitly requested. It is what
+	// separates "the caller asked for this model" from "no model was named",
+	// which a zero-value string cannot express — and it is deliberately NOT
+	// derived from AllowedModels: a whitelist says which models are permitted,
+	// never which one is selected.
+	ModelSet bool
 	// AllowedModels lists models allowed for the session. First-cut does NOT
 	// inject this (finding F1 — injection is a behavior change); contract only.
 	AllowedModels []string
@@ -62,8 +68,15 @@ type PolicySpec struct {
 	SkipPermissions bool
 	// AllowedTools is the tool whitelist; nil = no restriction.
 	AllowedTools []string
+	// AllowedToolsSet records an explicit declaration, including an explicit
+	// CLEAR. A nil slice alone cannot distinguish "inherit" from "allow
+	// nothing", and a mapper that treats nil as inherit silently drops the
+	// second case.
+	AllowedToolsSet bool
 	// DisallowedTools is the tool blacklist; nil = none.
 	DisallowedTools []string
+	// DisallowedToolsSet is the presence counterpart of AllowedToolsSet.
+	DisallowedToolsSet bool
 }
 
 // SandboxSpec captures filesystem/network isolation (codex semantics as the

@@ -37,9 +37,6 @@ on:
 env:
   # TODO: remove after Node 24 becomes the default runtime for GitHub Actions
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # Coverage artifacts are consumed within the same run; 90-day default
-  # retention is excessive when 3 shards land on every push to main.
-  ARTIFACT_RETENTION_DAYS: 7
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -47,39 +44,24 @@ concurrency:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
-  # ── Guard: block large files ────────────────────────────────────────────
-  large-file-guard:
-    name: Large File Guard
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
-
-      - name: Scan for files >1MB
-        run: |
-          OVERSIZED=""
-          while IFS= read -r blob_info; do
-            size=$(echo "$blob_info" | awk '{print $2}')
-            path=$(echo "$blob_info" | awk '{print $3}')
-            case "$path" in
-              assets/*|docs/assets/*|docs/channels/*/guides/*) continue ;;
-            esac
-            if [ "$size" -gt 1048576 ] 2>/dev/null; then
-              OVERSIZED="$OVERSIZED
-            $path ($(( size / 1048576 ))MB)"
-            fi
-          done < <(git ls-tree -r HEAD | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' | awk '$1 == "blob" && $2 > 1048576')
-
-          if [ -n "$OVERSIZED" ]; then
-            echo "::error::Large files (>1MB) detected in HEAD tree:$OVERSIZED"
-            exit 1
-          fi
-          echo "No oversized files in HEAD tree."
+  # The gate itself lives in a reusable workflow so Release can run the exact
+  # same checks against the exact SHA it is about to publish. Keeping a second
+  # copy here is how release and CI drift apart, which is what let an untested
+  # SHA reach the release page in the first place.
+  validate:
+    name: Validate
+    uses: ./.github/workflows/validate.yml
+    with:
+      ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      ref-label: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+      # A PR pays for only what it touched (plus the reverse test-dependency
+      # closure of it); main pays for everything, because that is the state
+      # release would publish from.
+      test-scope: ${{ github.event_name == 'pull_request' && 'affected' || 'full' }}
+      base-sha: ${{ github.event.pull_request.base.sha }}
+      test-shards: ${{ github.event_name == 'pull_request' && '[""]' || '["0","1","2"]' }}
 
   # ── Prune: artifacts consumed within a run, then deleted ───────────────
   # Coverage shards land on every push to main; without active pruning the
@@ -87,9 +69,7 @@ jobs:
   # retention-days upload setting). Delete every artifact whose run has
   # finished. Kept: artifacts of the current run and of any in-progress run
   # (nothing here consumes cross-run artifacts, so this is safe). Runs in
-  # parallel and never blocks CI: during the initial backlog drain the one-by-
-  # one deletion saturates the GITHUB_TOKEN API budget (~1000 req/hr), and
-  # each run simply processes the next batch.
+  # parallel and never blocks CI.
   prune-artifacts:
     name: Prune stale artifacts
     runs-on: ubuntu-latest
@@ -122,10 +102,6 @@ jobs:
             exit 0
           fi
 
-          # Keep artifacts that belong to the current run or to any run still
-          # in progress so concurrent workflows keep their inputs; delete every
-          # artifact from completed runs. Do not limit this to a workflow-
-          # specific name prefix: the Actions storage quota is repository-wide.
           keep_runs="$(jq -r '.workflow_runs[].id' "$runs_file")"
           keep_set="$(printf '%s\n%s\n' "$current_run" "$keep_runs" \
             | sort -n | uniq | tr '\n' ' ')"
@@ -143,441 +119,6 @@ jobs:
                 fi
                 ;;
             esac
-          done < <(jq -sr '[.[].artifacts[]] |
+          done < <(jq -sr '[.[].artifacts[] | select(.expired == false)] |
               .[] | "\(.id)\t\(.workflow_run.id)\t\(.name)"' "$artifacts_file")
           echo "Deleted $deleted stale artifact(s)"
-
-  # ── Test: race + coverage ───────────────────────────────────────────────
-  # On PRs: runs affected packages only (smart scope detection).
-  # On push to main: shards the full suite across 3 parallel runners.
-  test:
-    needs: [large-file-guard]
-    name: ${{ matrix.shard != '' && format('Test (shard {0})', matrix.shard) || 'Test' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ${{ github.event_name == 'push' && fromJSON('["0","1","2"]') || fromJSON('[""]') }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - uses: ./.github/actions/setup-go-webchat
-        with:
-          build-webchat: 'false'
-
-      - name: Determine test scope
-        id: scope
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT_NAME" = "push" ]; then
-            echo "pkgs=." >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          CHANGED=$(git diff --name-only origin/main... | grep '\.go$' || true)
-          if [ -z "$CHANGED" ]; then
-            echo "pkgs=." >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          AFFECTED=""
-          for f in $CHANGED; do
-            dir=$(dirname "$f")
-            full_pkg="github.com/hrygo/hotplex/$dir"
-            AFFECTED="$AFFECTED $full_pkg"
-          done
-
-          AFFECTED=$(echo "$AFFECTED" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
-          if [ -n "$AFFECTED" ]; then
-            echo "pkgs=$AFFECTED" >> "$GITHUB_OUTPUT"
-            echo "Testing affected packages: $AFFECTED"
-          else
-            echo "pkgs=." >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Run tests with race detector + coverage
-        env:
-          SCOPE: ${{ steps.scope.outputs.pkgs }}
-          SHARD: ${{ matrix.shard }}
-        run: |
-          ALL_PKGS=$(go list ./... | grep -v \
-            -e 'internal/worker/proc' \
-            -e 'internal/worker/pi' \
-            -e 'cmd/hotplex' \
-            -e 'e2e')
-
-          if [ "$SCOPE" = "." ]; then
-            TEST_PKGS="$ALL_PKGS"
-          else
-            TEST_PKGS=""
-            for pkg in $ALL_PKGS; do
-              for changed in $SCOPE; do
-                if [ "$pkg" = "$changed" ]; then
-                  TEST_PKGS="$TEST_PKGS $pkg"
-                  break
-                fi
-                # Include packages that import the changed package
-                if go list -f '{{range .Imports}}{{if eq . "'"$changed"'"}}{{.}} {{end}}{{end}}' "$pkg" 2>/dev/null | grep -q "'"$changed"'"; then
-                  TEST_PKGS="$TEST_PKGS $pkg"
-                  break
-                fi
-              done
-            done
-          fi
-
-          if [ -z "$TEST_PKGS" ]; then
-            echo "No test packages affected by this change"
-            printf 'mode: atomic\n' > coverage.out
-            exit 0
-          fi
-
-          # Shard: partition packages round-robin across N shards (push-to-main only)
-          if [ -n "$SHARD" ]; then
-            TOTAL=3
-            IDX=$SHARD
-            TEST_PKGS=$(echo "$TEST_PKGS" | tr ' ' '\n' | grep -v '^$' | awk -v total="$TOTAL" -v idx="$IDX" 'NR % total == idx')
-            echo "Shard $IDX of $TOTAL packages: $TEST_PKGS"
-            if [ -z "$TEST_PKGS" ]; then
-              printf 'mode: atomic\n' > coverage.out
-              exit 0
-            fi
-          fi
-
-          COVERAGE_FILE="coverage.out"
-          [ -n "$SHARD" ] && COVERAGE_FILE="coverage-${SHARD}.out"
-
-          # shellcheck disable=SC2086,SC2046
-          go test -short -race -count=1 -shuffle=on -timeout=10m \
-            -coverprofile="$COVERAGE_FILE" -covermode=atomic $TEST_PKGS
-
-      - name: Display coverage
-        if: always()
-        run: |
-          for f in coverage*.out; do
-            go tool cover -func="$f" 2>/dev/null | tail -1 || true
-            break
-          done
-
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: coverage${{ matrix.shard != '' && format('-{0}', matrix.shard) || '' }}
-          path: coverage*.out
-          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
-
-  # ── Platform × Worker contract matrix ──────────────────────────────────
-  # Keep this deterministic gate independent from the affected-package shard.
-  contract-matrix:
-    needs: [large-file-guard]
-    name: Platform × Worker Contract Matrix
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
-
-      - uses: ./.github/actions/setup-go-webchat
-        with:
-          build-webchat: 'false'
-
-      - name: Run deterministic 12-combination matrix
-        run: |
-          set -o pipefail
-          make test-contract-matrix | tee contract-matrix.log
-
-      - name: Publish matrix summary
-        if: always()
-        run: |
-          grep '^contract matrix:' contract-matrix.log >> "$GITHUB_STEP_SUMMARY" || true
-
-  # ── WebChat browser contract matrix ────────────────────────────────────
-  # This job owns the browser setup and stays independent from Go test shards.
-  webchat-e2e-matrix:
-    needs: [large-file-guard]
-    name: WebChat E2E Contract Matrix
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
-
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11.4.0
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-          cache: pnpm
-          cache-dependency-path: webchat/pnpm-lock.yaml
-
-      - name: Install WebChat dependencies
-        run: pnpm --dir webchat install --frozen-lockfile
-
-      - name: Install Chromium
-        run: pnpm --dir webchat exec playwright install --with-deps chromium
-
-      - name: Run WebChat unit tests
-        run: pnpm --dir webchat test
-
-      - name: Typecheck WebChat
-        run: pnpm --dir webchat exec tsc --noEmit
-
-      - name: Run WebChat browser baseline
-        run: pnpm --dir webchat exec playwright test e2e/chat.spec.ts --project=chromium
-
-      - name: Run WebChat platform-worker matrix
-        run: pnpm --dir webchat test:e2e:matrix
-
-      - name: Upload Playwright artifacts
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: webchat-playwright-report
-          path: |
-            webchat/playwright-report
-            webchat/test-results
-          if-no-files-found: ignore
-          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
-
-  # ── Coverage merge + threshold check (push-to-main only) ────────────────
-  coverage-check:
-    needs: [test]
-    name: Coverage Check
-    runs-on: ubuntu-latest
-    if: always()
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download coverage artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: coverage*
-          path: coverage-data
-          merge-multiple: true
-
-      - name: Merge coverage profiles
-        run: |
-          # Sharded runs (push-to-main): merge coverage-{0,1,2}.out
-          # Single run (PR): use coverage.out directly
-          SHARD_FILES=$(find coverage-data -name 'coverage-*.out' 2>/dev/null | head -1)
-          if [ -n "$SHARD_FILES" ]; then
-            printf 'mode: atomic\n' > coverage.out
-            find coverage-data -name 'coverage-*.out' -exec grep -h -v '^mode:' {} + >> coverage.out
-          else
-            cp coverage-data/coverage.out coverage.out 2>/dev/null || printf 'mode: atomic\n' > coverage.out
-          fi
-          echo "Merged coverage lines: $(wc -l < coverage.out)"
-
-      - name: Check per-package coverage thresholds
-        run: |
-          COV_FILE="coverage.out"
-
-          if [ ! -s "$COV_FILE" ] || [ "$(wc -l < "$COV_FILE")" -le 1 ]; then
-            echo "No coverage data (no affected packages). Skipping thresholds."
-            exit 0
-          fi
-
-          # Per-package thresholds (longest-prefix match wins).
-          declare -A THRESHOLDS
-          THRESHOLDS["internal/security"]=80
-          THRESHOLDS["pkg/events"]=45
-          THRESHOLDS["pkg/aep"]=75
-          THRESHOLDS["internal/gateway/testutil"]=0
-          THRESHOLDS["internal/gateway"]=55
-          THRESHOLDS["internal/session"]=70
-          THRESHOLDS["internal/config"]=70
-          THRESHOLDS["internal/worker/base"]=45
-          THRESHOLDS["internal/worker"]=70
-          THRESHOLDS["internal/worker/claudecode"]=53
-          THRESHOLDS["internal/worker/opencodeserver"]=9
-          THRESHOLDS["internal/worker/noop"]=80
-          THRESHOLDS["internal/worker/acp"]=40
-          THRESHOLDS["internal/messaging/feishu"]=48
-          THRESHOLDS["internal/worker/codexcli"]=51
-          THRESHOLDS["internal/worker/pi"]=0
-          THRESHOLDS["internal/messaging/slack"]=35
-          THRESHOLDS["internal/messaging"]=20
-
-          FAILED=0
-          {
-            echo "## Per-Package Coverage Report"
-            echo "| Package | Coverage | Threshold | Status |"
-            echo "|---------|----------|-----------|--------|"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          # Aggregate all coverage rows in one awk pass. Spawning dirname and
-          # awk for every row made this check exceed its timeout as coverage grew.
-          while IFS=$'\t' read -r PKG TOTAL COVERED; do
-            [ -z "$PKG" ] && continue
-            [ "$TOTAL" -eq 0 ] && continue
-            COV=$(echo "scale=1; $COVERED * 100 / $TOTAL" | bc -l)
-
-            MATCH=""
-            for pattern in "${!THRESHOLDS[@]}"; do
-              if [[ "$PKG" == *"$pattern"* ]]; then
-                if [ -z "$MATCH" ] || [ ${#pattern} -gt ${#MATCH} ]; then
-                  MATCH="$pattern"
-                fi
-              fi
-            done
-
-            if [ -n "$MATCH" ]; then
-              THRESH=${THRESHOLDS[$MATCH]}
-              PASS=$(echo "$COV >= $THRESH" | bc -l)
-              if [ "$PASS" -ne 1 ]; then
-                STATUS=":x: FAIL"
-                FAILED=1
-                echo "::error::Package $PKG coverage ${COV}% is below ${THRESH}% threshold."
-              else
-                STATUS=":white_check_mark: PASS"
-              fi
-              echo "| \`$PKG\` | ${COV}% | ${THRESH}% | $STATUS |" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done < <(
-            awk '
-              NR == 1 { next }
-              {
-                file = $1
-                sub(/:.*/, "", file)
-                if (file ~ /\//) {
-                  sub(/\/[^\/]*$/, "", file)
-                } else {
-                  file = "."
-                }
-                total[file] += $(NF - 1)
-                if ($NF > 0) {
-                  covered[file] += $(NF - 1)
-                }
-              }
-              END {
-                for (package in total) {
-                  printf "%s\t%d\t%d\n", package, total[package], covered[package] + 0
-                }
-              }
-            ' "$COV_FILE" | sort
-          )
-
-          TOTAL_LINE=$(go tool cover -func="$COV_FILE" 2>/dev/null | tail -1 | grep -oE '[0-9]+\.[0-9]+')
-          {
-            echo ""
-            echo "**Total coverage: ${TOTAL_LINE}%** (informational, not gated)"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$FAILED" -ne 0 ]; then
-            echo "::error::One or more packages are below their coverage thresholds."
-            exit 1
-          fi
-          echo "All package coverage thresholds met."
-
-  # ── Build verification ──────────────────────────────────────────────────
-  build:
-    needs: [large-file-guard]
-    name: Build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: ./.github/actions/setup-go-webchat
-
-      - name: Verify + Vet + Build
-        run: go mod verify && go vet ./... && go build ./...
-
-      - name: Verify docs output exists
-        run: test -f internal/docs/out/index.html
-
-      - name: Build gateway binary
-        run: |
-          mkdir -p bin
-          go build -o bin/hotplex ./cmd/hotplex
-
-      - name: Verify binary
-        run: test -x ./bin/hotplex && ./bin/hotplex --help
-
-  # ── Lint (parallel with Test + Build) ───────────────────────────────────
-  lint:
-    needs: [large-file-guard]
-    name: Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: ./.github/actions/setup-go-webchat
-        with:
-          build-webchat: 'false'
-
-      - name: Lint
-        uses: golangci/golangci-lint-action@v9.2.0
-        with:
-          version: v2.11.4
-          args: --timeout=10m
-
-  # ── AEP Schema & Cross-SDK Conformance (issue #869) ────────────────────
-  # Each SDK runs as a parallel job; all depend only on large-file-guard.
-  aep-schema-go:
-    needs: [large-file-guard]
-    name: AEP Schema (Go)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-go-webchat
-        with:
-          build-webchat: 'false'
-      - run: go test ./pkg/aep/schema/... -count=1 -race -v
-
-  aep-schema-typescript:
-    needs: [large-file-guard]
-    name: AEP Conformance (TypeScript)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: examples/typescript-client/package-lock.json
-      - working-directory: examples/typescript-client
-        run: |
-          npm ci
-          npx vitest run tests/conformance
-
-  aep-schema-python:
-    needs: [large-file-guard]
-    name: AEP Conformance (Python)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - working-directory: examples/python-client
-        run: |
-          pip install -e ".[dev]" 2>/dev/null || pip install -e .
-          python -m pytest tests/test_conformance.py -v
-
-  aep-schema-java:
-    needs: [large-file-guard]
-    name: AEP Conformance (Java)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-java@v5
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-      - working-directory: examples/java-client
-        run: |
-          mvn -B test -Dtest="dev.hotplex.conformance.AepCorpusConformanceTest" -DfailIfNoTests=false

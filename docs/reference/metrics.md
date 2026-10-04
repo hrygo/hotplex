@@ -317,6 +317,45 @@ rate(hotplex_execution_session_busy_total[5m])
 histogram_quantile(0.95, rate(hotplex_execution_delivery_latency_bucket[5m]))
 ```
 
+## 持久输入队列指标
+
+`execution.queue` 队列（默认关闭，见 [configuration.md §3.17](configuration.md#317-executionqueue--)）。这组指标回答两个问题：队列是否在真正接住输入，以及它是否在拖累体验。
+
+| 指标 | 类型 | 说明 |
+|------|------|------|
+| `hotplex.execution.queue_accepted` | Counter | 成功持久入队的输入数，label: `input_mode`（text / native_command） |
+| `hotplex.execution.queue_refused` | Counter | 入队被拒，label: `reason`（full / payload_too_large / conflict / content_unavailable / not_dispatchable） |
+| `hotplex.execution.queue_dispatched` | Counter | 队首被 claim 并派发的输入数，label: `input_mode`（text / native_command） |
+| `hotplex.execution.queue_settled` | Counter | 未派发即结算的输入数，label: `reason`（cancelled / expired / not_dispatchable） |
+| `hotplex.execution.queue_depth` | UpDownCounter | 当前排队中的输入数（存量，非流量） |
+| `hotplex.execution.queue_wait_ms` | Histogram | 入队到派发的等待耗时（毫秒） |
+| `hotplex.runtime.queue_actions` | Counter | Admin API 上的队列 operator 决策，label: `action`（cancel / clear）、`result`（ok / error） |
+| `hotplex.runtime.console_queries` | Counter | 执行控制台读取次数，label: `view`（list / timeline） |
+
+标签集全部低基数：不含 execution ID、session ID、actor 或任何输入内容。
+
+### 常用查询
+
+```promql
+# 当前积压
+hotplex_execution_queue_depth
+
+# 队列拒绝率（full 持续升高说明容量不足或 dispatch 不通畅）
+sum by (reason) (rate(hotplex_execution_queue_refused_total[5m]))
+
+# P95 排队等待
+histogram_quantile(0.95, rate(hotplex_execution_queue_wait_ms_bucket[5m]))
+
+# 结算原因分布：expired 占比高说明 TTL 相对实际等待过短
+sum by (reason) (rate(hotplex_execution_queue_settled_total[1h]))
+
+# operator 取消量
+sum by (action) (rate(hotplex_runtime_queue_actions_total[1h]))
+
+# 控制台读取量：list 与 timeline 的比例变化通常意味着有人在排查
+sum by (view) (rate(hotplex_runtime_console_queries_total[5m]))
+```
+
 ## Lease-Repair 指标
 
 Durable ingress 的 owner lease 续约与终态修复子系统。
@@ -353,6 +392,8 @@ Admin 响应中，永不作为指标 label）。
 |------|------|------|
 | `hotplex.runtime.fence_actions` | Counter | 通过 Admin API 应用的 operator fence 决策，labels: `decision`（resolve\|abandon）、`result`（ok\|conflict\|error） |
 | `hotplex.runtime.fence_conflicts` | Counter | fence-version 冲突（409，条件更新匹配 0 行）；上升说明 operator 或网关重启在 inspect 与 action 之间发生竞态 |
+| `hotplex.runtime.effect_actions` | Counter | 通过 Admin API 应用的 operator 外部交付决策，labels: `decision`（abandon\|mark_delivered\|requeue）、`result`（ok\|conflict\|error） |
+| `hotplex.runtime.effect_conflicts` | Counter | effect 状态冲突（409，effect 已不再是 unknown）；上升说明多个 operator 或恢复流程与人工决策竞争同一笔交付 |
 | `hotplex.runtime.plan_resolutions` | Counter | EffectiveRuntimePlan 影子解析次数，label: `result`（ok\|blocked） |
 | `hotplex.runtime.plan_blocked` | Counter | fail-closed 拦截的 plan，label: `code`（unknown_worker_type\|invalid_permission_mode\|invalid_sandbox_mode\|facts_missing_or_conflicting\|capability_unverifiable\|secret_shaped_value） |
 | `hotplex.runtime.plan_observed` | Counter | plan 读路径返回的 observed bootstrap 状态，label: `state`（planned\|unknown\|declared\|partial\|enforced） |
@@ -365,6 +406,12 @@ sum by (decision, result) (rate(hotplex_runtime_fence_actions_total[5m]))
 
 # fence 冲突率（持续非零说明存在并发 operator 或重启竞态）
 rate(hotplex_runtime_fence_conflicts_total[5m])
+
+# 不确定交付的处置速率（ok 为成功决策，conflict 需人工复查后重试）
+sum by (decision, result) (rate(hotplex_runtime_effect_actions_total[5m]))
+
+# 交付决策冲突率（持续非零说明同一笔交付被并发决策）
+rate(hotplex_runtime_effect_conflicts_total[5m])
 
 # plan 拦截率（影子模式下非零即配置边界问题，blocked plan 永不静默成功）
 sum(rate(hotplex_runtime_plan_blocked_total[5m]))

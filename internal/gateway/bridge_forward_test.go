@@ -220,3 +220,56 @@ func TestStopPendingReplaysBlocksRepairCallback(t *testing.T) {
 
 	require.Zero(t, rp.calls.Load(), "shutdown must reject replay work from a late repair callback")
 }
+
+// Releasing the active gate is what lets a session's durable queue promote its
+// head. Both trigger points are asserted here, because the queue dispatcher is
+// late-injected and neither path had any test: a regression here would leave a
+// queued input sitting undispatched forever with everything reporting success.
+//
+// dispatchQueued runs async (it is called while the forwarding path holds a seq
+// lease), so both cases poll the condition instead of sleeping.
+func TestTerminalTurnWakesTheDurableQueue(t *testing.T) {
+	t.Parallel()
+
+	t.Run("done releases the gate and promotes the queue head", func(t *testing.T) {
+		t.Parallel()
+		b, fc, env, _ := newDoneBridgeWithOpenExec(t, "s-queue-done")
+		dispatcher := &recordingQueueDispatcher{}
+		b.SetQueueDispatcher(dispatcher)
+
+		b.finishRuntimeOnDone("s-queue-done", fc, env)
+
+		require.Eventually(t, func() bool {
+			return len(dispatcher.dispatchedSessions()) == 1
+		}, time.Second, 10*time.Millisecond)
+		require.Equal(t, []string{"s-queue-done"}, dispatcher.dispatchedSessions())
+	})
+
+	// A runtime terminal write that failed is replayed by the repairer. When it
+	// finally succeeds the gate is released too, and a queue parked behind that
+	// failure must be woken as well -- otherwise the repair releases the gate
+	// and the queue never notices.
+	t.Run("a repaired terminal write also wakes the queue", func(t *testing.T) {
+		t.Parallel()
+		b, fc, env, store := newDoneBridgeWithOpenExec(t, "s-queue-repair")
+		store.finishErr = errors.New("db temporarily unavailable")
+		dispatcher := &recordingQueueDispatcher{}
+		b.SetQueueDispatcher(dispatcher)
+
+		b.finishRuntimeOnDone("s-queue-repair", fc, env)
+		// The durable write failed, so nothing may have been promoted.
+		require.Never(t, func() bool {
+			return len(dispatcher.dispatchedSessions()) > 0
+		}, 50*time.Millisecond, 10*time.Millisecond)
+
+		b.HandleRepairSuccess(execution.RepairIntent{
+			SessionID: "s-queue-repair",
+			Kind:      execution.RepairRuntime,
+		})
+
+		require.Eventually(t, func() bool {
+			return len(dispatcher.dispatchedSessions()) == 1
+		}, time.Second, 10*time.Millisecond)
+		require.Equal(t, []string{"s-queue-repair"}, dispatcher.dispatchedSessions())
+	})
+}

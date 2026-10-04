@@ -14,6 +14,7 @@ import (
 
 	"github.com/hrygo/hotplex/internal/audit"
 	"github.com/hrygo/hotplex/internal/config"
+	"github.com/hrygo/hotplex/internal/effect"
 	"github.com/hrygo/hotplex/internal/eventstore"
 	"github.com/hrygo/hotplex/internal/execution"
 	"github.com/hrygo/hotplex/internal/security"
@@ -99,6 +100,30 @@ type RuntimeExecutionProvider interface {
 	ApplyFenceDecision(ctx context.Context, request execution.FenceActionRequest) (*execution.Record, error)
 }
 
+// RuntimeEffectProvider is the narrow delivery-ledger view used by the effect
+// operator endpoints. Injected from cmd/hotplex so admin stays decoupled from
+// the gateway; errors must preserve effect.ErrEffectNotFound /
+// effect.ErrLeaseLost for status mapping.
+type RuntimeEffectProvider interface {
+	ListForOperator(ctx context.Context, f effect.OperatorListFilter) ([]*effect.Effect, error)
+	GetByID(ctx context.Context, effectID string) (*effect.Effect, error)
+	ListAttempts(ctx context.Context, effectID string) ([]*effect.Attempt, error)
+	ApplyOperatorAction(ctx context.Context, req effect.OperatorActionRequest) (*effect.Effect, error)
+}
+
+// RuntimeQueueProvider is the narrow durable-input-queue view used by the
+// queue operator endpoints. Injected from cmd/hotplex so admin stays decoupled
+// from the gateway handler.
+//
+// CancelQueued reports whether the input was still undispatched. false means
+// the dispatch boundary has already been crossed — the input may be running,
+// finished, or fenced — so the caller must say so plainly instead of implying
+// the input never ran.
+type RuntimeQueueProvider interface {
+	CancelQueuedInput(ctx context.Context, executionID string) (bool, error)
+	ClearSessionQueue(ctx context.Context, sessionID string) (int64, error)
+}
+
 // RuntimeEventNotifier emits the additive runtime.execution.failed event for
 // an operator abandon (#877). Best-effort: fenced sessions usually have no
 // connected clients, and the store write is already durable when this fires.
@@ -177,6 +202,17 @@ type AdminAPI struct {
 	builtinSkills    BuiltinSkillsCatalog     // Optional: embedded read-only Agent Skills
 	runtimeExec      RuntimeExecutionProvider // Optional: enables /admin/executions fence endpoints (#877); nil → 503
 	runtimeNotifier  RuntimeEventNotifier     // Optional: emits runtime.execution.failed on abandon (#877)
+	runtimeEffects   RuntimeEffectProvider    // Optional: enables /admin/effect endpoints; nil → 503
+	runtimeQueue     RuntimeQueueProvider     // Optional: enables /admin input-queue endpoints; nil → 503
+	// Execution console (#868). Each view is optional and degrades its own
+	// section to "unavailable" rather than failing the whole projection.
+	consoleExecutions ExecutionReader       // Optional: execution list + detail lookup
+	consoleEvents     SessionEventReader    // Optional: bounded session events for a timeline
+	consoleEffects    ExecutionEffectReader // Optional: bounded deliveries for a run
+	// launchPlans reports the plan each session's current run was ACTUALLY
+	// launched under (#946 D3). nil → the runtime-plan diagnostic re-resolves
+	// against the live config and marks the answer as not-from-launch.
+	launchPlans LaunchPlanProvider
 }
 
 type Deps struct {
@@ -261,6 +297,19 @@ func (a *AdminAPI) SetRuntimeExecution(p RuntimeExecutionProvider, n RuntimeEven
 	a.runtimeNotifier = n
 }
 
+// SetRuntimeQueue injects the durable-input-queue provider that backs the
+// queue operator endpoints. nil-safe: they answer 503 until wired, and while
+// the queue itself is disabled the gateway provider reports "nothing queued"
+// rather than pretending an input was cancelled.
+func (a *AdminAPI) SetRuntimeQueue(p RuntimeQueueProvider) { a.runtimeQueue = p }
+
+// SetRuntimeEffects injects the delivery-ledger provider that backs the
+// operator effect endpoints. nil-safe: they return 503 until wired.
+func (a *AdminAPI) SetRuntimeEffects(p RuntimeEffectProvider) { a.runtimeEffects = p }
+
+// launchPlans exposes the plan each session's current run was actually launched
+// under (#946 D3). nil-safe: the runtime-plan diagnostic then falls back to
+// re-resolution against the live config and marks the answer as such.
 func (a *AdminAPI) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

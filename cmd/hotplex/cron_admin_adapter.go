@@ -117,7 +117,10 @@ func (a *cronAdminAdapter) TriggerJob(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	return a.scheduler.TriggerJob(ctx, job)
+	// An operator pressing "run now" is a per-request firing, never a redelivery
+	// of someone else's event: it carries no VerifiedEventID and so gets its own
+	// nonce, which is what keeps two operator runs distinct.
+	return a.scheduler.TriggerJob(ctx, job, cron.TriggerRequest{})
 }
 
 func (a *cronAdminAdapter) RunHistory(ctx context.Context, id string) (any, error) {

@@ -18,10 +18,13 @@ var ErrJobDisabled = errors.New("cron: job is disabled")
 
 // Scheduler manages cron job lifecycle: loading, scheduling, execution, and shutdown.
 type Scheduler struct {
-	log             *slog.Logger
-	store           Store
-	executor        *Executor
-	delivery        *Delivery
+	log      *slog.Logger
+	store    Store
+	executor *Executor
+	delivery *Delivery
+	// effectDelivery is the gateway-owned delivery path. It is used only for
+	// jobs whose occurrence recorded DeliveryModeGateway.
+	effectDelivery  EffectDelivery
 	attachedHandler *AttachedSessionHandler
 	maxConcurrent   int
 	maxJobs         int
@@ -60,9 +63,12 @@ type WorkDirResolver func(job *CronJob) string
 type Deps struct {
 	Log            *slog.Logger
 	Store          Store
+	Occurrences    OccurrenceStore
+	Dispatcher     SystemInputDispatcher
 	Bridge         BridgeStarter
 	SessionMgr     SessionStateChecker
 	Delivery       *Delivery
+	EffectDelivery EffectDelivery
 	AttachedRouter AttachedSessionRouter
 	YAMLDefs       []YAMLJobDef
 	Cfg            Config
@@ -81,19 +87,20 @@ func New(deps Deps) *Scheduler {
 	}
 
 	s := &Scheduler{
-		log:           deps.Log.With("component", "cron"),
-		store:         deps.Store,
-		maxConcurrent: maxConcurrent,
-		maxJobs:       maxJobs,
-		delivery:      deps.Delivery,
-		jobs:          make(map[string]*CronJob),
+		log:            deps.Log.With("component", "cron"),
+		store:          deps.Store,
+		maxConcurrent:  maxConcurrent,
+		maxJobs:        maxJobs,
+		delivery:       deps.Delivery,
+		effectDelivery: deps.EffectDelivery,
+		jobs:           make(map[string]*CronJob),
 	}
 	defaultTimeout := 5 * time.Minute
 	if deps.Cfg.DefaultTimeoutSec > 0 {
 		defaultTimeout = time.Duration(deps.Cfg.DefaultTimeoutSec) * time.Second
 	}
 	s.defaultTimeout = defaultTimeout
-	s.executor = NewExecutor(deps.Log, deps.Bridge, deps.SessionMgr, deps.Cfg.DefaultSandbox)
+	s.executor = NewExecutor(deps.Log, deps.Bridge, deps.SessionMgr, deps.Cfg.DefaultSandbox, deps.Occurrences, deps.Dispatcher)
 	if deps.AttachedRouter != nil {
 		s.attachedHandler = NewAttachedSessionHandler(deps.Log, deps.AttachedRouter)
 	}
@@ -261,7 +268,7 @@ func (s *Scheduler) ListJobs(ctx context.Context) ([]*CronJob, error) {
 }
 
 // TriggerJob manually triggers a job execution outside of its schedule.
-func (s *Scheduler) TriggerJob(ctx context.Context, job *CronJob) error {
+func (s *Scheduler) TriggerJob(ctx context.Context, job *CronJob, req TriggerRequest) error {
 	if !s.tickLoop.tryAcquireSlot(s.maxConcurrent) {
 		return fmt.Errorf("cron: concurrency cap (%d) reached, cannot trigger job %s", s.maxConcurrent, job.ID)
 	}
@@ -272,7 +279,11 @@ func (s *Scheduler) TriggerJob(ctx context.Context, job *CronJob) error {
 			s.tickLoop.releaseSlot()
 			s.wg.Done()
 		}()
-		s.executeJob(j)
+		// Each manual request carries its own nonce, so distinct requests stay
+		// distinct runs while the occurrence ledger still records that this
+		// exact request was taken. A webhook carrying a verified event ID
+		// deduplicates on that ID instead.
+		s.executeJob(j, RequestedTriggerFor(j, GenerateOccurrenceID(), req.VerifiedEventID))
 	}()
 	return nil
 }
@@ -280,7 +291,7 @@ func (s *Scheduler) TriggerJob(ctx context.Context, job *CronJob) error {
 // TriggerByName finds a job by name in the in-memory index and triggers its execution.
 // It reads from s.jobs (source of truth) rather than the store to avoid stale-read windows
 // when the CLI has disabled a job but the DB has not yet been updated.
-func (s *Scheduler) TriggerByName(ctx context.Context, jobName string, extra map[string]string) error {
+func (s *Scheduler) TriggerByName(ctx context.Context, jobName string, req TriggerRequest) error {
 	s.mu.Lock()
 	var found *CronJob
 	for _, j := range s.jobs {
@@ -301,14 +312,14 @@ func (s *Scheduler) TriggerByName(ctx context.Context, jobName string, extra map
 	s.mu.Unlock()
 
 	// Inject extra context (e.g. target_pr from webhook) into PlatformKey.
-	if len(extra) > 0 {
+	if len(req.Extra) > 0 {
 		if job.PlatformKey == nil {
 			job.PlatformKey = make(map[string]string)
 		}
-		maps.Copy(job.PlatformKey, extra)
+		maps.Copy(job.PlatformKey, req.Extra)
 	}
 
-	return s.TriggerJob(ctx, job)
+	return s.TriggerJob(ctx, job, req)
 }
 
 // loadFromDB loads all jobs from the store into the in-memory index.
@@ -466,7 +477,10 @@ func (s *Scheduler) scheduleCatchUp(jobs []*CronJob) {
 				return
 			}
 			s.log.Info("cron: catch-up executing", "job_id", j.ID, "name", j.Name, "delay_sec", d)
-			s.executeJob(j)
+			// A catch-up run is still the scheduled firing for this job's
+			// persisted next_run_at_ms, so it must derive the same occurrence
+			// key as the normal timer path instead of racing it into a second run.
+			s.executeJob(j, ScheduledTriggerFor(j))
 		}(delay)
 	}
 }

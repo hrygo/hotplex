@@ -51,6 +51,7 @@ import {
     mapErrorToNotice,
 } from "@/lib/adapters/error-mapping";
 import { isExpectedClientError } from "@/lib/ai-sdk-transport/client/error-policy";
+import { classifyInputAck } from "@/lib/adapters/input-ack-receipt";
 import { logger } from "@/lib/logger";
 import i18n from "@/lib/i18n/config";
 import type {
@@ -1592,6 +1593,9 @@ export function useHotPlexRuntime({
         // / restart), so without this handler the UI would spin forever on a
         // turn whose outcome is ambiguous.
         const handleInputAck = (data: InputAckData) => {
+            // Receipt semantics are resolved once, independently of the Agent run
+            // state: an input receipt must never be read as "the turn finished".
+            const settlement = classifyInputAck(data);
             const queuedDispatch = activeQueueDispatchRef.current;
             const matchesQueuedDispatch =
                 queuedDispatch?.clientMessageId === data.client_message_id;
@@ -1613,14 +1617,14 @@ export function useHotPlexRuntime({
                 return;
             }
             if (
-                data.status === "delivered" ||
-                data.status === "unknown" ||
-                data.status === "failed"
+                settlement.kind === "delivered" ||
+                settlement.kind === "unknown" ||
+                settlement.kind === "failed"
             ) {
                 const deliveryStatus: "delivered" | "unknown" | "failed" =
-                    data.status === "delivered"
+                    settlement.kind === "delivered"
                         ? "delivered"
-                        : data.status === "unknown"
+                        : settlement.kind === "unknown"
                           ? "unknown"
                           : "failed";
                 setMessages((prev) =>
@@ -1635,7 +1639,7 @@ export function useHotPlexRuntime({
                 );
             }
             if (queuedDispatch && matchesQueuedDispatch) {
-                if (data.status === "delivered") {
+                if (settlement.kind === "delivered") {
                     const wasUnknown = queuedDispatch.outcomeUnknown === true;
                     const deliveredItem = queueStore.markDelivered(
                         queuedDispatch.sessionId,
@@ -1649,21 +1653,52 @@ export function useHotPlexRuntime({
                             setIsRunning(true);
                         }
                     }
-                } else if (data.status === "unknown") {
+                } else if (settlement.kind === "unknown") {
                     failActiveQueueDispatchRef.current(
                         "unknown",
-                        data.error_code || "Input outcome is unknown",
+                        settlement.errorCode || "Input outcome is unknown",
                     );
                     return;
-                } else if (data.status === "failed") {
+                } else if (settlement.kind === "failed") {
                     failActiveQueueDispatchRef.current(
                         "send",
-                        data.error_code || "Input delivery failed",
+                        settlement.errorCode || "Input delivery failed",
                     );
                     return;
                 }
             }
-            if (data.status === "accepted" || data.status === "delivered") {
+            if (
+                queuedDispatch &&
+                matchesQueuedDispatch &&
+                settlement.kind === "volatile-accepted"
+            ) {
+                // The gateway staged the input in process memory (supplement
+                // buffer). It is deliberately NOT recorded as delivered:
+                // buffering is not a delivery proof, and the running parent
+                // turn stays active.
+                //
+                // The release below only fires for a dispatch the queue store
+                // still tracks in "sending" state, and no production path
+                // creates one today: drainQueue pops every queued item through
+                // popAllDispatchable before dispatching them merged, so
+                // activeQueueDispatchRef is never set and a volatile
+                // acceptance on that path is a deliberate no-op — the parent
+                // turn's terminal envelope is what ends the turn. The branch
+                // remains for a future per-item dispatch path and must not be
+                // read as protection that is load-bearing today.
+                const releasedItem = queueStore.releaseVolatileAccepted(
+                    queuedDispatch.sessionId,
+                    data.client_message_id,
+                );
+                if (releasedItem) {
+                    activeQueueDispatchRef.current = null;
+                }
+            }
+            if (
+                settlement.kind === "durable-accepted" ||
+                settlement.kind === "volatile-accepted" ||
+                settlement.kind === "delivered"
+            ) {
                 if (isGatewayCommandAck(data)) {
                     // Gateway-handled command turn: the gateway sends no done
                     // for these, so this delivered ack terminates the turn.
@@ -1756,7 +1791,7 @@ export function useHotPlexRuntime({
                 );
                 return;
             }
-            if (data.status !== "unknown") return;
+            if (settlement.kind !== "unknown") return;
             logger.warn("RuntimeAdapter", "Input outcome unknown", {
                 client_message_id: data.client_message_id,
                 execution_id: data.execution_id,

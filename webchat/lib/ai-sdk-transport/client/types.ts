@@ -43,12 +43,25 @@ export interface InputData {
 
 export type ExecutionStatus = 'accepted' | 'delivered' | 'unknown' | 'failed';
 
+/** How the gateway handled the input. Absent on pre-receipt servers. */
+export type InputMode = 'primary' | 'injected' | 'buffered' | 'queued';
+
+/**
+ * Recovery guarantee. `accepted` is only durable when this is `durable`;
+ * a volatile acceptance is an in-memory staging decision, not a delivery proof.
+ */
+export type InputDurability = 'durable' | 'volatile';
+
 export interface InputAckData {
   client_message_id: string;
   execution_id: string;
   status: ExecutionStatus;
   duplicate?: boolean;
   error_code?: ErrorCode;
+  input_mode?: InputMode;
+  durability?: InputDurability;
+  /** Set on injected/buffered receipts to correlate with the running turn. */
+  parent_execution_id?: string;
 }
 
 export interface MessageStartData {

@@ -1,0 +1,15 @@
+{
+  "version": "aep/v1",
+  "id": "evt_00000000-0000-4000-8000-000000000001",
+  "seq": 1,
+  "session_id": "sess_00000000-0000-4000-8000-000000000001",
+  "timestamp": 1710000000000,
+  "event": {
+    "type": "input.ack",
+    "data": {
+      "client_message_id": "evt_client_3",
+      "execution_id": "exec_3",
+      "status": "delivered"
+    }
+  }
+}

@@ -22,6 +22,14 @@ import (
 type RuntimePlanReport struct {
 	Plan     agentspec.EffectiveRuntimePlanView `json:"plan"`
 	Observed agentspec.ObservedSummary          `json:"observed"`
+	// FromLaunch reports whether Plan is what this session's current run was
+	// ACTUALLY launched under. False means it was re-resolved against the live
+	// config — a different question, and one that must not be read as history.
+	FromLaunch bool `json:"from_launch"`
+	// PlanApplied reports whether the recorded run was started from its plan
+	// (authoritative rollout) or only shadow-compared against it. A plan that
+	// merely AGREED with the legacy parameters is not an applied plan.
+	PlanApplied bool `json:"plan_applied"`
 }
 
 // HandleSessionRuntimePlan returns the redacted effective runtime plan for a
@@ -79,7 +87,7 @@ func (a *AdminAPI) HandleSessionRuntimePlan(w http.ResponseWriter, r *http.Reque
 	if a.cfg != nil {
 		cfg = a.cfg.Get()
 	}
-	plan, err := buildSessionPlan(cfg, si)
+	plan, fromLaunch, err := a.resolvedPlanFor(si, cfg)
 	if err != nil && !errors.Is(err, agentspec.ErrPlanBlocked) {
 		// A blocked plan is a valid diagnostic projection (its Blocked reasons
 		// are the payload); any other failure is an internal error.
@@ -88,11 +96,18 @@ func (a *AdminAPI) HandleSessionRuntimePlan(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	observed := observedSummaryFor(si)
+	observed := observedSummaryFor(si, fromLaunch)
 	observability.RuntimePlanObserved().Add(r.Context(), 1,
 		metric.WithAttributes(attribute.String("state", observed.State)))
-
-	respondJSON(w, RuntimePlanReport{Plan: plan.Redacted(), Observed: observed})
+	// Tell the caller which question they are looking at. A re-resolved plan
+	// describes the CURRENT config, not this session's history; without this
+	// flag the two are indistinguishable in the response.
+	respondJSON(w, RuntimePlanReport{
+		Plan:        plan.Redacted(),
+		Observed:    observed,
+		FromLaunch:  fromLaunch,
+		PlanApplied: fromLaunch && a.launchPlans != nil && a.launchPlans.LaunchPlanApplied(si.ID),
+	})
 }
 
 // buildSessionPlan reconstructs the desired-state plan from the session's
@@ -115,14 +130,51 @@ func buildSessionPlan(cfg *config.Config, si *session.SessionInfo) (agentspec.Ef
 	return (agentspec.Resolver{}).ResolvePlan(in)
 }
 
+// LaunchPlanProvider exposes the plan a session's CURRENT run was actually
+// launched under (#946 D3).
+//
+// The diagnostic prefers this over re-resolving. A re-resolution answers "what
+// would launch now"; the recorded plan answers "what did this run launch
+// under". Reporting the first as the second is how a historical fact becomes a
+// plausible fiction — and the difference matters most exactly when a config
+// changed after the run started.
+type LaunchPlanProvider interface {
+	LaunchPlanFor(sessionID string) (agentspec.EffectiveRuntimePlan, bool)
+	LaunchPlanApplied(sessionID string) bool
+}
+
+// SetLaunchPlanProvider wires the recorded-launch-plan source. nil is safe:
+// the diagnostic then falls back to re-resolution and says so.
+func (a *AdminAPI) SetLaunchPlanProvider(p LaunchPlanProvider) { a.launchPlans = p }
+
+// resolvedPlanFor returns the plan to report, preferring what the run actually
+// launched under and falling back to a re-resolution against the live config.
+// The bool reports whether the answer came from a real launch.
+func (a *AdminAPI) resolvedPlanFor(
+	si *session.SessionInfo, cfg *config.Config,
+) (agentspec.EffectiveRuntimePlan, bool, error) {
+	if a.launchPlans != nil {
+		if recorded, ok := a.launchPlans.LaunchPlanFor(si.ID); ok {
+			return recorded, true, nil
+		}
+	}
+	plan, err := buildSessionPlan(cfg, si)
+	return plan, false, err
+}
+
 // observedSummaryFor maps the session's verifiable facts onto the observed
-// bootstrap states (#946 spec §6.5). First slice: a Worker-reported
-// permission ceiling is declared (not independently enforced → never
-// "enforced"); an active session without a reported ceiling is unknown; a
-// session with only the plan is planned.
-func observedSummaryFor(si *session.SessionInfo) agentspec.ObservedSummary {
+// bootstrap states (#946 spec §6.5). A Worker-reported permission ceiling is
+// DECLARED (not independently enforced → never "enforced").
+//
+// hasLaunch is the gate that keeps this honest: with no recorded launch there
+// is nothing observed at all, so the answer is ObservedPlanned. An active
+// session that has never launched is not "unknown" — reporting unknown would
+// describe a gap in our knowledge as a fact about the runtime.
+func observedSummaryFor(si *session.SessionInfo, hasLaunch bool) agentspec.ObservedSummary {
 	observed := agentspec.ObservedSummary{WorkerType: string(si.WorkerType)}
 	switch {
+	case !hasLaunch:
+		observed.State = agentspec.ObservedPlanned
 	case si.PermissionCeiling != "":
 		observed.State = agentspec.ObservedDeclared
 		observed.PermissionCeiling = si.PermissionCeiling

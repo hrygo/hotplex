@@ -369,17 +369,38 @@ func TestNewEnvelope(t *testing.T) {
 func TestInputAckData_JSONContract(t *testing.T) {
 	t.Parallel()
 	data, err := json.Marshal(InputAckData{
-		ClientMessageID: "evt_client",
-		ExecutionID:     "exec_1",
-		Status:          ExecutionStatusDelivered,
-		Duplicate:       true,
+		ClientMessageID:   "evt_client",
+		ExecutionID:       "exec_1",
+		Status:            ExecutionStatusDelivered,
+		Duplicate:         true,
+		InputMode:         InputModeInjected,
+		Durability:        InputDurabilityVolatile,
+		ParentExecutionID: "exec_parent",
 	})
 	require.NoError(t, err)
 	require.JSONEq(t, `{
 		"client_message_id":"evt_client",
 		"execution_id":"exec_1",
 		"status":"delivered",
-		"duplicate":true
+		"duplicate":true,
+		"input_mode":"injected",
+		"durability":"volatile",
+		"parent_execution_id":"exec_parent"
+	}`, string(data))
+}
+
+func TestInputAckData_OldPayloadRemainsWireCompatible(t *testing.T) {
+	t.Parallel()
+	data, err := json.Marshal(InputAckData{
+		ClientMessageID: "evt_client",
+		ExecutionID:     "exec_1",
+		Status:          ExecutionStatusDelivered,
+	})
+	require.NoError(t, err)
+	require.JSONEq(t, `{
+		"client_message_id":"evt_client",
+		"execution_id":"exec_1",
+		"status":"delivered"
 	}`, string(data))
 }
 

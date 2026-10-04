@@ -204,8 +204,24 @@ type EventStore interface {
 type EventTx interface {
 	Append(ctx context.Context, event *StoredEvent) error
 	AppendTurn(ctx context.Context, turn *TurnWriteRequest) error
+	// ExecContext runs a statement inside the transaction.
+	//
+	// It lets a caller owning a wider invariant — for example committing a
+	// delivery effect together with its content snapshot — share THIS
+	// transaction instead of opening a second one. Two transactions could
+	// commit independently, which is exactly the split this method prevents.
+	// On PostgreSQL the query is rebound to $N placeholders.
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	// QueryRowContext reads a single row inside the transaction, with the same
+	// sharing rationale as ExecContext.
+	QueryRowContext(ctx context.Context, query string, args ...any) Row
 	Commit() error
 	Rollback() error
+}
+
+// Row is the minimal result-row surface an EventTx exposes.
+type Row interface {
+	Scan(dest ...any) error
 }
 
 // TurnQuerier provides read-only access to conversation turn records.
@@ -268,21 +284,25 @@ func (s *SQLiteStore) BeginTx(ctx context.Context) (EventTx, error) {
 		s.writeMu.Lock()
 	}
 	ctx, cancel := withDefaultTimeout(ctx)
-	defer cancel()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		cancel()
 		if s.writeMu != nil {
 			s.writeMu.Unlock()
 		}
 		return nil, fmt.Errorf("eventstore: begin tx: %w", err)
 	}
-	return &sqliteTx{tx: tx, writeMu: s.writeMu}, nil
+	// The cancel must NOT run here: this context drives the returned
+	// transaction, so cancelling it on return would abort the transaction
+	// before the caller's first statement. It is released with the tx instead.
+	return &sqliteTx{tx: tx, writeMu: s.writeMu, cancel: cancel}, nil
 }
 
 type sqliteTx struct {
 	tx       *sql.Tx
 	writeMu  *sqlutil.WriteMu
 	released bool
+	cancel   context.CancelFunc
 }
 
 func (t *sqliteTx) release() {
@@ -290,9 +310,27 @@ func (t *sqliteTx) release() {
 		return
 	}
 	t.released = true
+	if t.cancel != nil {
+		t.cancel()
+	}
 	if t.writeMu != nil {
 		t.writeMu.Unlock()
 	}
+}
+
+// ExecContext runs a statement inside the transaction.
+//
+// It exists so a caller owning a wider invariant — for example committing a
+// delivery effect together with its content snapshot — can share THIS
+// transaction instead of opening a second one. Two transactions could commit
+// independently, which is exactly the split this method is meant to prevent.
+func (t *sqliteTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return t.tx.ExecContext(ctx, query, args...)
+}
+
+// QueryRowContext reads a single row inside the transaction.
+func (t *sqliteTx) QueryRowContext(ctx context.Context, query string, args ...any) Row {
+	return t.tx.QueryRowContext(ctx, query, args...)
 }
 
 func (t *sqliteTx) Append(ctx context.Context, event *StoredEvent) error {

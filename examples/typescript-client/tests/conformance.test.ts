@@ -12,6 +12,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AEP_VERSION, EventKind } from '../src/constants.js';
+import type { InputAckData } from '../src/types.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -77,5 +78,33 @@ describe('AEP corpus conformance', () => {
     const event = env['event'] as Record<string, unknown>;
     expect(event['type']).toBe('custom.future_event');
     // Parsing succeeds — forward-compatible.
+  });
+
+  it('input.ack carries mode and durability so a buffered accept is not read as delivered', () => {
+    const raw = readFileSync(
+      join(CORPUS_DIR, '93-compatibility-input-ack-buffered.json'),
+      'utf-8',
+    );
+    const env = JSON.parse(raw) as { event: { data: InputAckData } };
+    const ack = env.event.data;
+    expect(ack.status).toBe('accepted');
+    expect(ack.input_mode).toBe('buffered');
+    expect(ack.durability).toBe('volatile');
+    expect(ack.parent_execution_id).toBe('exec_parent_1');
+    // The volatile acceptance is explicitly NOT a delivery.
+    expect(ack.status).not.toBe('delivered');
+  });
+
+  it('input.ack from a pre-receipt server decodes with the fields absent', () => {
+    const raw = readFileSync(
+      join(CORPUS_DIR, '94-compatibility-input-ack-legacy.json'),
+      'utf-8',
+    );
+    const env = JSON.parse(raw) as { event: { data: InputAckData } };
+    const ack = env.event.data;
+    expect(ack.status).toBe('delivered');
+    expect(ack.input_mode).toBeUndefined();
+    expect(ack.durability).toBeUndefined();
+    expect(ack.parent_execution_id).toBeUndefined();
   });
 });

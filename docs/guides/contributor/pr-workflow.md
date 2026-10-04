@@ -55,6 +55,10 @@ git checkout -b feat/<feature-name> origin/main
 | 重构 | `refactor/<name>` | `refactor/hub-backpressure` |
 | 文档 | `docs/<name>` | `docs/contributor-guides` |
 | 杂项 | `chore/<name>` | `chore/update-deps` |
+| AI 协作 | `codex/<name>` | `codex/trusted-runtime-delivery` |
+
+`codex/` 前缀供 Codex 桌面端创建分支时使用，变更类型记录在 commit 主题中
+（遵循 Conventional Commits），分支名只承载工作区名称。
 
 ### 3. 开发与提交
 

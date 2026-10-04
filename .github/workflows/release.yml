@@ -7,29 +7,100 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., v1.0.0)'
+        description: 'Version tag to release (e.g., v1.0.0). Must already exist.'
         required: true
         type: string
 
+# Read-only by default. Only the publish job can write, and it says so
+# explicitly, so a blocked release fails loudly instead of quietly proceeding
+# with whatever permissions happened to be inherited.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   GO_VERSION: '1.26'
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # ── Resolve: pin an immutable SHA before anything else ────────────────
+  # workflow_dispatch used to check out the default branch while stamping the
+  # binary with the requested version string. That publishes one commit's code
+  # under another version's name, and nothing in the old graph could detect it.
+  resolve:
+    name: Resolve release ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve tag to an immutable commit SHA
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="${REQUESTED}"
+            if [ -z "$TAG" ]; then
+              echo "::error::workflow_dispatch requires a version tag"
+              exit 1
+            fi
+          else
+            TAG="${REF#refs/tags/}"
+          fi
+
+          case "$TAG" in
+            v*) ;;
+            *)
+              echo "::error::Release tag '$TAG' must start with 'v'"
+              exit 1
+              ;;
+          esac
+
+          # Fetch the tag itself. A tag that does not exist must fail here, not
+          # three jobs later after a release page already exists.
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth=1 origin "refs/tags/${TAG}:refs/tags/${TAG}"
+
+          SHA="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          if [ -z "$SHA" ]; then
+            echo "::error::Tag '$TAG' did not resolve to a commit"
+            exit 1
+          fi
+
+          echo "Releasing ${TAG} from ${SHA}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+
+  # ── Validate: the same gate CI runs, against the SHA being released ────
+  validate:
+    name: Validate ${{ needs.resolve.outputs.version }}
+    needs: [resolve]
+    uses: ./.github/workflows/validate.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      ref-label: ${{ needs.resolve.outputs.version }}
+      test-scope: 'full'
+
   # ── Prepare: build webchat once ────────────────────────────────────────
   prepare:
     name: Prepare
+    needs: [resolve, validate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
       - uses: ./.github/actions/setup-go-webchat
         with:
@@ -47,14 +118,12 @@ jobs:
           path: internal/docs/out
           retention-days: 1
 
-  # ── Build ────────────────────────────────────────────────────────────────
+  # ── Build ───────────────────────────────────────────────────────────────
   build:
-    needs: [prepare]
+    needs: [resolve, validate, prepare]
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +131,8 @@ jobs:
         arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
       - name: Restore webchat
         uses: actions/download-artifact@v7
@@ -86,24 +157,16 @@ jobs:
         if: matrix.os == 'windows'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq zip
 
-      - name: Compute version
-        id: version
-        run: |
-          REF="${{ github.ref }}"
-          TAG="${REF#refs/tags/}"
-          VER="${TAG:-dev}"
-          if [ "$VER" = "$REF" ]; then VER="${{ github.event.inputs.version || 'dev' }}"; fi
-          echo "version=${VER}" >> "$GITHUB_OUTPUT"
-
       - name: Build
         env:
           CGO_ENABLED: 0
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
           LDFLAGS: -s -w
-          VERSION: ${{ steps.version.outputs.version }}
-          COMMIT: ${{ github.sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          COMMIT: ${{ needs.resolve.outputs.sha }}
         run: |
+          set -euo pipefail
           EXT=""
           [ "${{ matrix.os }}" = "windows" ] && EXT=".exe"
           NAME="hotplex-${{ matrix.os }}-${{ matrix.arch }}${EXT}"
@@ -112,12 +175,25 @@ jobs:
           go build -ldflags="${LDFLAGS} -X main.version=${VERSION} -X main.commit=${COMMIT}" \
             -o "dist/${NAME}" ./cmd/hotplex
 
+          # Each artifact records the SHA it was built from, so a downloaded
+          # archive can be traced without trusting the release page it came from.
+          printf 'version=%s\nsource_sha=%s\n' "${VERSION}" "${COMMIT}" > "dist/${ARCHIVE}.provenance"
+
           # Pack archive: tar.gz for unix, zip for windows
           cd dist
           if [ "${{ matrix.os }}" = "windows" ]; then
-            zip -9 "${ARCHIVE}.zip" "${NAME}"
+            zip -9 "${ARCHIVE}.zip" "${NAME}" "${ARCHIVE}.provenance"
           else
-            tar -czf "${ARCHIVE}.tar.gz" "${NAME}"
+            tar -czf "${ARCHIVE}.tar.gz" "${NAME}" "${ARCHIVE}.provenance"
+          fi
+
+          # Per-leg digests travel with the archive, so the smoke job verifies
+          # THESE bytes rather than trusting whatever the artifact store
+          # returns later.
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.sha256"
+          else
+            sha256sum "${ARCHIVE}.tar.gz" > "${ARCHIVE}.sha256"
           fi
 
       - uses: actions/upload-artifact@v7
@@ -126,16 +202,320 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.provenance
+            dist/*.sha256
           retention-days: 7
 
-  # ── Release ─────────────────────────────────────────────────────────────
-  release:
-    needs: [build]
+  # ── Offline Bundle (OpenCode + OMO) ────────────────────────────────────
+  # Produces artifacts only. It used to publish to the release page itself, in
+  # parallel with the release job and gated on nothing but a build, so a failed
+  # or skipped validation still shipped bundles.
+  offline-bundle:
+    name: Pack offline bundle
+    needs: [resolve, validate, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Verify the runtime lock
+        # The bundle's OpenCode and Oh My OpenAgent versions come from the
+        # committed lock, never from whatever upstream publishes today.
+        run: python3 scripts/ci/check_runtime_lock.py --repo-root .
+
+      - name: Show the locked versions
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          with open("configs/worker-runtime-lock.json", encoding="utf-8") as handle:
+              lock = json.load(handle)
+          print("opencode:", lock["runtimes"]["opencode"]["version"])
+          print("omo:", lock["runtimes"]["oh-my-opencode"]["version"])
+          print("lock digest:", lock["runtimes"]["opencode"]["assets"]["linux-x64"]["sha256"][:16], "...")
+          PY
+
+      - name: Pack bundles
+        run: |
+          set -euo pipefail
+          chmod +x scripts/pack-offline-bundle.sh
+
+          for PLATFORM in linux-x64 linux-x64-musl linux-arm64 linux-arm64-musl darwin-arm64 darwin-x64 windows-x64 windows-arm64; do
+            echo "==> Packing ${PLATFORM}..."
+            # No --opencode-version / --omo-version: those flags imply
+            # --allow-dynamic, which is exactly the unreproducible build this
+            # lock exists to prevent.
+            bash scripts/pack-offline-bundle.sh \
+              --platform "${PLATFORM}" \
+              --output "dist/offline-bundle-${PLATFORM}"
+          done
+
+          ls -lh dist/hotplex-offline-bundle-*.tar.gz
+
+      - name: Upload offline bundles
+        uses: actions/upload-artifact@v7
+        with:
+          name: offline-bundle
+          path: |
+            dist/hotplex-offline-bundle-*.tar.gz
+            dist/hotplex-offline-bundle-*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── Publish: the single owner of the release page ──────────────────────
+  # ── Smoke: run the artifacts that were actually built ─────────────────
+  # These jobs download the release archives and run them. They never rebuild:
+  # a rebuild would prove the source compiles, not that the bytes people
+  # download start. Only the (os, arch) pairs a hosted runner can actually
+  # execute are covered; the rest stay build-only and are reported as such.
+  smoke:
+    name: Smoke ${{ matrix.target }}
+    needs: [resolve, validate, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-latest
+            artifact: dist-linux-amd64
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            artifact: dist-linux-arm64
+          - target: darwin-arm64
+            runner: macos-latest
+            artifact: dist-darwin-arm64
+          - target: darwin-amd64
+            runner: macos-15-intel
+            artifact: dist-darwin-amd64
+          - target: windows-amd64
+            runner: windows-latest
+            artifact: dist-windows-amd64
+    steps:
+      - name: Download the built artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+
+      - name: Verify the archive checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # The digest was recorded at build time and shipped beside the
+          # archive. Without this the smoke would happily test whatever the
+          # artifact store happened to hand back.
+          sha256sum --check --quiet ./*.sha256
+
+      - name: Extract
+        id: extract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location dist
+          $archive = Get-ChildItem -Filter 'hotplex-*.zip' | Select-Object -First 1
+          if ($archive) {
+            Expand-Archive -Path $archive.FullName -DestinationPath extracted
+          } else {
+            $tar = Get-ChildItem -Filter 'hotplex-*.tar.gz' | Select-Object -First 1
+            if (-not $tar) { throw 'no release archive found' }
+            tar -xzf $tar.FullName
+            New-Item -ItemType Directory -Path extracted | Out-Null
+            Get-ChildItem -Directory | Where-Object { $_.Name -ne 'extracted' } |
+              Move-Item -Destination extracted
+          }
+          $binary = Get-ChildItem -Path extracted -Filter 'hotplex*.exe' -Recurse | Select-Object -First 1
+          if (-not $binary) {
+            $binary = Get-ChildItem -Path extracted -Filter 'hotplex*' -File -Recurse | Select-Object -First 1
+          }
+          if (-not $binary) { throw 'no hotplex binary in archive' }
+          "BINARY=$($binary.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Extract (unix)
+        id: extract-unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # The archive is built with the binary and its provenance at the
+          # root, so this is a plain extraction with no directory to strip.
+          mkdir -p extracted
+          tar -xzf hotplex-*.tar.gz -C extracted
+          BINARY=$(find extracted -type f -name 'hotplex*' ! -name '*.provenance' | head -1)
+          if [ -z "$BINARY" ]; then
+            echo "::error::no hotplex binary in archive"
+            find extracted -type f | head -20
+            exit 1
+          fi
+          chmod +x "$BINARY"
+          echo "BINARY=$BINARY" >> "$GITHUB_OUTPUT"
+
+      - name: Binary starts, migrates a fresh database, serves health, shuts down cleanly
+        shell: pwsh
+        env:
+          BINARY: ${{ steps.extract.outputs.BINARY }}
+          PORT: 18888
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:BINARY --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "--help failed" }
+
+          # An isolated HOTPLEX_HOME so the smoke never touches a real
+          # installation, and an explicit config so the port does not depend on
+          # whatever the default happens to be.
+          $env:HOTPLEX_HOME = Join-Path $env:RUNNER_TEMP 'hotplex-smoke'
+          New-Item -ItemType Directory -Force -Path $env:HOTPLEX_HOME | Out-Null
+          # Built as a string, not a here-string: a here-string's body has to
+          # start at column 0, and a column-0 line inside this run block ends
+          # the YAML block scalar. That produced a release.yml GitHub refuses to
+          # parse, while the gating checker — reading the file with its own line
+          # parser — silently saw a workflow with no publish job.
+          $config = "gateway:`n  addr: `"127.0.0.1:$env:PORT`""
+          Set-Content -Path "$env:HOTPLEX_HOME\config.yaml" -Value $config -Encoding utf8
+          # Seed a database from BEFORE the bounded input queue existed, so
+          # startup runs the real upgrade instead of a fresh migration chain. A
+          # fresh database only proves the first-start path.
+          New-Item -ItemType Directory -Force -Path "$env:HOTPLEX_HOME\data" | Out-Null
+          Copy-Item -Path 'internal/session/testdata/pre-queue-036.db' `
+                     -Destination "$env:HOTPLEX_HOME\data\hotplex.db"
+
+          $proc = Start-Process -FilePath $env:BINARY `
+            -ArgumentList @('gateway', 'start', '--config', "$env:HOTPLEX_HOME\config.yaml") `
+            -PassThru -RedirectStandardOutput "$env:RUNNER_TEMP\out.log" `
+            -RedirectStandardError "$env:RUNNER_TEMP\err.log"
+          try {
+            $deadline = (Get-Date).AddSeconds(60)
+            $healthy = $false
+            while ((Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 2
+              if ($proc.HasExited) {
+                Get-Content "$env:RUNNER_TEMP\err.log" -Tail 40
+                throw "gateway exited early with code $($proc.ExitCode)"
+              }
+              try {
+                $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$env:PORT/health" -UseBasicParsing -TimeoutSec 5
+                if ($resp.StatusCode -eq 200) { $healthy = $true; break }
+              } catch { }
+            }
+            if (-not $healthy) {
+              Get-Content "$env:RUNNER_TEMP\err.log" -Tail 40
+              throw 'gateway did not become healthy'
+            }
+            Write-Host 'health OK'
+            if (-not (Test-Path "$env:HOTPLEX_HOME\data\hotplex.db")) {
+              Write-Host "::warning::no SQLite database at the expected path; migrations may live elsewhere"
+            }
+          } finally {
+            if (-not $proc.HasExited) {
+              # Graceful shutdown: SIGTERM-equivalent, not a kill.
+              $proc.CloseMainWindow() | Out-Null
+              $null = $proc.WaitForExit(30000)
+              if (-not $proc.HasExited) { $proc.Kill() }
+            }
+          }
+          if ($proc.ExitCode -ne 0) {
+            Get-Content "$env:RUNNER_TEMP\err.log" -Tail 40
+            throw "gateway exited with $($proc.ExitCode)"
+          }
+          Write-Host 'graceful shutdown OK'
+
+      - name: Binary starts, migrates a fresh database, serves health, shuts down cleanly (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          BINARY: ${{ steps.extract-unix.outputs.BINARY }}
+          PORT: 18888
+        run: |
+          set -euo pipefail
+          "$BINARY" --help >/dev/null
+
+          export HOTPLEX_HOME="$RUNNER_TEMP/hotplex-smoke"
+          mkdir -p "$HOTPLEX_HOME"
+          # An explicit config keeps the port off whatever the default is.
+          printf 'gateway:\n  addr: "127.0.0.1:%s"\n' "$PORT" > "$HOTPLEX_HOME/config.yaml"
+          # Seed a database from BEFORE the bounded input queue existed, so
+          # startup runs the real upgrade instead of a fresh migration chain.
+          # A fresh database only ever proves the first-start path; this is the
+          # path an existing installation actually takes, and it is the reason
+          # the pre-migration fixture is committed.
+          mkdir -p "$HOTPLEX_HOME/data"
+          cp internal/session/testdata/pre-queue-036.db "$HOTPLEX_HOME/data/hotplex.db"
+
+          "$BINARY" gateway start --config "$HOTPLEX_HOME/config.yaml" \
+            >"$RUNNER_TEMP/out.log" 2>"$RUNNER_TEMP/err.log" &
+          PID=$!
+          cleanup() {
+            if kill -0 "$PID" 2>/dev/null; then
+              # SIGTERM first: the gateway has an ordered shutdown sequence
+              # and a SIGKILL here would prove nothing about it.
+              kill -TERM "$PID" 2>/dev/null || true
+              for _ in $(seq 1 30); do
+                kill -0 "$PID" 2>/dev/null || return 0
+                sleep 1
+              done
+              kill -KILL "$PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 60); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "gateway exited during startup"
+              tail -40 "$RUNNER_TEMP/err.log"
+              exit 1
+            fi
+            if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+              echo "health OK"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
+
+          kill -TERM "$PID"
+          for _ in $(seq 1 30); do
+            kill -0 "$PID" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "::error::gateway ignored SIGTERM"
+            tail -40 "$RUNNER_TEMP/err.log"
+            exit 1
+          fi
+          wait "$PID" 2>/dev/null || true
+          echo "graceful shutdown OK"
+
+      - name: Upload smoke logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-logs-${{ matrix.target }}
+          path: ${{ runner.temp }}/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ── Publish: the single owner of the release page ──────────────────────
+  publish:
+    name: Publish ${{ needs.resolve.outputs.version }}
+    needs: [resolve, validate, build, offline-bundle, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      # Keyless signing and provenance attestation use OIDC, not a key we own.
+      # No private key is created, purchased or stored by this workflow.
+      id-token: write
+      attestations: write
+    steps:
       - name: Download all binaries
         uses: actions/download-artifact@v7
         with:
@@ -143,85 +523,103 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Download offline bundles
+        uses: actions/download-artifact@v7
+        with:
+          name: offline-bundle
+          path: dist
+
+      - name: Record release provenance
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          printf 'version=%s\nsource_sha=%s\n' "${VERSION}" "${SHA}" > dist/source-sha.txt
+
       - name: Generate checksums
         run: |
+          set -euo pipefail
           cd dist
+          # Only shipped artifacts are checksummed. The checksum file is written
+          # last and is deliberately not part of its own input list.
           sha256sum hotplex-*.tar.gz hotplex-*.zip > checksums.txt
+          if compgen -G 'hotplex-offline-bundle-*' > /dev/null; then
+            sha256sum hotplex-offline-bundle-*.tar.gz >> checksums.txt 2>/dev/null || true
+            sha256sum hotplex-offline-bundle-*.zip >> checksums.txt 2>/dev/null || true
+          fi
           echo "=== Checksums ==="
           cat checksums.txt
           echo ""
           echo "=== Integrity check ==="
-          sha256sum --check checksums.txt
+          sha256sum --check --quiet checksums.txt
+
+      - name: Verify every artifact declares this SHA
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          COUNT=0
+          for prov in dist/hotplex-*.provenance; do
+            [ -e "$prov" ] || continue
+            COUNT=$((COUNT + 1))
+            if ! grep -qx "source_sha=${SHA}" "$prov"; then
+              echo "::error::${prov} does not declare source_sha=${SHA}"
+              exit 1
+            fi
+          done
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No provenance files found; artifacts cannot be tied to a source SHA"
+            exit 1
+          fi
+          echo "${COUNT} provenance file(s) declare ${SHA}"
+
+      - name: Generate SBOMs
+        uses: anchore/sbom-action@v0.24.3
+        with:
+          path: dist
+          format: cyclonedx-json
+          output-file: sbom
+          artifact-name: sbom
+
+      - name: Sign the checksums
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Keyless-sign checksums.txt
+        env:
+          DIGEST: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --output-signature dist/checksums.txt.sig dist/checksums.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: dist/hotplex-*.tar.gz
+
+      - name: Verify what is about to be published
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The same verification a downloader performs: checksums, declared
+          # source SHA, an SBOM per artifact, a signature and an attestation.
+          # It runs here so a broken release fails before the page exists,
+          # rather than being discovered by whoever installs it.
+          python3 scripts/ci/verify_release_artifacts.py --dir dist --expect-sha "${SHA}"
 
       - name: Create Release
         uses: softprops/action-gh-release@v3.0.0
         with:
           draft: false
-          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+          prerelease: ${{ contains(needs.resolve.outputs.version, 'alpha') || contains(needs.resolve.outputs.version, 'beta') || contains(needs.resolve.outputs.version, 'rc') }}
           generate_release_notes: true
           files: |
             dist/hotplex-*.tar.gz
             dist/hotplex-*.zip
-            dist/checksums.txt
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ── Offline Bundle (OpenCode + OMO) ────────────────────────────────────
-  offline-bundle:
-    name: Pack offline bundle
-    needs: [build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-
-      - name: Resolve versions
-        id: versions
-        run: |
-          OPENCODE_VER=$(curl -sf https://api.github.com/repos/anomalyco/opencode/releases/latest \
-            | jq -r .tag_name 2>/dev/null | sed 's/^v//')
-          if [[ -z "$OPENCODE_VER" ]]; then
-            echo "::error::Failed to resolve latest OpenCode version from GitHub API (rate limit?)"
-            exit 1
-          fi
-          OMO_VER=$(npm view oh-my-opencode version 2>/dev/null || echo "unknown")
-          echo "opencode=${OPENCODE_VER}" >> "$GITHUB_OUTPUT"
-          echo "omo=${OMO_VER}" >> "$GITHUB_OUTPUT"
-          echo "OpenCode: ${OPENCODE_VER}, OMO: ${OMO_VER}"
-
-      - name: Pack bundles
-        if: steps.versions.outputs.opencode != ''
-        run: |
-          chmod +x scripts/pack-offline-bundle.sh
-
-          for PLATFORM in linux-x64 linux-x64-musl linux-arm64 linux-arm64-musl darwin-arm64 darwin-x64 windows-x64 windows-arm64; do
-            echo "==> Packing ${PLATFORM}..."
-            bash scripts/pack-offline-bundle.sh \
-              --opencode-version "${{ steps.versions.outputs.opencode }}" \
-              --omo-version "${{ steps.versions.outputs.omo }}" \
-              --platform "${PLATFORM}" \
-              --output "dist/offline-bundle-${PLATFORM}"
-          done
-
-          ls -lh dist/hotplex-offline-bundle-*.tar.gz
-
-      - name: Compute bundle checksums
-        run: |
-          for f in dist/hotplex-offline-bundle-*.tar.gz; do
-            sha256sum "$f" >> dist/checksums-offline.txt
-          done
-          cat dist/checksums-offline.txt
-
-      - name: Upload offline bundles to release
-        uses: softprops/action-gh-release@v3.0.0
-        with:
-          files: |
             dist/hotplex-offline-bundle-*.tar.gz
             dist/hotplex-offline-bundle-*.zip
-            dist/checksums-offline.txt
+            dist/checksums.txt
+            dist/source-sha.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

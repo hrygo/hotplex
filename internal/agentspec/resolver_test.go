@@ -300,9 +300,16 @@ func TestResolve_WSRESTDivergenceContained(t *testing.T) {
 
 	require.Equal(t, []string{"Bash"}, wsSpec.Policy.AllowedTools)
 	require.Nil(t, restSpec.Policy.AllowedTools, "REST must not have AllowedTools injected")
+	// The presence flag is part of the SAME decision, not a new divergence:
+	// it records that one entry declared a tool list and the other declared
+	// nothing, which is exactly the F4 gap.
+	require.True(t, wsSpec.Policy.AllowedToolsSet)
+	require.False(t, restSpec.Policy.AllowedToolsSet)
 
 	// Everything else identical.
 	wsSpec.Policy.AllowedTools = nil
 	restSpec.Policy.AllowedTools = nil
+	wsSpec.Policy.AllowedToolsSet = false
+	restSpec.Policy.AllowedToolsSet = false
 	require.Equal(t, wsSpec, restSpec)
 }

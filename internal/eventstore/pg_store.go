@@ -121,6 +121,23 @@ func (t *pgEventTx) Append(ctx context.Context, event *StoredEvent) error {
 	return nil
 }
 
+// ExecContext runs a statement inside the transaction.
+//
+// It exists so a caller owning a wider invariant — for example committing a
+// delivery effect together with its content snapshot — can share THIS
+// transaction instead of opening a second one. Two transactions could commit
+// independently, which is exactly the split this method is meant to prevent.
+// The query is rebound to PostgreSQL placeholders by the caller's dialect.
+func (t *pgEventTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return t.tx.ExecContext(ctx, t.dialect.Rebind(query), args...)
+}
+
+// QueryRowContext reads a single row inside the transaction, rebinding the
+// query to PostgreSQL placeholders.
+func (t *pgEventTx) QueryRowContext(ctx context.Context, query string, args ...any) Row {
+	return t.tx.QueryRowContext(ctx, t.dialect.Rebind(query), args...)
+}
+
 func (t *pgEventTx) AppendTurn(ctx context.Context, turn *TurnWriteRequest) error {
 	var successVal any
 	if turn.Success != nil {

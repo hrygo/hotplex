@@ -107,7 +107,7 @@ func TestOnTick_AdvanceNextRunBeforeExecution(t *testing.T) {
 	s := &Scheduler{
 		log:           slog.Default(),
 		store:         store,
-		executor:      NewExecutor(slog.Default(), bridge, sm, ""),
+		executor:      NewExecutor(slog.Default(), bridge, sm, "", nil, &mockSystemDispatcher{sm: sm}),
 		maxConcurrent: 3,
 		ctx:           context.Background(),
 		jobs:          map[string]*CronJob{},
@@ -145,7 +145,7 @@ func TestOnTick_AtSchedule_AdvancesToPreventDupes(t *testing.T) {
 	s := &Scheduler{
 		log:           slog.Default(),
 		store:         store,
-		executor:      NewExecutor(slog.Default(), bridge, sm, ""),
+		executor:      NewExecutor(slog.Default(), bridge, sm, "", nil, &mockSystemDispatcher{sm: sm}),
 		maxConcurrent: 3,
 		ctx:           context.Background(),
 		jobs:          map[string]*CronJob{},
@@ -183,7 +183,7 @@ func TestOnTick_AutoDisableAfterScheduleErrors(t *testing.T) {
 	s := &Scheduler{
 		log:           slog.Default(),
 		store:         store,
-		executor:      NewExecutor(slog.Default(), bridge, sm, ""),
+		executor:      NewExecutor(slog.Default(), bridge, sm, "", nil, &mockSystemDispatcher{sm: sm}),
 		maxConcurrent: 3,
 		ctx:           context.Background(),
 		jobs:          map[string]*CronJob{},
@@ -252,7 +252,7 @@ func TestFinishExecution_ClearsRunningAtMs(t *testing.T) {
 	s := &Scheduler{
 		log:           slog.Default(),
 		store:         store,
-		executor:      NewExecutor(slog.Default(), bridge, sm, ""),
+		executor:      NewExecutor(slog.Default(), bridge, sm, "", nil, &mockSystemDispatcher{sm: sm}),
 		maxConcurrent: 3,
 		ctx:           context.Background(),
 		jobs:          map[string]*CronJob{},
@@ -302,7 +302,7 @@ func TestOnTick_PanicRecovery(t *testing.T) {
 	s := &Scheduler{
 		log:           slog.Default(),
 		store:         store,
-		executor:      NewExecutor(slog.Default(), panicBridge{}, sm, ""),
+		executor:      NewExecutor(slog.Default(), panicBridge{}, sm, "", nil, &mockSystemDispatcher{sm: sm}),
 		maxConcurrent: 3,
 		ctx:           context.Background(),
 		jobs:          map[string]*CronJob{},

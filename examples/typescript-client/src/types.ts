@@ -275,7 +275,23 @@ export interface InputAckData {
   status: 'accepted' | 'delivered' | 'unknown' | 'failed';
   duplicate?: boolean;
   error_code?: string;
+  /** How the gateway handled the input. Absent on pre-receipt servers. */
+  input_mode?: InputMode;
+  /**
+   * Whether the gateway can recover this input after process failure.
+   * `accepted` only means durable when this is `durable`; a `volatile`
+   * acceptance is an in-memory staging decision, not a delivery proof.
+   */
+  durability?: InputDurability;
+  /** Set on injected/buffered receipts to correlate with the running turn. */
+  parent_execution_id?: string;
 }
+
+/** Input handling mode reported by input.ack. */
+export type InputMode = 'primary' | 'injected' | 'buffered' | 'queued';
+
+/** Recovery guarantee reported by input.ack. */
+export type InputDurability = 'durable' | 'volatile';
 
 // Runtime execution event payload (from pkg/events/events.go)
 export interface RuntimeExecutionData {

@@ -1069,6 +1069,30 @@ var (
 	supplementBuffered     metric.Int64Counter
 	supplementBufferedInit sync.Once
 
+	executionQueueAccepted     metric.Int64Counter
+	executionQueueAcceptedInit sync.Once
+
+	executionQueueRefused     metric.Int64Counter
+	executionQueueRefusedInit sync.Once
+
+	executionQueueDispatched     metric.Int64Counter
+	executionQueueDispatchedInit sync.Once
+
+	executionQueueSettled     metric.Int64Counter
+	executionQueueSettledInit sync.Once
+
+	executionQueueDepth     metric.Int64UpDownCounter
+	executionQueueDepthInit sync.Once
+
+	executionQueueWaitMs     metric.Float64Histogram
+	executionQueueWaitMsInit sync.Once
+
+	runtimeQueueOperatorActions     metric.Int64Counter
+	runtimeQueueOperatorActionsInit sync.Once
+
+	runtimeConsoleQueries     metric.Int64Counter
+	runtimeConsoleQueriesInit sync.Once
+
 	executionDeliveryOutcome     metric.Int64Counter
 	executionDeliveryOutcomeInit sync.Once
 
@@ -1116,6 +1140,12 @@ var (
 
 	runtimeFenceConflicts     metric.Int64Counter
 	runtimeFenceConflictsInit sync.Once
+
+	runtimeEffectActions     metric.Int64Counter
+	runtimeEffectActionsInit sync.Once
+
+	runtimeEffectConflicts     metric.Int64Counter
+	runtimeEffectConflictsInit sync.Once
 
 	runtimePlanResolutions     metric.Int64Counter
 	runtimePlanResolutionsInit sync.Once
@@ -1213,6 +1243,140 @@ func SupplementBuffered() metric.Int64Counter {
 		}
 	})
 	return supplementBuffered
+}
+
+// ExecutionQueueAccepted counts inputs durably accepted into the bounded
+// queue. Separate from supplement_buffered because that one is process-local
+// and lost on restart; conflating them would make a volatile backlog look
+// durable in the metrics.
+func ExecutionQueueAccepted() metric.Int64Counter {
+	executionQueueAcceptedInit.Do(func() {
+		var err error
+		executionQueueAccepted, err = Meter().Int64Counter(
+			"hotplex.execution.queue_accepted",
+			metric.WithDescription("Inputs durably accepted into the bounded queue. Labels: input_mode (text|native_command)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_accepted", err)
+		}
+	})
+	return executionQueueAccepted
+}
+
+// ExecutionQueueRefused counts queue rejections by reason. Labels are bounded
+// enums only — a session ID or client message ID would blow up cardinality.
+func ExecutionQueueRefused() metric.Int64Counter {
+	executionQueueRefusedInit.Do(func() {
+		var err error
+		executionQueueRefused, err = Meter().Int64Counter(
+			"hotplex.execution.queue_refused",
+			metric.WithDescription("Queue rejections. Labels: reason (full|payload_too_large|conflict|content_unavailable|not_dispatchable)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_refused", err)
+		}
+	})
+	return executionQueueRefused
+}
+
+// ExecutionQueueDispatched counts queue heads promoted across the dispatch
+// boundary.
+func ExecutionQueueDispatched() metric.Int64Counter {
+	executionQueueDispatchedInit.Do(func() {
+		var err error
+		executionQueueDispatched, err = Meter().Int64Counter(
+			"hotplex.execution.queue_dispatched",
+			metric.WithDescription("Queued inputs claimed and dispatched. Labels: input_mode (text|native_command)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_dispatched", err)
+		}
+	})
+	return executionQueueDispatched
+}
+
+// ExecutionQueueSettled counts queued inputs settled without ever reaching a
+// worker. Labels: reason (cancelled|expired|not_dispatchable).
+func ExecutionQueueSettled() metric.Int64Counter {
+	executionQueueSettledInit.Do(func() {
+		var err error
+		executionQueueSettled, err = Meter().Int64Counter(
+			"hotplex.execution.queue_settled",
+			metric.WithDescription("Queued inputs settled without dispatch. Labels: reason (cancelled|expired|not_dispatchable)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_settled", err)
+		}
+	})
+	return executionQueueSettled
+}
+
+// ExecutionQueueDepth tracks how many inputs are waiting. It is a gauge
+// because the queue is a level, not a flow.
+func ExecutionQueueDepth() metric.Int64UpDownCounter {
+	executionQueueDepthInit.Do(func() {
+		var err error
+		executionQueueDepth, err = Meter().Int64UpDownCounter(
+			"hotplex.execution.queue_depth",
+			metric.WithDescription("Inputs currently waiting in the durable queue"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_depth", err)
+		}
+	})
+	return executionQueueDepth
+}
+
+// ExecutionQueueWaitMs measures how long an input waited before dispatch. This
+// is the number that tells an operator whether the queue is helping.
+func ExecutionQueueWaitMs() metric.Float64Histogram {
+	executionQueueWaitMsInit.Do(func() {
+		var err error
+		executionQueueWaitMs, err = Meter().Float64Histogram(
+			"hotplex.execution.queue_wait_ms",
+			metric.WithDescription("Milliseconds a queued input waited before dispatch"),
+			metric.WithUnit("ms"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.execution.queue_wait_ms", err)
+		}
+	})
+	return executionQueueWaitMs
+}
+
+// RuntimeConsoleQueries counts execution-console reads. Labels: view
+// (list|timeline). Low-cardinality only — no execution IDs, no session IDs, no
+// actor. A console that answered from cache or from the session's current state
+// would show up here as a drop, which is the point of having it.
+func RuntimeConsoleQueries() metric.Int64Counter {
+	runtimeConsoleQueriesInit.Do(func() {
+		var err error
+		runtimeConsoleQueries, err = Meter().Int64Counter(
+			"hotplex.runtime.console_queries",
+			metric.WithDescription("Execution console reads. Labels: view (list|timeline)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.runtime.console_queries", err)
+		}
+	})
+	return runtimeConsoleQueries
+}
+
+// RuntimeQueueOperatorActions counts operator decisions applied to the durable
+// input queue. Labels: action (cancel|clear), result (ok|error). Low-cardinality
+// only — no execution IDs, no actors, no input content.
+func RuntimeQueueOperatorActions() metric.Int64Counter {
+	runtimeQueueOperatorActionsInit.Do(func() {
+		var err error
+		runtimeQueueOperatorActions, err = Meter().Int64Counter(
+			"hotplex.runtime.queue_actions",
+			metric.WithDescription("Operator input-queue decisions applied. Labels: action (cancel|clear), result (ok|error)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.runtime.queue_actions", err)
+		}
+	})
+	return runtimeQueueOperatorActions
 }
 
 func ExecutionDeliveryOutcome() metric.Int64Counter {
@@ -1461,6 +1625,44 @@ func RuntimeFenceConflicts() metric.Int64Counter {
 		}
 	})
 	return runtimeFenceConflicts
+}
+
+// ─── Runtime Effect Instruments ──────────────────────────────────────
+
+// RuntimeEffectActions counts operator decisions applied to an uncertain
+// delivery effect. Labels: decision (abandon|mark_delivered|requeue),
+// result (ok|conflict|error). Low-cardinality only — no effect IDs, no
+// actors, no message content.
+func RuntimeEffectActions() metric.Int64Counter {
+	runtimeEffectActionsInit.Do(func() {
+		var err error
+		runtimeEffectActions, err = Meter().Int64Counter(
+			"hotplex.runtime.effect_actions",
+			metric.WithDescription("Operator effect decisions applied. Labels: decision (abandon|mark_delivered|requeue), result (ok|conflict|error)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.runtime.effect_actions", err)
+		}
+	})
+	return runtimeEffectActions
+}
+
+// RuntimeEffectConflicts counts effect-status conflicts (409). A rising value
+// means operators decided against a stale view, or a late receipt arrived
+// while one was deciding. Neither is a bug; a spike means the console is
+// showing operators stale state.
+func RuntimeEffectConflicts() metric.Int64Counter {
+	runtimeEffectConflictsInit.Do(func() {
+		var err error
+		runtimeEffectConflicts, err = Meter().Int64Counter(
+			"hotplex.runtime.effect_conflicts",
+			metric.WithDescription("Effect-status conflicts on operator decisions (conditional update matched 0 rows)"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.runtime.effect_conflicts", err)
+		}
+	})
+	return runtimeEffectConflicts
 }
 
 // ─── Runtime Plan Instruments (#946) ────────────────────────────────

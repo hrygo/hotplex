@@ -27,11 +27,44 @@ type Config struct {
 	OAuth       OAuthConfig     `mapstructure:"oauth"`
 	Events      EventsConfig    `mapstructure:"events"`
 	Audit       AuditConfig     `mapstructure:"audit"`
+	Execution   ExecutionConfig `mapstructure:"execution"`
 	Inherits    string          `mapstructure:"inherits"` // path to parent config file; "" = no inheritance
 
 	// ResolvedAPIKeyUsers is the runtime map of expanded API key value → userID.
 	// Populated by resolveAPIKeyUsers() during load. Nil when no mapping configured.
 	ResolvedAPIKeyUsers map[string]string `mapstructure:"-"`
+}
+
+// ExecutionConfig holds gateway-level settings for the durable input
+// execution ledger and its bounded input queue.
+type ExecutionConfig struct {
+	Queue ExecutionQueueConfig `mapstructure:"queue"`
+}
+
+// ExecutionQueueConfig bounds the persistent queue of inputs that arrive while
+// a session is busy.
+//
+// Enabled defaults to FALSE on purpose. Accepting into a queue whose dispatch
+// path is not wired would silently accumulate inputs nobody ever sends, which
+// is a worse failure than refusing the input outright. Turning it on is a
+// statement that dispatch, cancellation and expiry are all live.
+type ExecutionQueueConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// PerSession caps undispatched inputs for one session.
+	PerSession int `mapstructure:"per_session"`
+	// Global caps undispatched inputs across the instance.
+	Global int `mapstructure:"global"`
+	// MaxPayloadBytes caps one queued input's content, including a native
+	// command invocation's serialized arguments.
+	MaxPayloadBytes int `mapstructure:"max_payload_bytes"`
+	// TTL is how long an undispatched input stays dispatchable.
+	TTL time.Duration `mapstructure:"ttl"`
+	// SweepInterval is how often expired inputs are settled. Zero disables the
+	// sweeper; expired inputs then wait for the next enqueue or dispatch.
+	SweepInterval time.Duration `mapstructure:"sweep_interval"`
+	// SweepBatch bounds one sweep so a large backlog cannot hold the write
+	// lock long enough to stall live input.
+	SweepBatch int `mapstructure:"sweep_batch"`
 }
 
 // MessagingConfig holds messaging platform adapter settings.
@@ -530,7 +563,66 @@ type WorkerConfig struct {
 	Environment           []string                  `mapstructure:"environment"`
 	DefaultPermissionMode string                    `mapstructure:"default_permission_mode"` // r3 (#804): bridge injects this for workspaces with no explicit override; seeded "workspace" by Default()
 	PermissionDenyDedup   PermissionDenyDedupConfig `mapstructure:"permission_deny_dedup"`
+	RuntimePlan           RuntimePlanConfig         `mapstructure:"runtime_plan"`
+	// EnvProfile / EnvAllowKeys apply to Workers that run ONE PROCESS PER
+	// SESSION. Shared-process Workers carry their own copy on their own config
+	// struct, because there the environment belongs to the process and not to
+	// any session — reporting a per-session env for those would be fiction.
+	EnvProfile   string   `mapstructure:"env_profile"`
+	EnvAllowKeys []string `mapstructure:"env_allow_keys"`
+	// RequireIsolation makes the gateway REFUSE a launch whose Worker cannot
+	// prove the named isolation dimensions (#946 E2).
+	//
+	// The bar is deliberately "enforced", not "declared". A configuration
+	// that asks for filesystem or network isolation and gets a Worker that can
+	// only claim it was requested has been given a weaker guarantee than it
+	// asked for, and quietly proceeding is how that becomes an incident.
+	RequireIsolation IsolationRequirementConfig `mapstructure:"require_isolation"`
 }
+
+// IsolationRequirementConfig names the isolation dimensions a Worker must be
+// able to prove before it may launch. An empty/false dimension is not required.
+type IsolationRequirementConfig struct {
+	Filesystem bool `mapstructure:"filesystem"`
+	Network    bool `mapstructure:"network"`
+}
+
+// RuntimePlanConfig controls how far the EffectiveRuntimePlan is trusted at
+// launch (#946 plan unit D2). The default is SHADOW: the plan is resolved,
+// bound to the Worker run and compared against the legacy parameters, but
+// nothing it says changes what actually launches.
+//
+// Mode is deliberately two-valued. "authoritative" is not a global switch —
+// it applies ONLY to the entry×Worker combinations named in AuthoritativeEntries
+// and AuthoritativeWorkers, and every other combination stays explicitly in
+// shadow. A partially rolled-out rollout must report itself as partial, never
+// as fully live.
+type RuntimePlanConfig struct {
+	// Mode is "shadow" (default) or "authoritative".
+	Mode string `mapstructure:"mode"`
+	// AuthoritativeEntries lists entry kinds allowed to launch from the plan:
+	// "webchat", "messaging", "cron". Empty = none, so "authoritative" alone
+	// never turns the plan live by accident.
+	AuthoritativeEntries []string `mapstructure:"authoritative_entries"`
+	// AuthoritativeWorkers lists worker types allowed to launch from the plan:
+	// "claude_code", "codex_cli", "opencode_server", "acp".
+	AuthoritativeWorkers []string `mapstructure:"authoritative_workers"`
+}
+
+// NormalizePlanRolloutMode maps an absent or unrecognized mode onto the safe
+// default. An unknown value must never be read as "authoritative".
+func (c RuntimePlanConfig) NormalizePlanRolloutMode() string {
+	if c.Mode == RuntimePlanModeAuthoritative {
+		return RuntimePlanModeAuthoritative
+	}
+	return RuntimePlanModeShadow
+}
+
+// Runtime plan rollout modes.
+const (
+	RuntimePlanModeShadow        = "shadow"
+	RuntimePlanModeAuthoritative = "authoritative"
+)
 
 // PermissionDenyDedupConfig controls suppression of repeated permission cards
 // after a user denial. Within Window after a deny, the same owner+fingerprint is
@@ -591,6 +683,11 @@ type CodexCLIConfig struct {
 	LocalProvider    bool          `mapstructure:"local_provider"`      // force local model provider (--local-provider)
 	ConfigProfile    string        `mapstructure:"config_profile"`      // codex config profile (--profile)
 	BypassHookTrust  bool          `mapstructure:"bypass_hook_trust"`   // bypass hook trust (--dangerously-bypass-hook-trust)
+	// EnvProfile / EnvAllowKeys describe the SHARED app-server process
+	// environment (#946 E). One process serves many sessions, so these are
+	// process-scoped by construction — there is no per-session env to report.
+	EnvProfile   string   `mapstructure:"env_profile"`
+	EnvAllowKeys []string `mapstructure:"env_allow_keys"`
 }
 
 // OpenCodeServerConfig holds OpenCode Server singleton process settings.
@@ -602,6 +699,11 @@ type OpenCodeServerConfig struct {
 	ReadyPollInterval time.Duration `mapstructure:"ready_poll_interval"`
 	HTTPTimeout       time.Duration `mapstructure:"http_timeout"`
 	ContextWindow     int64         `mapstructure:"context_window"` // fallback context window size; OCS HTTP API does not expose the real value
+	// EnvProfile / EnvAllowKeys describe the SHARED serve process environment
+	// (#946 E). One process serves many sessions, so these are process-scoped
+	// by construction — there is no per-session env to report.
+	EnvProfile   string   `mapstructure:"env_profile"`
+	EnvAllowKeys []string `mapstructure:"env_allow_keys"`
 }
 
 // ACPConfig holds ACP (Agent Client Protocol) worker settings.

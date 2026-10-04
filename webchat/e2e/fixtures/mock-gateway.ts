@@ -35,10 +35,28 @@ export type MockGatewayWindow = Window & {
         pauseNextConnect(): void;
         setNextInitState(state: "idle" | "running"): void;
         setNextInputOutcome(
-            outcome: "delivered" | "unknown" | "failed",
+            outcome: InputOutcome,
         ): void;
     };
 };
+
+/**
+ * Terminal-or-not outcome the mock gateway reports for the next client input.
+ *
+ * - `delivered` / `unknown` / `failed`: the ordinary terminal receipts.
+ * - `volatile`: one `accepted` receipt with `durability=volatile`, mirroring a
+ *   supplement the gateway staged in process memory. No `delivered` ever
+ *   follows, so a client that waits for one would hang forever.
+ * - `queued`: one `accepted` receipt with `durability=durable`. This is an
+ *   INTERMEDIATE state — `delivered` is still owed — so the client must keep
+ *   the queue head in flight rather than treating acceptance as settlement.
+ */
+export type InputOutcome =
+    | "delivered"
+    | "unknown"
+    | "failed"
+    | "volatile"
+    | "queued";
 
 /**
  * Installs a parameterized in-page mock gateway plus a fake `/api/**` backend.
@@ -62,7 +80,7 @@ export async function installMockGateway(page: Page, workerType: string) {
         let serverSequence = 0;
         let activeSocket: MockWebSocket | null = null;
         let nextInitState: "idle" | "running" = "idle";
-        let nextInputOutcome: "delivered" | "unknown" | "failed" = "delivered";
+        let nextInputOutcome: InputOutcome = "delivered";
         let pauseNextSocketOpen = false;
 
         class MockWebSocket extends EventTarget {
@@ -123,14 +141,35 @@ export async function installMockGateway(page: Page, workerType: string) {
                     const outcome = nextInputOutcome;
                     nextInputOutcome = "delivered";
                     queueMicrotask(() => {
-                        this.emit("input.ack", {
+                        const base = {
                             client_message_id: envelope.id,
                             execution_id: `execution-${envelope.id}`,
-                            status: "accepted",
-                        });
+                        };
+                        if (outcome === "volatile") {
+                            // Mirrors internal/gateway ackSupplement for a
+                            // buffered supplement: staged in process memory,
+                            // explicitly NOT a delivery proof.
+                            this.emit("input.ack", {
+                                ...base,
+                                status: "accepted",
+                                input_mode: "buffered",
+                                durability: "volatile",
+                                parent_execution_id: "execution-parent-turn",
+                            });
+                            return;
+                        }
+                        if (outcome === "queued") {
+                            this.emit("input.ack", {
+                                ...base,
+                                status: "accepted",
+                                input_mode: "queued",
+                                durability: "durable",
+                            });
+                            return;
+                        }
+                        this.emit("input.ack", { ...base, status: "accepted" });
                         this.emit("input.ack", {
-                            client_message_id: envelope.id,
-                            execution_id: `execution-${envelope.id}`,
+                            ...base,
                             status: outcome,
                             ...(outcome === "delivered"
                                 ? {}

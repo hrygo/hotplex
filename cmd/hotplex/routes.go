@@ -154,6 +154,36 @@ func setupRoutes(
 			&runtimeEventNotifier{hub: hub},
 		)
 	}
+	// Delivery effect console: inspect effects and their per-attempt history,
+	// and apply a bounded operator decision to an uncertain delivery.
+	// Nil store → endpoints answer 503 instead of crashing the mux.
+	if deps.EffectStore != nil {
+		adminAPI.SetRuntimeEffects(&effectProviderAdapter{store: deps.EffectStore})
+	}
+	// Durable input queue operator actions. The gateway Handler owns queue
+	// dispatch, so it is the provider; nil → 503 rather than a fake success.
+	if handler != nil {
+		adminAPI.SetRuntimeQueue(handler)
+	}
+	// Execution console (#868): a bounded, redacted projection of a run's
+	// history. Wired from three independent read views so a missing one
+	// degrades its own section instead of the whole projection.
+	if deps.ExecutionStore != nil {
+		adminAPI.SetExecutionConsole(
+			&executionConsoleAdapter{store: deps.ExecutionStore},
+			&consoleEventAdapter{store: deps.EventStore},
+			nil,
+		)
+	}
+	if deps.EffectStore != nil {
+		adminAPI.SetConsoleEffects(&consoleEffectAdapter{store: deps.EffectStore})
+	}
+	// Runtime-plan diagnostics report what a session's current run was ACTUALLY
+	// launched under, not a re-resolution against the live config (#946 D3).
+	// Nil bridge → the diagnostic falls back and marks the answer as such.
+	if bridge != nil {
+		adminAPI.SetLaunchPlanProvider(bridge)
+	}
 
 	if cfg.Admin.RateLimitEnabled {
 		limiter := admin.NewRateLimiter(cfg.Admin.RequestsPerSec, cfg.Admin.Burst)
@@ -205,6 +235,28 @@ func setupRoutes(
 	// a fencing token. GET needs runtime:read, POST needs runtime:write.
 	adminMux.HandleFunc("GET /admin/executions/fences", adminAPI.HandleListFences)
 	adminMux.HandleFunc("POST /admin/executions/{id}/fence-action", adminAPI.HandleFenceAction)
+
+	// Execution console (#868): browse runs and open one run's bounded,
+	// redacted timeline. Reads only; the decisions live at the fence, queue
+	// and effect endpoints above, which stay separate on purpose.
+	adminMux.HandleFunc("GET /admin/executions", adminAPI.ListExecutions)
+	adminMux.HandleFunc("GET /admin/executions/{id}/timeline", adminAPI.GetExecutionTimeline)
+
+	// Durable input queue operator actions: withdraw promises that have not
+	// been dispatched yet. Separate from the fence endpoints because a queued
+	// input is not a broken run — cancelling one must never be reported as
+	// having unblocked or failed an execution.
+	adminMux.HandleFunc("POST /admin/executions/{id}/queue-cancel", adminAPI.HandleCancelQueuedInput)
+	adminMux.HandleFunc("POST /admin/sessions/{id}/queue-clear", adminAPI.HandleClearSessionQueue)
+
+	// Delivery effect API: inspect external deliveries and their attempts, and
+	// decide an uncertain one. Separate from the fence endpoints on purpose —
+	// a delivery decision must never unblock a run, and a fence decision must
+	// never rewrite delivery history. GET needs runtime:read, POST needs
+	// runtime:write.
+	adminMux.HandleFunc("GET /admin/effects", adminAPI.HandleListEffects)
+	adminMux.HandleFunc("GET /admin/effects/{id}", adminAPI.HandleGetEffect)
+	adminMux.HandleFunc("POST /admin/effects/{id}/action", adminAPI.HandleEffectAction)
 
 	// User activity API (issue #833) - by-user audit query + export
 	adminMux.HandleFunc("GET /admin/users/{id}/activity", adminAPI.HandleUserActivity)

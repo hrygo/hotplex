@@ -19,6 +19,12 @@ import (
 // SnapshotVersion).
 const PlanVersion = 1
 
+// LaunchFingerprintVersion versions the INTERNAL launch fingerprint — the
+// identity of the decisions that will actually be applied at start. It is a
+// separate version line from PlanVersion because the two answer different
+// questions and change for different reasons.
+const LaunchFingerprintVersion = 1
+
 // PlanResolverID names the resolver implementation that produced a plan. It is
 // part of the canonical hash input, so a future resolver generation produces a
 // different plan identity for the same effective fields.
@@ -153,6 +159,63 @@ type EffectiveRuntimePlan struct {
 	SourceRefs    []PlanSourceRef
 	Warnings      []PlanWarning
 	Blocked       []PlanBlockReason
+
+	// LaunchFingerprint is the INTERNAL identity of the decisions this plan
+	// will actually apply. It is deliberately NOT the public PlanHash:
+	//
+	//   - PlanHash stays a redacted, publicly servable identity. It covers only
+	//     what a public view may contain, so it changes when harmless
+	//     presentation fields change.
+	//   - LaunchFingerprint covers the execution-relevant decisions plus the
+	//     coverage flags saying which ones were actually resolved.
+	//
+	// Neither may be used as an authorization or approval cache key: a
+	// fingerprint identifies a PLAN, never proof that it was applied. Only the
+	// observed bootstrap state (ObservedSummary) can support such a claim, and
+	// that requires Worker-reported facts.
+	LaunchFingerprint string
+
+	// Coverage records which execution-relevant decisions this plan actually
+	// pinned. An uncovered decision is not a zero value — it is an ABSENT one,
+	// and the fingerprint must make that difference visible so two plans that
+	// look identical cannot be confused.
+	Coverage PlanCoverage
+}
+
+// PlanCoverage names the execution-relevant decisions a plan pinned. Every flag
+// is a statement about the plan, not about the Worker: "resolved" never means
+// "enforced".
+type PlanCoverage struct {
+	WorkerType      bool `json:"worker_type"`
+	PermissionMode  bool `json:"permission_mode"`
+	AllowedTools    bool `json:"allowed_tools"`
+	DisallowedTools bool `json:"disallowed_tools"`
+	Model           bool `json:"model"`
+	SandboxMode     bool `json:"sandbox_mode"`
+	Budget          bool `json:"budget"`
+	EnvProfile      bool `json:"env_profile"`
+	CapabilityIDs   bool `json:"capability_ids"`
+	SkillMaterial   bool `json:"skill_material"`
+	ConfigMaterial  bool `json:"config_material"`
+}
+
+// coverageOf reports which decisions the plan actually pinned. Presence, not
+// emptiness, is the test: a caller that explicitly CLEARED the tool list
+// resolved that decision, while a caller that never mentioned it did not.
+func coverageOf(spec AgentSpec, plan EffectiveRuntimePlan) PlanCoverage {
+	return PlanCoverage{
+		WorkerType:      spec.Worker.Type != "",
+		PermissionMode:  spec.Policy.PermissionMode != "",
+		AllowedTools:    spec.Policy.AllowedToolsSet || spec.Policy.AllowedTools != nil,
+		DisallowedTools: spec.Policy.DisallowedToolsSet || spec.Policy.DisallowedTools != nil,
+		Model:           spec.Worker.ModelSet || spec.Worker.Model != "",
+		SandboxMode:     spec.Sandbox.Mode != "",
+		Budget:          spec.Budget.MaxTurns != 0 || spec.Budget.MaxBudgetUSD != 0,
+		EnvProfile:      plan.EnvProfile != "",
+		CapabilityIDs:   len(plan.CapabilityIDs) > 0,
+		SkillMaterial:   plan.SkillHash != "",
+		ConfigMaterial:  plan.ConfigHash != "",
+	}
 }
 
 // EffectiveRuntimePlanView is the redacted public projection of a plan (#946
@@ -198,13 +261,32 @@ type EffectiveRuntimePlanView struct {
 func (r Resolver) ResolvePlan(in Input) (EffectiveRuntimePlan, error) {
 	plan := EffectiveRuntimePlan{Version: PlanVersion, Resolver: PlanResolverID}
 
-	spec, err := r.Resolve(in)
+	spec, authority, err := r.resolveWithAuthority(in)
 	if err != nil {
 		reason := blockReasonForResolveError(err)
 		plan.Blocked = []PlanBlockReason{reason}
 		return plan, fmt.Errorf("%w: %s: %w", ErrPlanBlocked, reason.Code, err)
 	}
 	plan.AgentSpec = spec
+
+	// Authority is evaluated before any other desired-state rule: no
+	// precedence answer can make an over-ceiling request legal.
+	if authority.BlockedCode != "" {
+		reason := PlanBlockReason{
+			Code:    authority.BlockedCode,
+			Message: boundedMessage("explicitly requested permission tier is above every ceiling for this session"),
+		}
+		plan.Blocked = []PlanBlockReason{reason}
+		return plan, fmt.Errorf("%w: %s", ErrPlanBlocked, authority.BlockedCode)
+	}
+	if missing := missingRequiredCapabilities(in.RequiredCapabilities, in.VerifiedCapabilities); len(missing) > 0 {
+		reason := PlanBlockReason{
+			Code:    BlockRequiredCapabilityUnverified,
+			Message: boundedMessage("required capability could not be verified against the backend"),
+		}
+		plan.Blocked = []PlanBlockReason{reason}
+		return plan, fmt.Errorf("%w: %s", ErrPlanBlocked, BlockRequiredCapabilityUnverified)
+	}
 
 	if mode := spec.Sandbox.Mode; mode != "" {
 		if _, ok := knownSandboxModes[mode]; !ok {
@@ -218,8 +300,20 @@ func (r Resolver) ResolvePlan(in Input) (EffectiveRuntimePlan, error) {
 	}
 
 	plan.Warnings = planWarnings(in, spec)
+	if authority.WarningCode != "" {
+		plan.Warnings = append(plan.Warnings, PlanWarning{
+			Code:    authority.WarningCode,
+			Message: authorityWarningMessage(authority.WarningCode),
+		})
+	}
 	plan.SourceRefs = planSourceRefs(in, spec)
+	// Bind the plan to the config policy revision it was resolved against, so
+	// a later config edit is visible as a different launch rather than an
+	// invisible one. Only the secret-free allowlist feeds this hash.
+	plan.ConfigHash = ConfigPolicyRevision(in.Cfg)
+	plan.Coverage = coverageOf(spec, plan)
 	plan.PlanHash = CanonicalPlanHash(plan.Redacted())
+	plan.LaunchFingerprint = CanonicalLaunchFingerprint(plan)
 	return plan, nil
 }
 

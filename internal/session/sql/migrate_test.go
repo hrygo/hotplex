@@ -323,3 +323,196 @@ func TestMigrations_030AuditNoDelete_BlocksUnauthorizedRowDeletes(t *testing.T) 
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_activity`).Scan(&n))
 	require.Equal(t, 0, n, "all rows pruned via GC path")
 }
+
+// insertMigrationSession creates a real sessions row so the execution_queue
+// foreign keys are exercised rather than switched off.
+func insertMigrationSession(t *testing.T, db *sql.DB, id string) {
+	t.Helper()
+	_, err := db.ExecContext(context.Background(), `INSERT INTO sessions
+		(id, user_id, worker_type, state, created_at, updated_at)
+		VALUES (?, 'u1', 'claude_code', 'idle', ?, ?)`,
+		id, time.Now().UnixMilli(), time.Now().UnixMilli())
+	require.NoError(t, err, "seed session %s", id)
+}
+
+// TestMigrations_037ExecutionQueue_SchemaAndInvariants covers migration 037 on
+// SQLite, where widening the runtime_status CHECK required a full table
+// rebuild. A rebuild that dropped an index, the input-idempotency unique key
+// or the sessions foreign key would silently weaken guarantees that migrations
+// 026/027/031 established, so those are asserted directly rather than assumed.
+func TestMigrations_037ExecutionQueue_SchemaAndInvariants(t *testing.T) {
+	t.Parallel()
+
+	const ts = 1700000000000
+	ctx := context.Background()
+	db := openMigrationTestDB(t)
+	require.NoError(t, session.RunMigrations(ctx, db, dbutil.DialectSQLite))
+
+	insertMigrationSession(t, db, "s-queue")
+
+	// 1) The rebuild kept every column the older migrations added.
+	wantCols := []string{
+		"execution_id", "session_id", "client_message_id", "payload_hash", "status",
+		"error_code", "created_at", "updated_at", "delivered_at",
+		"owner_instance_id", "worker_run_id", "lease_until",
+		"runtime_status", "runtime_error_code", "started_at", "finished_at",
+		"fence_reason", "fence_version", "fence_created_at",
+	}
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(execution_inputs)`)
+	require.NoError(t, err)
+	gotCols := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		require.NoError(t, rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk))
+		gotCols[name] = true
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+	for _, col := range wantCols {
+		require.True(t, gotCols[col], "execution_inputs lost column %s in the 037 rebuild", col)
+	}
+
+	// 2) Every pre-037 index survived the rebuild.
+	for _, idx := range []string{
+		"idx_execution_inputs_session_created",
+		"idx_execution_inputs_status_updated",
+		"idx_execution_owner_runtime",
+		"idx_execution_one_active_per_session",
+		"idx_execution_fenced",
+	} {
+		var n int
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=? AND tbl_name='execution_inputs'`, idx,
+		).Scan(&n))
+		require.Equal(t, 1, n, "expected index %s to survive the 037 rebuild", idx)
+	}
+
+	insertExec := func(execID, sessionID, msgID, runtime string) error {
+		_, err := db.ExecContext(ctx, `INSERT INTO execution_inputs
+			(execution_id, session_id, client_message_id, payload_hash, status, error_code,
+			 created_at, updated_at, owner_instance_id, worker_run_id, lease_until,
+			 runtime_status, runtime_error_code, fence_reason)
+			VALUES (?, ?, ?, ?, 'accepted', '', ?, ?, '', '', 0, ?, '', '')`,
+			execID, sessionID, msgID, "hash_"+msgID, ts, ts, runtime)
+		return err
+	}
+
+	// 3) 'queued' is now a legal runtime fact and still does not occupy the
+	//    single active slot: twenty queued rows may coexist with one pending.
+	require.NoError(t, insertExec("exec_q1", "s-queue", "msg-q1", "queued"))
+	require.NoError(t, insertExec("exec_q2", "s-queue", "msg-q2", "queued"))
+	require.NoError(t, insertExec("exec_pending", "s-queue", "msg-pending", "pending"))
+	err = insertExec("exec_second_pending", "s-queue", "msg-second-pending", "pending")
+	require.Error(t, err, "a queued backlog must not weaken the single-active gate")
+
+	// 4) An unknown value is still rejected: the CHECK widened, it did not open.
+	require.Error(t, insertExec("exec_bogus", "s-queue", "msg-bogus", "bogus"),
+		"invalid runtime_status must still be rejected")
+
+	// 5) Input idempotency survived: the (session_id, client_message_id) key.
+	require.Error(t, insertExec("exec_dup", "s-queue", "msg-q1", "completed"),
+		"unique (session_id, client_message_id) must survive the 037 rebuild")
+
+	// 6) The queue, allocator and budget tables exist with their indexes.
+	for _, table := range []string{"execution_queue", "execution_queue_counters", "execution_queue_budget"} {
+		var n int
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n))
+		require.Equal(t, 1, n, "expected table %s after migration 037", table)
+	}
+	for _, idx := range []string{"idx_execution_queue_head", "idx_execution_queue_expiry"} {
+		var n int
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=? AND tbl_name='execution_queue'`, idx,
+		).Scan(&n))
+		require.Equal(t, 1, n, "expected index %s on execution_queue", idx)
+	}
+
+	// 7) FIFO order is a database fact: the per-session ordinal is unique.
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue
+		(execution_id, session_id, queue_seq, enqueued_at, expires_at)
+		VALUES ('exec_q1', 's-queue', 1, ?, ?)`, ts, ts+1000)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue
+		(execution_id, session_id, queue_seq, enqueued_at, expires_at)
+		VALUES ('exec_q2', 's-queue', 1, ?, ?)`, ts, ts+1000)
+	require.Error(t, err, "two queue rows must not share a per-session ordinal")
+
+	// 8) The budget row is a single well-known row, so the enqueue path can
+	//    always find it to serialise the global capacity decision.
+	var used int
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT used FROM execution_queue_budget WHERE budget_id = 1`).Scan(&used))
+	require.Equal(t, 0, used, "budget starts empty")
+
+	_, err = db.ExecContext(ctx, `DELETE FROM sessions WHERE id = 's-queue'`)
+	require.NoError(t, err, "session delete must cascade to execution_queue")
+
+	var remaining int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM execution_queue`).Scan(&remaining))
+	require.Equal(t, 0, remaining, "queued rows must not outlive their session")
+
+	// 9) Depth is derived from execution_queue, never tallied by the delete
+	//    paths. Session delete cascade removed both rows without running any
+	//    application code, which is exactly why the enqueue path recounts
+	//    instead of trusting a maintained counter.
+	var depth int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM execution_queue`).Scan(&depth))
+	require.Equal(t, 0, depth)
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT used FROM execution_queue_budget WHERE budget_id = 1`).Scan(&used))
+	require.Equal(t, 0, used)
+}
+
+// TestMigrations_038ExecutionQueuePayloads_ContentFollowsControlFacts guards
+// the retention rule the queue depends on. The payload foreign key must be a
+// real ON DELETE CASCADE to execution_queue: without it, cancelling, expiring
+// or deleting a session would leave queued prompts behind with nothing that
+// says they are no longer dispatchable.
+func TestMigrations_038ExecutionQueuePayloads_ContentFollowsControlFacts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openMigrationTestDB(t)
+	require.NoError(t, session.RunMigrations(ctx, db, dbutil.DialectSQLite))
+
+	var n int
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='execution_queue_payloads'`).Scan(&n))
+	require.Equal(t, 1, n, "expected the payload table after migration 038")
+
+	insertMigrationSession(t, db, "s-payload")
+	_, err := db.ExecContext(ctx, `INSERT INTO execution_inputs
+		(execution_id, session_id, client_message_id, payload_hash, status, error_code,
+		 created_at, updated_at, owner_instance_id, worker_run_id, lease_until,
+		 runtime_status, runtime_error_code, fence_reason)
+		VALUES ('exec_p', 's-payload', 'msg-p', 'hash_p', 'accepted', '', 1, 1, '', '', 0, 'queued', '', '')`)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue
+		(execution_id, session_id, queue_seq, enqueued_at, expires_at, payload_ref, payload_bytes)
+		VALUES ('exec_p', 's-payload', 1, 1, 9999999999999, 'qpayload_p', 12)`)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue_payloads
+		(payload_id, execution_id, session_id, content, invocation_json,
+		 content_bytes, content_sha256, created_at)
+		VALUES ('qpayload_p', 'exec_p', 's-payload', 'do the thing', '', 12, 'hash_p', 1)`)
+	require.NoError(t, err)
+
+	// A payload with no queue row cannot exist: the foreign key is the retention
+	// rule, not a convenience constraint.
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue_payloads
+		(payload_id, execution_id, session_id, content, invocation_json,
+		 content_bytes, content_sha256, created_at)
+		VALUES ('qpayload_orphan', 'exec_missing', 's-payload', 'x', '', 1, 'h', 1)`)
+	require.Error(t, err, "payload content must not exist without a queued input to dispatch it for")
+
+	// Removing the queue row removes the content with it.
+	_, err = db.ExecContext(ctx, `DELETE FROM execution_queue WHERE execution_id = 'exec_p'`)
+	require.NoError(t, err)
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM execution_queue_payloads`).Scan(&n))
+	require.Zero(t, n, "content must not outlive the promise to dispatch it")
+}

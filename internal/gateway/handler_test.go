@@ -1504,6 +1504,7 @@ func TestHandleSupplementOnBusy_AcknowledgesAndDeduplicates(t *testing.T) {
 	t.Parallel()
 	mw := &mockMidTurnWorker{}
 	h, _, hub, _ := newBusyTestHandler(t, mw)
+	h.executionStore = &fakeExecutionStore{activeRecord: testExecutionRecord(execution.StatusDelivered)}
 	conn := &mockPlatformConn{}
 	hub.JoinPlatformSession("s", conn)
 
@@ -1522,7 +1523,12 @@ func TestHandleSupplementOnBusy_AcknowledgesAndDeduplicates(t *testing.T) {
 				continue
 			}
 			data, ok := got.Event.Data.(events.InputAckData)
-			if !ok || data.ClientMessageID != clientMessageID(env) || data.Status != events.ExecutionStatusDelivered {
+			if !ok ||
+				data.ClientMessageID != clientMessageID(env) ||
+				data.Status != events.ExecutionStatusDelivered ||
+				data.InputMode != events.InputModeInjected ||
+				data.Durability != events.InputDurabilityVolatile ||
+				data.ParentExecutionID != "exec_test" {
 				return false
 			}
 			acks++
@@ -1606,6 +1612,7 @@ func TestMidTurnContract_AllWorkers(t *testing.T) {
 				w = new(mockWorkerForHandler)
 			}
 			h, _, hub, bridge := newBusyTestHandler(t, w)
+			h.executionStore = &fakeExecutionStore{activeRecord: testExecutionRecord(execution.StatusDelivered)}
 			sessionID := "mid-turn-" + tc.name
 			conn := &mockPlatformConn{}
 			hub.JoinPlatformSession(sessionID, conn)
@@ -1626,11 +1633,27 @@ func TestMidTurnContract_AllWorkers(t *testing.T) {
 			}, time.Second, 10*time.Millisecond)
 
 			modeCount := 0
+			ackCount := 0
 			for _, got := range conn.envelopes() {
+				if got.Event.Type == events.InputAck {
+					data, ok := got.Event.Data.(events.InputAckData)
+					require.True(t, ok)
+					require.Equal(t, "exec_test", data.ParentExecutionID)
+					require.Equal(t, events.InputDurabilityVolatile, data.Durability)
+					if tc.native {
+						require.Equal(t, events.InputModeInjected, data.InputMode)
+						require.Equal(t, events.ExecutionStatusDelivered, data.Status)
+					} else {
+						require.Equal(t, events.InputModeBuffered, data.InputMode)
+						require.Equal(t, events.ExecutionStatusAccepted, data.Status)
+					}
+					ackCount++
+				}
 				if got.Metadata != nil && got.Metadata["supplement_mode"] == tc.mode {
 					modeCount++
 				}
 			}
+			require.Equal(t, 1, ackCount)
 			require.GreaterOrEqual(t, modeCount, 1, "the platform must observe the contract mode")
 
 			bridge.pending.mu.Lock()

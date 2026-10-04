@@ -18,7 +18,10 @@ jobs:
         env:
           BRANCH: ${{ github.head_ref }}
         run: |
-          REGEX="^(feat|fix|refactor|perf|docs|chore|test|batch)/([0-9]+-)?.*$"
+          # `codex/` is the prefix the Codex desktop app mandates for the
+          # branches it creates; the type lives in the commit subject
+          # (Conventional Commits), so the branch carries the workspace name.
+          REGEX="^(feat|fix|refactor|perf|docs|chore|test|batch|codex)/([0-9]+-)?.*$"
           if [[ ! "$BRANCH" =~ $REGEX ]]; then
             echo "::error::Branch '$BRANCH' does not match required format: <type>/[<id>-]<desc>"
             echo "Example: feat/96-login or fix/123-bug"

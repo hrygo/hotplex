@@ -33,6 +33,7 @@ description: "HotPlex Worker Gateway 所有配置项的权威参考，覆盖配�
    - [oauth — WebChat 企业 SSO（OIDC）](#314-oauth--webchat--ssooidc)
    - [inherits — 配置继承](#315-inherits--)
    - [events 和 audit — 事件与审计留存](#316-events-和-audit--事件与审计留存)
+   - [execution.queue — 持久输入队列](#317-executionqueue--)
 4. [热重载](#4-热重载)
 5. [环境变量速查](#5-环境变量速查)
 
@@ -258,6 +259,21 @@ Worker 进程生命周期和环境配置。
 | `default_permission_mode` | string | `workspace` | — | workspace 无显式 override 时 bridge 注入的默认权限模式（r3 #804）。合法值 `read-only`/`workspace`/`auto-edit`/`bypass`/空，空与缺省均归一化为 `workspace`；非法值在启动与热重载时拒绝（防 typo fail-open）。仅 config.yaml 可配置，无 env 绑定 |
 | `permission_deny_dedup.enabled` | bool | `true` | `HOTPLEX_WORKER_PERMISSION_DENY_DEDUP_ENABLED` | 用户拒绝权限后，在 `window` 窗口内对相同 owner+fingerprint 的重复权限请求本地自动拒绝，不再转发新卡片给客户端——关闭「拒绝 → Agent 秒级重试同一工具 → 新卡片」循环。详见 `docs/specs/Permission-Deny-Dedup-Spec.md` |
 | `permission_deny_dedup.window` | duration | `60s` | `HOTPLEX_WORKER_PERMISSION_DENY_DEDUP_WINDOW` | 拒绝去重窗口长度。`enabled=true` 时必须 > 0，否则启动拒绝 |
+| `runtime_plan.mode` | string | `shadow` | — | EffectiveRuntimePlan 在启动路径上的信任级别（#946 D2/D3）。`shadow` = 解析计划、绑定到本次 Worker run 并与实际启动参数做字段级 parity 对比，但**不改变任何启动行为**；`authoritative` = 由计划驱动启动，且仅对下面两个白名单同时命中的「入口 × Worker」组合生效。任何其他值（含缺省）一律按 `shadow` 处理，绝不解读为 authoritative |
+| `runtime_plan.authoritative_entries` | string[] | `[]` | — | 允许由计划驱动启动的入口类型：`webchat` / `messaging` / `cron`。为空表示**没有任何入口**处于 authoritative |
+| `runtime_plan.authoritative_workers` | string[] | `[]` | — | 允许由计划驱动启动的 Worker 类型：`claude_code` / `codex_cli` / `opencode_server` / `acp`。为空表示**没有任何 Worker**处于 authoritative |
+| `env_profile` | string | `compat` | — | Worker 子进程环境的构建方式（#946 E）。`compat` = 沿用现状：继承宿主环境并减去 blocklist（denylist 只能拦住已被枚举的变量）。`strict` = 反转：从**按 OS 的最小系统白名单**开始，只接受显式注入的变量。任何其他取值（含缺省）一律按 `compat` 处理，绝不解读为 strict |
+| `env_allow_keys` | string[] | `[]` | — | strict 模式下额外允许从宿主继承的变量名。这是**运维配置，不是客户端输入**：请求不得据此扩大宿主环境向 Worker 的泄漏面。blocklist 优先级更高，显式 block 不会被 allow 覆盖 |
+| `codex_cli.env_profile` / `codex_cli.env_allow_keys` | string / string[] | `compat` / `[]` | — | 同上，但作用于 **共享的 codex app-server 进程**。该进程服务多个会话，环境属于**进程**而非会话，因此配置挂在 Worker 自己的段上 |
+| `opencode_server.env_profile` / `opencode_server.env_allow_keys` | string / string[] | `compat` / `[]` | — | 同上，作用于共享的 `opencode serve` 进程 |
+| `require_isolation.filesystem` | bool | `false` | — | 要求 Worker 在启动前**证明**文件系统隔离，否则拒绝启动（#946 E2）。判定门槛是 `enforced`，不是 `declared`：`declared` 只说明「我们请求过」，`observed` 只说明「后端自述」，`partial` 说明只约束了一部分——都比要求的保证弱 |
+| `require_isolation.network` | bool | `false` | — | 同上，针对网络隔离。默认关闭：**不要求隔离时，未知（unknown）不会阻止启动**，因此仅启用 strict env 即可在没有 OS 隔离后端的主机上正常运行 |
+> 💡 **两个白名单都必须命中**：`authoritative` 需要「入口」与「Worker」同时在各自白名单内才生效。只配一侧的 rollout 会整体停留在 `shadow`，因此部分上线永远不会自称已完整上线。默认两个白名单都是空的，即使把 `mode` 写成 `authoritative`，也不会有任何组合真正切换。
+
+> ⚠️ **strict 环境不是隔离**。它只收窄**环境变量**，不提供文件系统或网络隔离。`strict` 下传入 `HOME` 也**不**意味着目录被隔离——那只是一个变量，Worker 仍可读取 OS 允许它读取的任何路径。隔离结论必须来自隔离能力报告（`declared` / `observed` / `enforced` / `partial` / `unavailable` / `unknown`），由实际后端证据产生，不能由 permission mode 或 env profile 推断。
+
+
+> 💡 **未知是合法答案**。Worker 通过可选接口 `IsolationReporter` 上报隔离能力；未实现该接口的 Worker 报告 `unknown`，而不是被推断为安全。空报告等同于「无法回答」，同样按 `unknown` 处理。`scope=process` 表示该边界属于共享进程——同一进程上的所有会话看到的是同一条边界，报告成 per-session 属于编造。
 
 **默认 environment**：
 
@@ -791,6 +807,24 @@ log:
 | `audit.full_content_retention` | duration | `2160h` (90天) | `HOTPLEX_AUDIT_FULL_CONTENT_RETENTION` | 审计原文的兼容配置字段；不再影响 event store 或 turns 留存 |
 
 > 网关 INFO 日志不会记录消息正文、prompt 或 `Envelope.Event.Data`。为支持关联排障，日志仅包含事件类型、session、seq、`data_size` 与 `data_sha256`（SHA-256 的短指纹）。
+
+### 3.17 execution.queue — 持久输入队列
+
+当一个 session 正在执行时到达的补充输入，可以进入一个**有界持久队列**，等待当前轮次结束后按 FIFO 派发。这个队列兑现的是网关对客户端的承诺："这条输入已经存下来了，稍后会被派发"，而不是"已进入内存暂存，重启可能丢失"。
+
+| 字段 | 类型 | 默认值 | 环境变量 | 说明 |
+|------|------|--------|----------|------|
+| `execution.queue.enabled` | bool | `false` | `HOTPLEX_EXECUTION_QUEUE_ENABLED` | 队列总开关。**默认关闭**，见下方说明 |
+| `execution.queue.per_session` | int | `20` | `HOTPLEX_EXECUTION_QUEUE_PER_SESSION` | 单个 session 允许的未派发输入条数上限 |
+| `execution.queue.global` | int | `1000` | `HOTPLEX_EXECUTION_QUEUE_GLOBAL` | 整个实例允许的未派发输入条数上限 |
+| `execution.queue.max_payload_bytes` | int | `65536` (64 KiB) | `HOTPLEX_EXECUTION_QUEUE_MAX_PAYLOAD_BYTES` | 单条输入的正文上限；原生命令的 invocation 参数一并计入 |
+| `execution.queue.ttl` | duration | `24h` | `HOTPLEX_EXECUTION_QUEUE_TTL` | 未派发输入保持可派发状态的最长时间，超时后按 `QUEUE_EXPIRED` 结算 |
+| `execution.queue.sweep_interval` | duration | `1m` | `HOTPLEX_EXECUTION_QUEUE_SWEEP_INTERVAL` | 过期扫描间隔；设为 `0` 关闭后台扫描 |
+| `execution.queue.sweep_batch` | int | `100` | `HOTPLEX_EXECUTION_QUEUE_SWEEP_BATCH` | 单次扫描处理的最大条数，避免大积压长时间占用写锁 |
+
+> **`enabled` 默认为 `false`**：只有派发、取消与过期三条路径都接通之后，接收才成为一件有意义的事。在派发未接通的情况下开启队列，会静默堆积无人发送的输入——这比直接拒绝输入更糟。容量已满、载荷过大等情况下，网关不会挤掉已被ACK 的输入，而是回落到内存暂存并如实标注为 volatile。
+
+队列只覆盖**尚未派发**的输入。一旦某条输入跨过派发边界（进入 pending 并取得 owner lease），它的失败与重试语义与其他 execution 完全一致：响应丢失即 `unknown` + fence，不会自动重投。`/stop` 只停止当前轮次，不影响队列；要撤销一条已入队输入，使用 Admin API `POST /admin/executions/{id}/queue-cancel`，已派发的输入返回 `409`。
 
 ---
 

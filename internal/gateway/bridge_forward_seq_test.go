@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/hrygo/hotplex/internal/eventstore"
+	"github.com/hrygo/hotplex/internal/execution"
 	"github.com/hrygo/hotplex/internal/sqlutil"
 	"github.com/hrygo/hotplex/internal/worker"
 	"github.com/hrygo/hotplex/pkg/aep"
@@ -131,4 +132,56 @@ func TestProcessForwardedEvent_NoCollectorPreservesWorkerSeq(t *testing.T) {
 	// Hub SeqGen should NOT have been used (collector is nil, worker seq != 0).
 	require.Equal(t, int64(0), hub.NextSeqPeek(sessionID),
 		"Hub SeqGen must not advance when collector is disabled and worker provided a non-zero seq")
+}
+
+// TestProcessForwardedEvent_DoneArrivesAfterTheRuntimeFactItOvertakes pins the
+// client-visible seq invariant for the one worker event whose own handling
+// emits another client-visible event before the Done itself is enqueued.
+//
+// The order asserted below is the order the gateway emits today, NOT the order
+// docs/reference/aep-protocol.md:385-386 specifies (completed after done). This
+// test pins the invariant that clients depend on — seq increases with arrival —
+// and leaves the ordering deviation to
+// docs/issues/2026-10-04-live-run/D01.
+func TestProcessForwardedEvent_DoneArrivesAfterTheRuntimeFactItOvertakes(t *testing.T) {
+	t.Parallel()
+
+	const sessionID = "done-vs-runtime-seq"
+	b, _ := newCollectorBridgeForSeqTest(t, sessionID, 0)
+
+	// A joined WebSocket conn makes the client-visible order observable: these
+	// are the exact frames a browser or SDK receives, in the exact order.
+	conn, server := newTestWSConnPair(t)
+	t.Cleanup(func() { _ = conn.Close(); _ = server.Close() })
+	b.hub.JoinSession(sessionID, newConn(b.hub, conn, sessionID, nil))
+	b.executionStore = &fakeExecutionStore{
+		openRecord: testExecutionRecord(execution.StatusDelivered),
+	}
+
+	fc := &forwardContext{sessionID: sessionID, workerType: worker.TypeClaudeCode, firstEvent: true}
+	fc.turnText.WriteString("reply")
+	fw := &mockBridgeWorker{
+		workerType: worker.TypeClaudeCode,
+		conn:       &fakeWorkerConn{ch: make(chan *events.Envelope)},
+	}
+	done := events.NewEnvelope(aep.NewID(), sessionID, 0, events.Done, events.DoneData{Success: true})
+
+	b.processForwardedEvent(done, fw, forwardOpts{}, fc)
+
+	first := tryReadEnvelope(t, server)
+	require.NotNil(t, first, "the runtime fact must reach the client")
+	require.Equal(t, events.RuntimeExecutionCompleted, first.Event.Type,
+		"the runtime fact is emitted while the Done is still being processed, so it arrives first")
+
+	second := tryReadEnvelope(t, server)
+	require.NotNil(t, second, "the Done itself must still reach the client")
+	require.Equal(t, events.Done, second.Event.Type)
+
+	// The invariant every seq-enforcing client depends on: arrival order and
+	// seq order agree. A Done stamped before the runtime fact is emitted but
+	// enqueued after it arrives carrying a LOWER seq than an event the client
+	// has already seen, and monotonic-seq clients drop it — the turn then never
+	// terminates. Found by a live run against a real Worker.
+	require.Greater(t, second.Seq, first.Seq,
+		"client-visible seq must increase with arrival order")
 }

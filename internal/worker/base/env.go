@@ -19,22 +19,11 @@ func hasAnyPrefix(s string, prefixes []string) bool {
 // All other HOTPLEX_* vars are gateway-internal and never reach workers.
 const workerSecretPrefix = "HOTPLEX_WORKER_"
 
-// setOrAppend sets key=value in env, replacing existing entry or appending.
-func setOrAppend(env []string, entry string) []string {
-	key, _, _ := strings.Cut(entry, "=")
-	for i, existing := range env {
-		if strings.HasPrefix(existing, key+"=") {
-			env[i] = entry
-			return env
-		}
-	}
-	return append(env, entry)
-}
-
 // BuildEnv constructs the environment variables for a CLI worker process.
 //
 // Priority (low → high):
-//  1. os.Environ() — filtered through blocklist
+//  1. os.Environ() — filtered through blocklist (compat), or through the
+//     per-OS system allowlist plus EnvAllowKeys (strict)
 //  2. HOTPLEX_WORKER_ prefix-stripped injections from .env
 //  3. session.Env — per-session overrides
 //  4. ConfigEnv — highest priority config overrides
@@ -49,9 +38,15 @@ func setOrAppend(env []string, entry string) []string {
 //	to prevent the gateway's own secrets from leaking to workers.
 //
 // Blocklist entries ending with "_" are treated as prefix matches.
+//
+// The nested-agent scrub runs LAST, after every merge, because it is a
+// force-disabled item rather than a default. Running it earlier let
+// worker.environment reintroduce CLAUDECODE on the very next phase, so an
+// operator override could silently restore something the system forbids.
 func BuildEnv(session worker.SessionInfo, blocklist []string, workerTypeLabel string) []string {
 	environ := os.Environ()
 	env := make([]string, 0, len(environ))
+	strict := NormalizeEnvProfile(session.EnvProfile) == worker.EnvProfileStrict
 
 	// Build blocklist set, tracking prefix entries.
 	blockSet := make(map[string]bool)
@@ -110,6 +105,12 @@ func BuildEnv(session worker.SessionInfo, blocklist []string, workerTypeLabel st
 		if _, blocked := stripMap[key]; blocked {
 			continue
 		}
+		// Strict narrows the host contribution to the system allowlist plus
+		// the operator's explicit additions. The blocklist above still
+		// applies: strict is not a reason to re-admit a blocked key.
+		if strict && !envKeyAllowedBySystemAllowlist(key) && !slices.Contains(session.EnvAllowKeys, key) {
+			continue
+		}
 
 		env = append(env, e)
 	}
@@ -122,27 +123,49 @@ func BuildEnv(session worker.SessionInfo, blocklist []string, workerTypeLabel st
 
 	// Phase 4: Inject stripped HOTPLEX_WORKER_* vars (override system env).
 	for k, v := range stripMap {
-		env = setOrAppend(env, k+"="+v)
+		env = SetEnv(env, k, v)
 	}
 
 	// Phase 5: Add session-specific env vars (override stripped vars).
 	for k, v := range session.Env {
-		if k == "" {
+		if invalidEnvKey(k) {
 			continue
 		}
-		env = setOrAppend(env, k+"="+v)
+		env = SetEnv(env, k, v)
 	}
 
-	// Phase 6: Strip nested agent config (CLAUDECODE=).
-	env = security.StripNestedAgent(env)
-
-	// Phase 7: Apply config-driven env vars (worker.environment). Highest priority.
+	// Phase 6: Apply config-driven env vars (worker.environment). Highest priority.
 	for _, e := range session.ConfigEnv {
 		if e == "" || !strings.Contains(e, "=") {
 			continue
 		}
-		env = setOrAppend(env, e)
+		k, v, _ := strings.Cut(e, "=")
+		if invalidEnvKey(k) {
+			continue
+		}
+		env = SetEnv(env, k, v)
 	}
 
+	// Phase 7: Strip nested agent config (CLAUDECODE=). This is a
+	// FORCE-disabled item, so it runs after every merge — otherwise the
+	// config phase above could put it straight back.
+	env = security.StripNestedAgent(env)
+
 	return env
+}
+
+// BuildProcessEnv builds the environment for a Worker process that serves MANY
+// sessions (opencode serve, codex app-server).
+//
+// The profile is passed explicitly because there is no SessionInfo to carry
+// it: for a shared process the environment belongs to the PROCESS, and every
+// session on it sees exactly the same one. Reporting a per-session env here
+// would be fiction, so the caller gets a process-scoped answer instead.
+func BuildProcessEnv(
+	profile string, allowKeys []string, blocklist []string, workerTypeLabel string,
+) []string {
+	return BuildEnv(worker.SessionInfo{
+		EnvProfile:   profile,
+		EnvAllowKeys: allowKeys,
+	}, blocklist, workerTypeLabel)
 }

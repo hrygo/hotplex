@@ -187,6 +187,7 @@ Reconciliation / Repair / Fence / Operator Action
 
 - [#948](https://github.com/hrygo/hotplex/issues/948)：scope-aware capability inventory、precedence、hash、safe materialization 和 admin-gated promotion；
 - [#870](https://github.com/hrygo/hotplex/issues/870)：基于 Cron、Webhook、Session、Worker、EffectiveRuntimePlan 和 EffectLedger 的 versioned Coding Ops Recipes；
+- [Recipes 模板草案](RECIPES-TEMPLATES.md)：两个试点的模板与 fail-closed 条件。**启动条件未满足**（2026-10-04 核对），仓库内没有 registry、manifest 校验或 dry-run 执行器；
 - [Scope-aware Capability Inventory Contract](../specs/Scope-Aware-Capability-Inventory-Spec.md) 定义 capability 的解释与安全投影边界。
 
 ### 启动条件

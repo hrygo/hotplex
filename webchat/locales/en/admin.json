@@ -100,6 +100,7 @@
     "sessions": "Sessions",
     "users": "Users",
     "activity": "Activity",
+    "executions": "Executions",
     "workspaces": "Workspaces",
     "skills": "Skills",
     "cron": "Cron",
@@ -634,6 +635,135 @@
       "description": "Audit rows appear here after users authenticate, create sessions, send messages, call tools, or perform admin actions."
     }
   },
+  "executions": {
+    "title": "Executions",
+    "subtitle": "Every input accepted by the gateway, and what actually happened to it.",
+    "loading": "Loading executions...",
+    "loading_more": "Loading...",
+    "refresh": "Refresh",
+    "load_older": "Load older",
+    "showing": "{{count}} runs",
+    "fenced_badge": "Fenced",
+    "filters": {
+      "session": "Session ID",
+      "session_placeholder": "exact session id",
+      "delivery": "Delivery",
+      "runtime": "Runtime",
+      "all": "All",
+      "apply": "Apply",
+      "reset": "Reset"
+    },
+    "empty": {
+      "title": "No executions",
+      "description": "Nothing has been accepted by the gateway yet, or the filters exclude every run."
+    },
+    "table": {
+      "created": "Accepted",
+      "execution": "Execution",
+      "session": "Session",
+      "delivery": "Delivery",
+      "runtime": "Runtime",
+      "worker_run": "Worker run",
+      "fence": "Fence"
+    },
+    "status": {
+      "accepted": "Accepted",
+      "delivered": "Delivered",
+      "unknown": "Unknown",
+      "failed": "Failed",
+      "queued": "Queued",
+      "pending": "Dispatched",
+      "running": "Running",
+      "completed": "Completed"
+    },
+    "phase": {
+      "accepted": "Accepted",
+      "queued": "Queued",
+      "dispatched": "Dispatched",
+      "running": "Running",
+      "delivery": "Delivery",
+      "terminal": "Terminal",
+      "fenced": "Fenced",
+      "truncated": "Truncated"
+    },
+    "evidence": {
+      "recorded": "Recorded for this run",
+      "not_recorded": "Not recorded for this run",
+      "unavailable": "Unavailable",
+      "unknown": "Unknown"
+    },
+    "notes": {
+      "events_unavailable": "Session events could not be read for this run.",
+      "events_not_configured": "No event source is configured on this deployment.",
+      "events_truncated": "The event window was truncated; narrow the time range to see the rest.",
+      "effects_unavailable": "Delivery evidence could not be read for this run.",
+      "effects_not_configured": "No delivery source is configured on this deployment.",
+      "effects_truncated": "The delivery list was truncated.",
+      "no_delivery_planned": "This run planned no external delivery."
+    },
+    "detail": {
+      "back": "Back to executions",
+      "untitled": "Execution",
+      "missing_id": "No execution id was given.",
+      "created": "Accepted at",
+      "started": "Dispatched at",
+      "finished": "Finished at",
+      "updated": "Last updated",
+      "error_code": "Runtime error",
+      "plan_evidence": "Launch plan evidence",
+      "effect_evidence": "External delivery evidence",
+      "truncated": "This timeline is truncated. Narrow the time window to see the rest.",
+      "notes": "Notes"
+    },
+    "timeline": {
+      "title": "Timeline",
+      "lag_hint": "Fact time is when it happened; observed time is when it was read.",
+      "empty": "No facts were recorded for this run.",
+      "table": {
+        "phase": "Phase",
+        "source": "Source",
+        "kind": "Kind",
+        "fact_time": "Fact time",
+        "observed_at": "Observed",
+        "evidence": "Evidence"
+      }
+    },
+    "actions": {
+      "title": "Available actions",
+      "none": "No action is valid for this run right now.",
+      "kind": {
+        "fence_resolve": "Clear the fence",
+        "fence_abandon": "Clear the fence and end the run as failed",
+        "queue_cancel": "Withdraw the queued input",
+        "effect_abandon": "Give up on the delivery",
+        "effect_mark_delivered": "Record the delivery as sent",
+        "effect_requeue": "Allow one more delivery attempt"
+      },
+      "target": "target: {{target}}",
+      "requires_version": "token: {{version}}",
+      "choose": "Select",
+      "unsupported": "Not supported by this console",
+      "reason": "Reason",
+      "reason_placeholder": "Why you are doing this. Recorded in the audit log.",
+      "reason_required": "A reason is required.",
+      "reason_too_long": "The reason must be at most {{max}} characters.",
+      "evidence_ref": "External evidence reference",
+      "evidence_ref_placeholder": "Optional: a message id, ticket or link you checked",
+      "evidence_ref_too_long": "The evidence reference must be at most {{max}} characters.",
+      "submit": "Apply",
+      "cancel": "Cancel",
+      "done": "Applied.",
+      "stale": "The record changed before this action was applied. The current state has been reloaded.",
+      "confirm_title": {
+        "fence_resolve": "Clear this fence?",
+        "fence_abandon": "Abandon this run?",
+        "queue_cancel": "Withdraw this queued input?",
+        "effect_abandon": "Give up on this delivery?",
+        "effect_mark_delivered": "Record this delivery as sent?",
+        "effect_requeue": "Allow one more delivery attempt?"
+      }
+    }
+  },
   "cron": {
     "title": "Cron Jobs",
     "subtitle": "Schedule recurring agent tasks, automated reminders, and cron triggers",
@@ -749,9 +879,15 @@
       "view": "View",
       "close": "Close"
     },
-    "label": { "managed": "Managed", "external": "External (read-only)" },
+    "label": {
+      "managed": "Managed",
+      "external": "External (read-only)"
+    },
     "search_placeholder": "Search skill name or description…",
-    "empty": { "title": "No skills installed", "desc": "Upload a skill .zip or create a new text skill to install it into global skills directory." },
+    "empty": {
+      "title": "No skills installed",
+      "desc": "Upload a skill .zip or create a new text skill to install it into global skills directory."
+    },
     "pagination": {
       "prev": "Previous",
       "next": "Next",

@@ -101,3 +101,35 @@ def test_data_types_importable():
 
     ir = InternalResetData(generation=2)
     assert ir.generation == 2
+
+
+def test_input_ack_reports_mode_and_durability():
+    """A buffered accept must be distinguishable from a real delivery."""
+    import json
+
+    from hotplex_client.types import InputAckData
+
+    raw = (CORPUS_DIR / "93-compatibility-input-ack-buffered.json").read_text()
+    data = json.loads(raw)["event"]["data"]
+    ack = InputAckData(**data)
+    assert ack.status == "accepted"
+    assert ack.input_mode == "buffered"
+    assert ack.durability == "volatile"
+    assert ack.parent_execution_id == "exec_parent_1"
+    # The volatile acceptance is explicitly NOT a delivery.
+    assert ack.status != "delivered"
+
+
+def test_input_ack_legacy_payload_without_mode_and_durability():
+    """A pre-receipt server omits the new fields; decoding must still work."""
+    import json
+
+    from hotplex_client.types import InputAckData
+
+    raw = (CORPUS_DIR / "94-compatibility-input-ack-legacy.json").read_text()
+    data = json.loads(raw)["event"]["data"]
+    ack = InputAckData(**data)
+    assert ack.status == "delivered"
+    assert ack.input_mode is None
+    assert ack.durability is None
+    assert ack.parent_execution_id is None

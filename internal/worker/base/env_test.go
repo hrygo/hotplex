@@ -10,13 +10,30 @@ import (
 	"github.com/hrygo/hotplex/internal/worker"
 )
 
+// setEnvForTest sets a process-wide variable for one test and restores the
+// previous value afterwards.
+//
+// These tests used to clean up with defer os.Unsetenv, which is not a restore:
+// it DESTROYS PATH and HOME for the whole test binary. Any test running later
+// then sees a gutted environment and fails for reasons that have nothing to do
+// with its own assertions — the leak this helper removes.
+func setEnvForTest(t *testing.T, key, value string) {
+	t.Helper()
+	prev, had := os.LookupEnv(key)
+	require.NoError(t, os.Setenv(key, value))
+	t.Cleanup(func() {
+		if had {
+			_ = os.Setenv(key, prev)
+			return
+		}
+		_ = os.Unsetenv(key)
+	})
+}
+
 func TestBuildEnv_BlocklistFiltersBlockedVars(t *testing.T) {
-	os.Setenv("HOME", "/home/test")
-	os.Setenv("PATH", "/usr/bin")
-	os.Setenv("SECRET_KEY", "should-be-filtered")
-	defer os.Unsetenv("HOME")
-	defer os.Unsetenv("PATH")
-	defer os.Unsetenv("SECRET_KEY")
+	setEnvForTest(t, "HOME", "/home/test")
+	setEnvForTest(t, "PATH", "/usr/bin")
+	setEnvForTest(t, "SECRET_KEY", "should-be-filtered")
 
 	session := worker.SessionInfo{
 		SessionID:  "test-session",
@@ -53,8 +70,7 @@ func TestBuildEnv_BlocklistFiltersBlockedVars(t *testing.T) {
 }
 
 func TestBuildEnv_SessionVarsOverride(t *testing.T) {
-	os.Setenv("MY_VAR", "original-value")
-	defer os.Unsetenv("MY_VAR")
+	setEnvForTest(t, "MY_VAR", "original-value")
 
 	session := worker.SessionInfo{
 		SessionID:  "test-session",
@@ -94,10 +110,8 @@ func TestBuildEnv_HotPlexVars(t *testing.T) {
 }
 
 func TestBuildEnv_StripNestedAgent(t *testing.T) {
-	os.Setenv("CLAUDECODE", "nested-agent-config")
-	os.Setenv("HOME", "/home/test")
-	defer os.Unsetenv("CLAUDECODE")
-	defer os.Unsetenv("HOME")
+	setEnvForTest(t, "CLAUDECODE", "nested-agent-config")
+	setEnvForTest(t, "HOME", "/home/test")
 
 	session := worker.SessionInfo{
 		SessionID:  "test-session",
@@ -117,10 +131,8 @@ func TestBuildEnv_StripNestedAgent(t *testing.T) {
 }
 
 func TestBuildEnv_EmptyBlocklistPassesAll(t *testing.T) {
-	os.Setenv("HOME", "/home/test")
-	os.Setenv("SOME_CUSTOM_VAR", "custom-value")
-	defer os.Unsetenv("HOME")
-	defer os.Unsetenv("SOME_CUSTOM_VAR")
+	setEnvForTest(t, "HOME", "/home/test")
+	setEnvForTest(t, "SOME_CUSTOM_VAR", "custom-value")
 
 	session := worker.SessionInfo{
 		SessionID:  "test-session",
@@ -147,8 +159,7 @@ func TestBuildEnv_EmptyBlocklistPassesAll(t *testing.T) {
 }
 
 func TestBuildEnv_SessionOnlyVars(t *testing.T) {
-	os.Setenv("HOME", "/home/test")
-	defer os.Unsetenv("HOME")
+	setEnvForTest(t, "HOME", "/home/test")
 
 	session := worker.SessionInfo{
 		SessionID:  "test-session",
@@ -167,14 +178,10 @@ func TestBuildEnv_SessionOnlyVars(t *testing.T) {
 }
 
 func TestBuildEnv_PrefixBlocklist(t *testing.T) {
-	os.Setenv("HOME", "/home/test")
-	os.Setenv("HOTPLEX_JWT_SECRET", "super-secret")
-	os.Setenv("HOTPLEX_ADMIN_TOKEN_1", "admin-secret")
-	os.Setenv("HOTPLEX_CUSTOM_VAR", "should-be-blocked")
-	defer os.Unsetenv("HOME")
-	defer os.Unsetenv("HOTPLEX_JWT_SECRET")
-	defer os.Unsetenv("HOTPLEX_ADMIN_TOKEN_1")
-	defer os.Unsetenv("HOTPLEX_CUSTOM_VAR")
+	setEnvForTest(t, "HOME", "/home/test")
+	setEnvForTest(t, "HOTPLEX_JWT_SECRET", "super-secret")
+	setEnvForTest(t, "HOTPLEX_ADMIN_TOKEN_1", "admin-secret")
+	setEnvForTest(t, "HOTPLEX_CUSTOM_VAR", "should-be-blocked")
 
 	session := worker.SessionInfo{
 		SessionID:  "test-session",
@@ -209,8 +216,7 @@ func TestBuildEnv_PrefixBlocklist(t *testing.T) {
 }
 
 func TestBuildEnv_ConfigEnvOverrides(t *testing.T) {
-	os.Setenv("MY_VAR", "original")
-	defer os.Unsetenv("MY_VAR")
+	setEnvForTest(t, "MY_VAR", "original")
 
 	session := worker.SessionInfo{
 		SessionID:  "test-session",
@@ -234,12 +240,9 @@ func TestBuildEnv_ConfigEnvOverrides(t *testing.T) {
 }
 
 func TestBuildEnv_WorkerSecretStripping(t *testing.T) {
-	os.Setenv("HOTPLEX_WORKER_GITHUB_TOKEN", "from-dotenv")
-	os.Setenv("GITHUB_TOKEN", "from-system")
-	os.Setenv("HOME", "/home/test")
-	defer os.Unsetenv("HOTPLEX_WORKER_GITHUB_TOKEN")
-	defer os.Unsetenv("GITHUB_TOKEN")
-	defer os.Unsetenv("HOME")
+	setEnvForTest(t, "HOTPLEX_WORKER_GITHUB_TOKEN", "from-dotenv")
+	setEnvForTest(t, "GITHUB_TOKEN", "from-system")
+	setEnvForTest(t, "HOME", "/home/test")
 
 	session := worker.SessionInfo{
 		SessionID:  "test-session",
@@ -258,12 +261,9 @@ func TestBuildEnv_WorkerSecretStripping(t *testing.T) {
 }
 
 func TestBuildEnv_GatewayVarsNotStripped(t *testing.T) {
-	os.Setenv("HOTPLEX_JWT_SECRET", "jwt-secret")
-	os.Setenv("HOTPLEX_ADMIN_TOKEN_1", "admin-token")
-	os.Setenv("HOTPLEX_WORKER_GITHUB_TOKEN", "github-token")
-	defer os.Unsetenv("HOTPLEX_JWT_SECRET")
-	defer os.Unsetenv("HOTPLEX_ADMIN_TOKEN_1")
-	defer os.Unsetenv("HOTPLEX_WORKER_GITHUB_TOKEN")
+	setEnvForTest(t, "HOTPLEX_JWT_SECRET", "jwt-secret")
+	setEnvForTest(t, "HOTPLEX_ADMIN_TOKEN_1", "admin-token")
+	setEnvForTest(t, "HOTPLEX_WORKER_GITHUB_TOKEN", "github-token")
 
 	session := worker.SessionInfo{
 		SessionID:  "test-session",
@@ -284,8 +284,7 @@ func TestBuildEnv_GatewayVarsNotStripped(t *testing.T) {
 }
 
 func TestBuildEnv_SystemVarPassesWithoutWorkerOverride(t *testing.T) {
-	os.Setenv("MY_SECRET", "system-value")
-	defer os.Unsetenv("MY_SECRET")
+	setEnvForTest(t, "MY_SECRET", "system-value")
 
 	session := worker.SessionInfo{
 		SessionID:  "test-session",
@@ -299,10 +298,8 @@ func TestBuildEnv_SystemVarPassesWithoutWorkerOverride(t *testing.T) {
 }
 
 func TestBuildEnv_PriorityOrder(t *testing.T) {
-	os.Setenv("MY_KEY", "system")
-	os.Setenv("HOTPLEX_WORKER_MY_KEY", "from-stripping")
-	defer os.Unsetenv("MY_KEY")
-	defer os.Unsetenv("HOTPLEX_WORKER_MY_KEY")
+	setEnvForTest(t, "MY_KEY", "system")
+	setEnvForTest(t, "HOTPLEX_WORKER_MY_KEY", "from-stripping")
 
 	session := worker.SessionInfo{
 		SessionID:  "test-session",

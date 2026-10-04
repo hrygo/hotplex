@@ -64,6 +64,17 @@ const NAV_ITEMS = [
     exact: false,
   },
   {
+    label: 'Executions',
+    href: '/admin/executions',
+    icon: (
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="h-5 w-5">
+        <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6l4 2" />
+        <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 12a8.25 8.25 0 1 1 16.5 0 8.25 8.25 0 0 1-16.5 0Z" />
+      </svg>
+    ),
+    exact: false,
+  },
+  {
     label: 'Workspaces',
     href: '/admin/workspaces',
     icon: (
@@ -132,6 +143,7 @@ export function AdminNav({ onLogout, showConnectionSettings = false }: AdminNavP
       case 'Sessions': return t('admin:nav.sessions', { defaultValue: 'Sessions' });
       case 'Users': return t('admin:nav.users', { defaultValue: 'Users' });
       case 'Activity': return t('admin:nav.activity', { defaultValue: 'Activity' });
+      case 'Executions': return t('admin:nav.executions', { defaultValue: 'Executions' });
       case 'Workspaces': return t('admin:nav.workspaces', { defaultValue: 'Workspaces' });
       case 'Skills': return t('admin:nav.skills', { defaultValue: 'Skills' });
       case 'Cron': return t('admin:nav.cron', { defaultValue: 'Cron' });

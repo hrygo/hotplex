@@ -1,0 +1,18 @@
+{
+  "version": "aep/v1",
+  "id": "evt_00000000-0000-4000-8000-000000000001",
+  "seq": 1,
+  "session_id": "sess_00000000-0000-4000-8000-000000000001",
+  "timestamp": 1710000000000,
+  "event": {
+    "type": "input.ack",
+    "data": {
+      "client_message_id": "evt_client_2",
+      "execution_id": "supplement-evt_client_2",
+      "status": "accepted",
+      "input_mode": "buffered",
+      "durability": "volatile",
+      "parent_execution_id": "exec_parent_1"
+    }
+  }
+}

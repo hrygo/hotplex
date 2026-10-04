@@ -1,0 +1,660 @@
+# Reusable validation gate.
+#
+# One definition, two callers: CI (so a PR is judged by the same rules) and
+# Release (so what gets published is what was actually validated). Release used
+# to inline its own weaker checks, which is how an untested SHA ends up on a
+# download page.
+#
+# Every job checks out `inputs.ref` — an immutable SHA, never a branch name.
+# Validating a moving ref proves nothing about an artifact built later.
+name: Validate
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Immutable commit SHA to validate'
+        required: true
+        type: string
+      ref-label:
+        description: 'Human-readable label for logs (tag or branch)'
+        required: false
+        default: ''
+        type: string
+      test-scope:
+        description: 'full = every package; affected = reverse test-dependency closure of the diff'
+        required: false
+        default: 'full'
+        type: string
+      base-sha:
+        description: 'Base SHA for the diff; required when test-scope=affected'
+        required: false
+        default: ''
+        type: string
+      test-shards:
+        description: 'JSON array of shard indices, e.g. ["0","1","2"]; [""] runs unsharded'
+        required: false
+        default: '[""]'
+        type: string
+
+# Read-only by construction. Anything that needs to write belongs in the
+# caller's publish job, never here.
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ARTIFACT_RETENTION_DAYS: 7
+
+jobs:
+  # ── Guard: block large files ────────────────────────────────────────────
+  # Root of the graph. Everything expensive waits on it: a commit carrying a
+  # >1MB blob should not also burn three test shards before being rejected.
+  large-file-guard:
+    name: Large File Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Scan for files >1MB
+        run: |
+          OVERSIZED=""
+          while IFS= read -r blob_info; do
+            size=$(echo "$blob_info" | awk '{print $2}')
+            path=$(echo "$blob_info" | awk '{print $3}')
+            case "$path" in
+              assets/*|docs/assets/*|docs/channels/*/guides/*) continue ;;
+            esac
+            if [ "$size" -gt 1048576 ] 2>/dev/null; then
+              OVERSIZED="$OVERSIZED
+            $path ($(( size / 1048576 ))MB)"
+            fi
+          done < <(git ls-tree -r HEAD | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' | awk '$1 == "blob" && $2 > 1048576')
+
+          if [ -n "$OVERSIZED" ]; then
+            echo "::error::Large files (>1MB) detected in HEAD tree:$OVERSIZED"
+            exit 1
+          fi
+          echo "No oversized files in HEAD tree."
+
+  lint:
+    name: Lint
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+
+      - uses: golangci/golangci-lint-action@v9.2.0
+        with:
+          version: v2.11.4
+          args: --timeout=10m
+
+  build:
+    name: Build
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: ./.github/actions/setup-go-webchat
+
+      - name: Verify + Vet + Build
+        run: go mod verify && go vet ./... && go build ./...
+
+      - name: Verify docs output exists
+        run: test -f internal/docs/out/index.html
+
+      - name: Build gateway binary
+        run: |
+          mkdir -p bin
+          go build -o bin/hotplex ./cmd/hotplex
+
+      - name: Verify binary
+        run: test -x ./bin/hotplex && ./bin/hotplex --help
+
+  test:
+    name: ${{ matrix.shard != '' && format('Test (shard {0}, {1})', matrix.shard, inputs.test-scope) || format('Test ({0})', inputs.test-scope) }}
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(inputs.test-shards) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+
+      - name: Test CI helper scripts
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+
+      - name: Check release gating graph
+        # A directed graph is the only thing between an untested commit and a
+        # download page, and every edge is a line someone can delete in a
+        # hurry. This step fails when the graph stops being a gate.
+        run: python3 scripts/ci/check_release_gating.py --repo-root .
+
+      - name: Check worker runtime lock
+        # Offline bundles used to resolve their OpenCode and Oh My OpenAgent
+        # versions from whatever upstream published at build time.
+        run: python3 scripts/ci/check_runtime_lock.py --repo-root .
+
+      - name: Determine test scope
+        id: scope
+        env:
+          TEST_SCOPE: ${{ inputs.test-scope }}
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          if [ "$TEST_SCOPE" = "full" ]; then
+            python3 scripts/ci/select_go_tests.py \
+              --repo-root . \
+              --full \
+              --github-output "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$BASE_SHA" ]; then
+            echo "::error::test-scope=affected requires base-sha"
+            exit 1
+          fi
+          if ! git cat-file -e "$BASE_SHA^{commit}"; then
+            echo "::error::Base commit $BASE_SHA is unavailable"
+            exit 1
+          fi
+
+          git diff --name-only -z "$BASE_SHA" "$HEAD_SHA" |
+            python3 scripts/ci/select_go_tests.py \
+              --repo-root . \
+              --github-output "$GITHUB_OUTPUT"
+
+      - name: Summarize test scope
+        env:
+          SCOPE_MODE: ${{ steps.scope.outputs.mode }}
+          SCOPE_REASON: ${{ steps.scope.outputs.fallback_reason }}
+          SCOPE_PACKAGES: ${{ steps.scope.outputs.test_packages }}
+          SCOPE_EXCLUDED: ${{ steps.scope.outputs.excluded_test_packages }}
+        run: |
+          {
+            echo "mode=$SCOPE_MODE"
+            echo "reason=$SCOPE_REASON"
+            echo "affected packages:"
+            printf '%s\n' "$SCOPE_PACKAGES"
+            echo "dedicated excluded packages:"
+            printf '%s\n' "$SCOPE_EXCLUDED"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run tests with race detector + coverage
+        env:
+          MODE: ${{ steps.scope.outputs.mode }}
+          SELECTED: ${{ steps.scope.outputs.test_packages }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS_JSON: ${{ inputs.test-shards }}
+          COVERAGE_FILE: ${{ matrix.shard != '' && format('coverage-{0}.out', matrix.shard) || 'coverage.out' }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "empty" ]; then
+            echo "No Go packages affected by this change"
+            printf 'mode: atomic\n' > "$COVERAGE_FILE"
+            exit 0
+          fi
+
+          TEST_PKGS=$(printf '%s\n' "$SELECTED" | sed '/^$/d' | tr '\n' ' ')
+
+          if [ -n "$SHARD" ]; then
+            # The shard count comes from the matrix definition, not from the
+            # index itself: deriving it from $SHARD always yields 1.
+            TOTAL=$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$SHARDS_JSON")
+            echo "Shard $SHARD of $TOTAL"
+            TEST_PKGS=$(echo "$TEST_PKGS" | tr ' ' '\n' | grep -v '^$' | awk -v total="$TOTAL" -v idx="$SHARD" 'NR % total == idx')
+            echo "Shard $SHARD packages: $TEST_PKGS"
+            if [ -z "$TEST_PKGS" ]; then
+              printf 'mode: atomic\n' > "$COVERAGE_FILE"
+              exit 0
+            fi
+          fi
+
+          if [ -z "$TEST_PKGS" ]; then
+            echo "::error::Selector produced no packages in mode '$MODE'"
+            exit 1
+          fi
+
+          # shellcheck disable=SC2086,SC2046
+          go test -short -race -count=1 -shuffle=on -timeout=10m \
+            -coverprofile="$COVERAGE_FILE" -covermode=atomic $TEST_PKGS
+
+      # These packages stay outside the main selection to preserve the existing
+      # coverage thresholds, but a scoped run must not skip them.
+      - name: Run dedicated excluded-package tests
+        env:
+          EXCLUDED: ${{ steps.scope.outputs.excluded_test_packages }}
+        run: |
+          set -euo pipefail
+          EXCLUDED_PKGS=$(printf '%s\n' "$EXCLUDED" | sed '/^$/d' | tr '\n' ' ')
+          if [ -z "$EXCLUDED_PKGS" ]; then
+            echo "No excluded packages affected by this change"
+            exit 0
+          fi
+          echo "Running dedicated excluded-package tests: $EXCLUDED_PKGS"
+          # shellcheck disable=SC2086
+          go test -short -race -count=1 -shuffle=on -timeout=10m $EXCLUDED_PKGS
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage${{ matrix.shard != '' && format('-{0}', matrix.shard) || '' }}
+          path: coverage*.out
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+  coverage-check:
+    name: Coverage Check
+    needs: [test]
+    runs-on: ubuntu-latest
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: coverage*
+          path: coverage-data
+          merge-multiple: true
+
+      - name: Merge coverage profiles
+        run: |
+          set -euo pipefail
+          # Sharded runs: merge coverage-{0,1,2}.out. Single run: coverage.out.
+          SHARD_FILES=$(find coverage-data -name 'coverage-*.out' 2>/dev/null | head -1)
+          if [ -n "$SHARD_FILES" ]; then
+            printf 'mode: atomic\n' > coverage.out
+            find coverage-data -name 'coverage-*.out' -exec grep -h -v '^mode:' {} + >> coverage.out
+          else
+            cp coverage-data/coverage.out coverage.out 2>/dev/null || printf 'mode: atomic\n' > coverage.out
+          fi
+          echo "Merged coverage lines: $(wc -l < coverage.out)"
+
+      - name: Check per-package coverage thresholds
+        run: |
+          COV_FILE="coverage.out"
+
+          if [ ! -s "$COV_FILE" ] || [ "$(wc -l < "$COV_FILE")" -le 1 ]; then
+            echo "No coverage data (no affected packages). Skipping thresholds."
+            exit 0
+          fi
+
+          declare -A THRESHOLDS
+          THRESHOLDS["internal/security"]=80
+          THRESHOLDS["pkg/events"]=45
+          THRESHOLDS["pkg/aep"]=75
+          THRESHOLDS["internal/gateway/testutil"]=0
+          THRESHOLDS["internal/gateway"]=55
+          THRESHOLDS["internal/session"]=70
+          THRESHOLDS["internal/config"]=70
+          THRESHOLDS["internal/worker/base"]=45
+          THRESHOLDS["internal/worker"]=70
+          THRESHOLDS["internal/worker/claudecode"]=53
+          THRESHOLDS["internal/worker/opencodeserver"]=9
+          THRESHOLDS["internal/worker/noop"]=80
+          THRESHOLDS["internal/worker/acp"]=40
+          THRESHOLDS["internal/messaging/feishu"]=48
+          THRESHOLDS["internal/worker/codexcli"]=51
+          THRESHOLDS["internal/worker/pi"]=0
+          THRESHOLDS["internal/messaging/slack"]=35
+          THRESHOLDS["internal/messaging"]=20
+
+          FAILED=0
+          {
+            echo "## Per-Package Coverage Report"
+            echo "| Package | Coverage | Threshold | Status |"
+            echo "|---------|----------|-----------|--------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS=$'\t' read -r PKG TOTAL COVERED; do
+            [ -z "$PKG" ] && continue
+            [ "$TOTAL" -eq 0 ] && continue
+            COV=$(echo "scale=1; $COVERED * 100 / $TOTAL" | bc -l)
+
+            MATCH=""
+            for pattern in "${!THRESHOLDS[@]}"; do
+              if [[ "$PKG" == *"$pattern"* ]]; then
+                if [ -z "$MATCH" ] || [ ${#pattern} -gt ${#MATCH} ]; then
+                  MATCH="$pattern"
+                fi
+              fi
+            done
+
+            if [ -n "$MATCH" ]; then
+              THRESH=${THRESHOLDS[$MATCH]}
+              PASS=$(echo "$COV >= $THRESH" | bc -l)
+              if [ "$PASS" -ne 1 ]; then
+                STATUS=":x: FAIL"
+                FAILED=1
+                echo "::error::Package $PKG coverage ${COV}% is below ${THRESH}% threshold."
+              else
+                STATUS=":white_check_mark: PASS"
+              fi
+              echo "| \`$PKG\` | ${COV}% | ${THRESH}% | $STATUS |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done < <(
+            awk '
+              NR == 1 { next }
+              {
+                file = $1
+                sub(/:.*/, "", file)
+                if (file ~ /\//) {
+                  sub(/\/[^\/]*$/, "", file)
+                } else {
+                  file = "."
+                }
+                total[file] += $(NF - 1)
+                if ($NF > 0) {
+                  covered[file] += $(NF - 1)
+                }
+              }
+              END {
+                for (package in total) {
+                  printf "%s\t%d\t%d\n", package, total[package], covered[package] + 0
+                }
+              }
+            ' "$COV_FILE" | sort
+          )
+
+          TOTAL_LINE=$(go tool cover -func="$COV_FILE" 2>/dev/null | tail -1 | grep -oE '[0-9]+\.[0-9]+')
+          {
+            echo ""
+            echo "**Total coverage: ${TOTAL_LINE}%** (informational, not gated)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::One or more packages are below their coverage thresholds."
+            exit 1
+          fi
+          echo "All package coverage thresholds met."
+
+  contract-matrix:
+    name: Platform × Worker Contract Matrix
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+
+      - name: Run deterministic 12-combination matrix
+        run: |
+          set -o pipefail
+          make test-contract-matrix | tee contract-matrix.log
+
+      - name: Publish matrix summary
+        if: always()
+        run: |
+          grep '^contract matrix:' contract-matrix.log >> "$GITHUB_STEP_SUMMARY" || true
+
+  webchat:
+    name: WebChat E2E Contract Matrix
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.4.0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: webchat/pnpm-lock.yaml
+
+      - name: Install WebChat dependencies
+        run: pnpm --dir webchat install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm --dir webchat exec playwright install --with-deps chromium
+
+      - name: Run WebChat unit tests
+        run: pnpm --dir webchat test
+
+      - name: Typecheck WebChat
+        run: pnpm --dir webchat exec tsc --noEmit
+
+      - name: Run WebChat browser baseline
+        run: pnpm --dir webchat exec playwright test e2e/chat.spec.ts --project=chromium
+
+      - name: Run WebChat platform-worker matrix
+        run: pnpm --dir webchat test:e2e:matrix
+
+      - name: Run WebChat execution console baseline
+        run: pnpm --dir webchat exec playwright test e2e/executions-console.spec.ts --project=chromium
+
+      - name: Upload Playwright artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: webchat-playwright-report
+          path: |
+            webchat/playwright-report
+            webchat/test-results
+          if-no-files-found: ignore
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+  aep-schema-go:
+    name: AEP Schema (Go)
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+      - run: go test ./pkg/aep/schema/... -count=1 -race -v
+
+  sdk-go:
+    name: Go SDK Conformance
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+          download-modules: 'false'
+      - name: Test the client SDK module
+        run: go -C client mod download && go -C client test ./... -count=1 -race -shuffle=on
+
+  aep-schema-typescript:
+    name: AEP Conformance (TypeScript)
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: examples/typescript-client/package-lock.json
+      - working-directory: examples/typescript-client
+        run: |
+          npm ci
+          npx vitest run tests/conformance
+
+  aep-schema-python:
+    name: AEP Conformance (Python)
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - working-directory: examples/python-client
+        run: |
+          pip install -e ".[dev]" 2>/dev/null || pip install -e .
+          python -m pytest tests/test_conformance.py -v
+
+  aep-schema-java:
+    name: AEP Conformance (Java)
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - working-directory: examples/java-client
+        run: |
+          # No -DfailIfNoTests=false: a rename that stops matching the
+          # conformance test must fail the gate, not pass silently.
+          mvn -B test -Dtest="dev.hotplex.conformance.AepCorpusConformanceTest"
+
+  # PostgreSQL is a supported deployment target, so its migrations and
+  # conditional updates are checked by a gate like any other supported
+  # dialect. The SQLite suite cannot stand in for it: dialect-specific SQL
+  # (DO blocks, CHECK widening, binary parameter encoding) fails only on PG,
+  # which is how a broken PG migration reached main before this job existed.
+  postgres:
+    name: PostgreSQL
+    needs: [large-file-guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: hotplex_test
+          POSTGRES_PASSWORD: hotplex_test
+          POSTGRES_DB: hotplex_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hotplex_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      HOTPLEX_TEST_PG_DSN: postgres://hotplex_test:hotplex_test@localhost:5432/hotplex_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-go-webchat
+        with:
+          build-webchat: 'false'
+
+      - name: Run PostgreSQL-tagged tests
+        run: |
+          set -euo pipefail
+          # -p 1 is required, not a performance choice: every PG test starts by
+          # DROP SCHEMA public CASCADE so it is deterministic, which means two
+          # packages running in parallel would delete each other's schema
+          # mid-test. Serialising the packages is what makes one shared
+          # service container safe.
+          go test -tags pg -p 1 \
+            ./internal/execution \
+            ./internal/session \
+            ./internal/session/sql \
+            -count=1 -race -shuffle=on -timeout=15m
+
+  # ── Gate ──────────────────────────────────────────────────────────────
+  # `needs:` already stops publish when a check fails, but a check that was
+  # skipped, cancelled, or never started leaves the downstream job merely
+  # "skipped" — which reads like a pass in a release log. This job turns every
+  # non-success outcome into an explicit failure, so the gate cannot be
+  # satisfied by absence.
+  gate:
+    name: Validation Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - large-file-guard
+      - lint
+      - build
+      - test
+      - coverage-check
+      - contract-matrix
+      - webchat
+      - aep-schema-go
+      - sdk-go
+      - aep-schema-typescript
+      - aep-schema-python
+      - aep-schema-java
+      - postgres
+    steps:
+      - name: Require every check to have succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          REF: ${{ inputs.ref }}
+          REF_LABEL: ${{ inputs.ref-label }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          failed = sorted(n for n, v in needs.items() if v.get("result") != "success")
+          print(f"ref={os.environ['REF']} label={os.environ['REF_LABEL'] or '-'}")
+          for name in sorted(needs):
+              print(f"  {name}: {needs[name].get('result')}")
+          if failed:
+              # A check that did not succeed is not a pass, whatever the reason:
+              # cancelled, skipped and skipped-by-condition all mean the gate has
+              # no evidence for this SHA.
+              print(f"::error::Validation gate not satisfied: {', '.join(failed)}")
+              sys.exit(1)
+          print("All validation checks succeeded.")
+          PY

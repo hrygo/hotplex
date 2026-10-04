@@ -22,7 +22,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/hrygo/hotplex/internal/config"
-	"github.com/hrygo/hotplex/internal/worker"
 	"github.com/hrygo/hotplex/internal/worker/base"
 	"github.com/hrygo/hotplex/internal/worker/proc"
 	"github.com/hrygo/hotplex/pkg/events"
@@ -632,7 +631,11 @@ func (s *SingletonProcessManager) startIdleDrainLocked() {
 
 // buildEnv creates the environment for the opencode serve process.
 func (s *SingletonProcessManager) buildEnv() []string {
-	env := base.BuildEnv(worker.SessionInfo{}, openCodeSrvEnvBlocklist, "opencode-server")
+	// Process-scoped: one `opencode serve` backs every session, so the profile
+	// comes from the worker config rather than from any session. Pretending a
+	// per-session env exists here would be a claim nothing can back.
+	env := base.BuildProcessEnv(
+		s.cfg.EnvProfile, s.cfg.EnvAllowKeys, openCodeSrvEnvBlocklist, "opencode-server")
 	env = append(env, "OPENCODE_EXPERIMENTAL_EVENT_SYSTEM=true")
 	if s.cfg.Password != "" {
 		env = append(env, "OPENCODE_SERVER_PASSWORD="+s.cfg.Password)

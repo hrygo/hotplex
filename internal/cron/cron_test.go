@@ -23,7 +23,7 @@ func newTestScheduler(t *testing.T) *Scheduler {
 	return &Scheduler{
 		log:            slog.Default(),
 		store:          store,
-		executor:       NewExecutor(slog.Default(), bridge, sm, ""),
+		executor:       NewExecutor(slog.Default(), bridge, sm, "", nil, &mockSystemDispatcher{sm: sm}),
 		maxConcurrent:  3,
 		maxJobs:        50,
 		defaultTimeout: 5 * time.Minute,
@@ -151,7 +151,7 @@ func TestScheduler_TriggerJob(t *testing.T) {
 	job := testRecurringJob("trigger-test", "manual")
 
 	// TriggerJob should not block (starts goroutine).
-	require.NoError(t, s.TriggerJob(context.Background(), job))
+	require.NoError(t, s.TriggerJob(context.Background(), job, TriggerRequest{}))
 	// Give goroutine a moment to start.
 	time.Sleep(10 * time.Millisecond)
 }

@@ -17,6 +17,10 @@ import (
 	"github.com/hrygo/hotplex/pkg/events"
 )
 
+// errFakeQueueUnsupported keeps the fake honest: it holds no queue, so it must
+// not pretend one exists.
+var errFakeQueueUnsupported = errors.New("fake execution store: queue unsupported")
+
 type fakeExecutionStore struct {
 	mu            sync.Mutex
 	record        *execution.Record
@@ -129,6 +133,12 @@ func (s *fakeExecutionStore) ApplyFenceDecision(_ context.Context, _ execution.F
 func (s *fakeExecutionStore) ListFences(context.Context, string, int, int) ([]*execution.Record, error) {
 	return nil, nil
 }
+func (s *fakeExecutionStore) ByID(context.Context, string) (*execution.Record, error) {
+	return nil, execution.ErrNotFound
+}
+func (s *fakeExecutionStore) ListRecent(context.Context, execution.ListFilter) ([]*execution.Record, error) {
+	return nil, nil
+}
 func (s *fakeExecutionStore) RenewLeases(context.Context, string, int64, []string) (int64, error) {
 	return 0, nil
 }
@@ -137,6 +147,57 @@ func (s *fakeExecutionStore) RecoverExpiredLeases(context.Context, []string) (ex
 }
 func (s *fakeExecutionStore) TerminateOwnerLeases(context.Context, string, string) (int64, error) {
 	return 0, nil
+}
+
+// The queue surface is not exercised by the ordinary accept paths these tests
+// cover, so the fake refuses rather than inventing a plausible queue. A test
+// that starts asserting about queued inputs must build a real store.
+func (s *fakeExecutionStore) AcceptQueued(
+	context.Context, execution.QueuedRequest, execution.QueueLimits,
+) (*execution.Record, *execution.QueueEntry, bool, error) {
+	return nil, nil, false, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) QueueByExecution(context.Context, string) (*execution.QueueEntry, error) {
+	return nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) QueuePayload(context.Context, string) (*execution.QueuedPayload, error) {
+	return nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) QueueBySession(context.Context, string, int) ([]*execution.QueueEntry, error) {
+	return nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) QueuedByClientMessage(context.Context, string, string) (*execution.Record, error) {
+	return nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) QueueDepth(context.Context) (int64, error) {
+	return 0, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) ClaimQueued(
+	context.Context, execution.ClaimQueuedRequest,
+) (*execution.Record, *execution.QueueEntry, error) {
+	return nil, nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) CancelQueued(context.Context, string, string) (*execution.Record, error) {
+	return nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) ClearQueue(context.Context, string, string) (int64, error) {
+	return 0, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) ExpireQueued(context.Context, time.Time, int) ([]*execution.Record, error) {
+	return nil, errFakeQueueUnsupported
+}
+
+func (s *fakeExecutionStore) QueueDepthBySession(context.Context, string) (int64, error) {
+	return 0, errFakeQueueUnsupported
 }
 
 func (s *fakeExecutionStore) snapshot() (execution.Status, string, int) {
@@ -180,6 +241,9 @@ func requireInputAcks(t *testing.T, conn *mockPlatformConn, statuses ...events.E
 		require.Equal(t, "evt-client-1", data.ClientMessageID)
 		require.Equal(t, "exec_test", data.ExecutionID)
 		require.Equal(t, statuses[i], data.Status)
+		require.Equal(t, events.InputModePrimary, data.InputMode)
+		require.Equal(t, events.InputDurabilityDurable, data.Durability)
+		require.Empty(t, data.ParentExecutionID)
 	}
 }
 

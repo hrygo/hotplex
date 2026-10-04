@@ -59,7 +59,40 @@ type GitHubEvent struct {
 
 // JobTrigger triggers a named cron job with optional extra context.
 type JobTrigger interface {
-	TriggerByName(ctx context.Context, jobName string, extra map[string]string) error
+	TriggerByName(ctx context.Context, jobName string, req cron.TriggerRequest) error
+}
+
+// githubDeliveryID is the sender's per-delivery identifier, used as the
+// occurrence's idempotency key.
+//
+// GitHub mints one GUID per delivery and reuses it when redelivering the same
+// event (the REST API exposes it as `guid` alongside a `redelivery` flag), so it
+// is exactly the "verified source/event ID" the occurrence ledger needs: a
+// redelivery resolves to the run that already happened instead of starting a
+// second one.
+//
+// The header is not covered by X-Hub-Signature-256 — that signature covers the
+// body only. It is still trustworthy here because this function is only reached
+// after signature verification, so reaching it already required the secret; a
+// replayed capture carries its original ID and is deduplicated by it.
+func githubDeliveryID(r *http.Request) string {
+	id := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
+	if id == "" || len(id) > 128 {
+		return ""
+	}
+	// The value is persisted as an occurrence's source id and appears in logs,
+	// so anything outside the identifier alphabet is refused rather than
+	// trimmed or escaped. GitHub sends a UUID; the wider set keeps this working
+	// if the format ever changes.
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_':
+		default:
+			return ""
+		}
+	}
+	return id
 }
 
 const maxConcurrentTriggers = 5
@@ -202,6 +235,13 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 9. Async trigger with dedup and bounded concurrency
 	jobName := h.cfg.TargetJobName
 	repo := event.Repository.FullName
+	// One X-GitHub-Delivery covers the whole payload, but a single payload can
+	// name several PRs, and the occurrence's trigger key does not contain the
+	// PR number. Folding the PR number in is what keeps those from colliding
+	// on one delivery id. The number comes from the request body, which the
+	// signature above already verified, so it carries the same trust as the
+	// delivery id itself.
+	deliveryID := githubDeliveryID(r)
 	for _, prNum := range prNumbers {
 		// Dedup: atomically check and mark to prevent TOCTOU race when
 		// check_suite and check_run arrive near-simultaneously.
@@ -222,9 +262,16 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				defer func() { <-h.sem; h.wg.Done() }()
 				ctx, cancel := context.WithTimeout(h.baseCtx, 5*time.Minute)
 				defer cancel()
-				err := h.trigger.TriggerByName(ctx, jobName, map[string]string{
-					"trigger":   "webhook",
-					"pr_number": strconv.Itoa(n),
+				sourceID := deliveryID
+				if sourceID != "" {
+					sourceID += "#" + strconv.Itoa(n)
+				}
+				err := h.trigger.TriggerByName(ctx, jobName, cron.TriggerRequest{
+					Extra: map[string]string{
+						"trigger":   "webhook",
+						"pr_number": strconv.Itoa(n),
+					},
+					VerifiedEventID: sourceID,
 				})
 				if err != nil {
 					if errors.Is(err, cron.ErrJobDisabled) || errors.Is(err, cron.ErrJobNotFound) {

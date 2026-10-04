@@ -92,6 +92,8 @@ func allFixtures() []corpusFixture {
 			ClientMessageID: "evt_client_1",
 			ExecutionID:     "exec_1",
 			Status:          events.ExecutionStatusDelivered,
+			InputMode:       events.InputModePrimary,
+			Durability:      events.InputDurabilityDurable,
 		}), false},
 		{"13-done.json", mkEnv(1, events.Done, events.DoneData{
 			Success: true,
@@ -218,6 +220,23 @@ func allFixtures() []corpusFixture {
 		{"92-compatibility-missing-optional.json", mkEnv(1, events.Done, map[string]any{
 			"success": true,
 		}), true},
+		// A supplement buffered in process memory: accepted is NOT delivered, and
+		// the volatility is what tells the client no later ACK is coming.
+		{"93-compatibility-input-ack-buffered.json", mkEnv(1, events.InputAck, events.InputAckData{
+			ClientMessageID:   "evt_client_2",
+			ExecutionID:       "supplement-evt_client_2",
+			Status:            events.ExecutionStatusAccepted,
+			InputMode:         events.InputModeBuffered,
+			Durability:        events.InputDurabilityVolatile,
+			ParentExecutionID: "exec_parent_1",
+		}), false},
+		// A pre-receipt server payload: the mode/durability fields are absent and
+		// must still strict-decode to the legacy meaning.
+		{"94-compatibility-input-ack-legacy.json", mkEnv(1, events.InputAck, events.InputAckData{
+			ClientMessageID: "evt_client_3",
+			ExecutionID:     "exec_3",
+			Status:          events.ExecutionStatusDelivered,
+		}), false},
 	}
 }
 

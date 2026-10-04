@@ -128,3 +128,134 @@ func TestMigrations_PG_030AuditNoDelete_BlocksUnauthorizedRowDeletes(t *testing.
 	_, err = db.ExecContext(ctx, `DELETE FROM user_activity WHERE id = 2`)
 	require.Error(t, err, "row past the checkpoint anchor must stay immutable")
 }
+
+// TestMigrations_PG_037ExecutionQueue_SchemaAndInvariants is the PostgreSQL
+// counterpart of the SQLite 037 guard. PostgreSQL widens a CHECK in place
+// rather than rebuilding the table, and the constraint it has to find is one
+// the server named for us back in migration 027 — so the DO block's discovery
+// step is the part most likely to silently match nothing and leave the old
+// five-value CHECK in place.
+func TestMigrations_PG_037ExecutionQueue_SchemaAndInvariants(t *testing.T) {
+	ctx := context.Background()
+	db := openTestPGDB(t)
+	defer func() { _ = db.Close() }()
+
+	const ts = 1700000000000
+	_, err := db.ExecContext(ctx, `INSERT INTO sessions
+		(id, user_id, worker_type, state, created_at, updated_at)
+		VALUES ('s-queue', 'u1', 'claude_code', 'idle', NOW(), NOW())`)
+	require.NoError(t, err, "seed session")
+
+	// 1) Exactly one runtime_status CHECK survives, and it admits 'queued'.
+	var checks int
+	require.NoError(t, db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM pg_constraint con
+		JOIN pg_class rel ON rel.oid = con.conrelid
+		WHERE rel.relname = 'execution_inputs'
+		  AND con.contype = 'c'
+		  AND pg_get_constraintdef(con.oid) LIKE '%runtime_status%'`,
+	).Scan(&checks))
+	require.Equal(t, 1, checks, "expected exactly one runtime_status CHECK after 037")
+
+	insertExec := func(execID, sessionID, msgID, runtime string) error {
+		_, err := db.ExecContext(ctx, `INSERT INTO execution_inputs
+			(execution_id, session_id, client_message_id, payload_hash, status, error_code,
+			 created_at, updated_at, owner_instance_id, worker_run_id, lease_until,
+			 runtime_status, runtime_error_code, fence_reason)
+			VALUES ($1, $2, $3, $4, 'accepted', '', $5, $5, '', '', 0, $6, '', '')`,
+			execID, sessionID, msgID, "hash_"+msgID, ts, runtime)
+		return err
+	}
+
+	require.NoError(t, insertExec("exec_q1", "s-queue", "msg-q1", "queued"))
+	require.NoError(t, insertExec("exec_q2", "s-queue", "msg-q2", "queued"))
+	require.NoError(t, insertExec("exec_pending", "s-queue", "msg-pending", "pending"))
+	require.Error(t, insertExec("exec_second_pending", "s-queue", "msg-p2", "pending"),
+		"a queued backlog must not weaken the single-active gate")
+	require.Error(t, insertExec("exec_bogus", "s-queue", "msg-bogus", "bogus"),
+		"the CHECK widened, it did not open")
+
+	// 2) Queue, allocator and budget tables exist.
+	for _, table := range []string{"execution_queue", "execution_queue_counters", "execution_queue_budget"} {
+		var n int
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM information_schema.tables
+			WHERE table_schema = 'public' AND table_name = $1`, table).Scan(&n))
+		require.Equal(t, 1, n, "expected table %s after migration 037", table)
+	}
+
+	// 3) FIFO ordinal is a database fact.
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue
+		(execution_id, session_id, queue_seq, enqueued_at, expires_at)
+		VALUES ('exec_q1', 's-queue', 1, $1, $2)`, ts, ts+1000)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue
+		(execution_id, session_id, queue_seq, enqueued_at, expires_at)
+		VALUES ('exec_q2', 's-queue', 1, $1, $2)`, ts, ts+1000)
+	require.Error(t, err, "two queue rows must not share a per-session ordinal")
+
+	// 4) The budget row the enqueue path locks exists.
+	var used int64
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT used FROM execution_queue_budget WHERE budget_id = 1`).Scan(&used))
+	require.Equal(t, int64(0), used)
+
+	// 5) Session delete cascades into the queue; depth is derived, so nothing
+	//    has to remember to release the slot.
+	_, err = db.ExecContext(ctx, `DELETE FROM sessions WHERE id = 's-queue'`)
+	require.NoError(t, err)
+	var remaining int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM execution_queue`).Scan(&remaining))
+	require.Equal(t, 0, remaining, "queued rows must not outlive their session")
+}
+
+// TestMigrations_PG_038ExecutionQueuePayloads_ContentFollowsControlFacts is the
+// PostgreSQL counterpart of the 038 payload guard. The foreign key to
+// execution_queue is the retention rule: content must disappear exactly when
+// the promise to dispatch it does.
+func TestMigrations_PG_038ExecutionQueuePayloads_ContentFollowsControlFacts(t *testing.T) {
+	ctx := context.Background()
+	db := openTestPGDB(t)
+	defer func() { _ = db.Close() }()
+
+	var n int
+	require.NoError(t, db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'execution_queue_payloads'`).Scan(&n))
+	require.Equal(t, 1, n, "expected the payload table after migration 038")
+
+	_, err := db.ExecContext(ctx, `INSERT INTO sessions
+		(id, user_id, worker_type, state, created_at, updated_at)
+		VALUES ('s-payload', 'u1', 'claude_code', 'idle', NOW(), NOW())`)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_inputs
+		(execution_id, session_id, client_message_id, payload_hash, status, error_code,
+		 created_at, updated_at, owner_instance_id, worker_run_id, lease_until,
+		 runtime_status, runtime_error_code, fence_reason)
+		VALUES ('exec_p', 's-payload', 'msg-p', 'hash_p', 'accepted', '', 1, 1, '', '', 0, 'queued', '', '')`)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue
+		(execution_id, session_id, queue_seq, enqueued_at, expires_at, payload_ref, payload_bytes)
+		VALUES ('exec_p', 's-payload', 1, 1, 9999999999999, 'qpayload_p', 12)`)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue_payloads
+		(payload_id, execution_id, session_id, content, invocation_json,
+		 content_bytes, content_sha256, created_at)
+		VALUES ('qpayload_orphan', 'exec_missing', 's-payload', 'x', '', 1, 'h', 1)`)
+	require.Error(t, err, "payload content must not exist without a queued input")
+
+	_, err = db.ExecContext(ctx, `INSERT INTO execution_queue_payloads
+		(payload_id, execution_id, session_id, content, invocation_json,
+		 content_bytes, content_sha256, created_at)
+		VALUES ('qpayload_p', 'exec_p', 's-payload', 'do the thing', '', 12, 'hash_p', 1)`)
+	require.NoError(t, err)
+
+	_, err = db.ExecContext(ctx, `DELETE FROM execution_queue WHERE execution_id = 'exec_p'`)
+	require.NoError(t, err)
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM execution_queue_payloads`).Scan(&n))
+	require.Zero(t, n, "content must not outlive the promise to dispatch it")
+}

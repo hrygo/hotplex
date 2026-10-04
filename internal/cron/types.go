@@ -50,6 +50,35 @@ const (
 	StatusTimeout JobStatus = "timeout"
 )
 
+// DeliveryMode decides who owns the delivery of a cron run's final answer.
+//
+// The two modes are mutually exclusive by design. A job must never have both
+// the gateway sending its result and a CLI instruction telling the Agent to
+// send it again — that is the double-delivery this mode exists to prevent.
+type DeliveryMode string
+
+const (
+	// DeliveryModeLegacyCLI keeps today's behaviour: the result is appended to
+	// the prompt as a CLI instruction and the Agent performs the send. It is
+	// the default for any job that does not name a mode, so existing jobs
+	// keep their exact current behaviour.
+	DeliveryModeLegacyCLI DeliveryMode = "legacy_cli"
+	// DeliveryModeGateway means the gateway owns delivery: the Agent returns
+	// the answer and the gateway sends it through a recorded effect.
+	DeliveryModeGateway DeliveryMode = "gateway"
+)
+
+// ResolveDeliveryMode maps a stored mode to the mode actually used.
+//
+// An absent or unrecognised value resolves to legacy_cli: an existing job
+// must never silently acquire a delivery owner it was never validated for.
+func ResolveDeliveryMode(mode DeliveryMode) DeliveryMode {
+	if mode == DeliveryModeGateway {
+		return DeliveryModeGateway
+	}
+	return DeliveryModeLegacyCLI
+}
+
 // CronJobState holds mutable runtime state.
 type CronJobState struct {
 	NextRunAtMs     int64     `json:"next_run_at_ms"`
@@ -108,25 +137,27 @@ func (j *CronJob) Clone() *CronJob {
 
 // CronJob is the top-level job entity.
 type CronJob struct {
-	ID             string            `json:"id"`
-	Name           string            `json:"name"`
-	Description    string            `json:"description,omitempty"`
-	Enabled        bool              `json:"enabled"`
-	Schedule       CronSchedule      `json:"schedule"`
-	Payload        CronPayload       `json:"payload"`
-	WorkDir        string            `json:"work_dir,omitempty"`
-	BotID          string            `json:"bot_id,omitempty"`
-	BotName        string            `json:"bot_name,omitempty"`
-	OwnerID        string            `json:"owner_id,omitempty"`
-	Platform       string            `json:"platform,omitempty"`
-	PlatformKey    map[string]string `json:"platform_key,omitempty"`
-	TimeoutSec     int               `json:"timeout_sec,omitempty"`
-	DeleteAfterRun bool              `json:"delete_after_run,omitempty"`
-	Silent         bool              `json:"silent,omitempty"`
-	MaxRetries     int               `json:"max_retries,omitempty"`
-	MaxRuns        int               `json:"max_runs,omitempty"`
-	ExpiresAt      string            `json:"expires_at,omitempty"`
-	State          CronJobState      `json:"state"`
-	CreatedAtMs    int64             `json:"created_at_ms"`
-	UpdatedAtMs    int64             `json:"updated_at_ms"`
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Description string            `json:"description,omitempty"`
+	Enabled     bool              `json:"enabled"`
+	Schedule    CronSchedule      `json:"schedule"`
+	Payload     CronPayload       `json:"payload"`
+	WorkDir     string            `json:"work_dir,omitempty"`
+	BotID       string            `json:"bot_id,omitempty"`
+	BotName     string            `json:"bot_name,omitempty"`
+	OwnerID     string            `json:"owner_id,omitempty"`
+	Platform    string            `json:"platform,omitempty"`
+	PlatformKey map[string]string `json:"platform_key,omitempty"`
+	// DeliveryMode selects the delivery owner. Empty means legacy_cli.
+	DeliveryMode   DeliveryMode `json:"delivery_mode,omitempty"`
+	TimeoutSec     int          `json:"timeout_sec,omitempty"`
+	DeleteAfterRun bool         `json:"delete_after_run,omitempty"`
+	Silent         bool         `json:"silent,omitempty"`
+	MaxRetries     int          `json:"max_retries,omitempty"`
+	MaxRuns        int          `json:"max_runs,omitempty"`
+	ExpiresAt      string       `json:"expires_at,omitempty"`
+	State          CronJobState `json:"state"`
+	CreatedAtMs    int64        `json:"created_at_ms"`
+	UpdatedAtMs    int64        `json:"updated_at_ms"`
 }

@@ -211,6 +211,32 @@ export class FollowUpQueueStore {
         }));
     }
 
+    /**
+     * Release a slot whose input the gateway accepted into volatile (in-process)
+     * storage. Unlike markDelivered this asserts nothing about Worker delivery:
+     * the supplement buffer is not a delivery proof, it only means the gateway
+     * owns the input now and the queue must stop waiting on it. Without this the
+     * head-of-line item would stay "sending" forever and block every later item.
+     */
+    releaseVolatileAccepted(
+        sessionId: string,
+        clientMessageId: string,
+    ): FollowUpQueueItem | null {
+        const queue = this.getSnapshot(sessionId);
+        const index = queue.findIndex(
+            (item) =>
+                item.status === "sending" &&
+                item.clientMessageId === clientMessageId,
+        );
+        if (index === -1) return null;
+        const released = queue[index] ?? null;
+        this.setQueue(sessionId, [
+            ...queue.slice(0, index),
+            ...queue.slice(index + 1),
+        ]);
+        return released;
+    }
+
     retry(sessionId: string, itemId: string): boolean {
         return this.updateItem(sessionId, itemId, (item) => {
             if (item.status !== "failed") return null;

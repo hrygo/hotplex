@@ -10,8 +10,10 @@ resolve.go        # Resolver (pure): Input → AgentSpec; precedence + worker-ty
 map.go            # MapToStartParams (wired, shadow mode) / MapToSessionInfo (contract-only, NOT wired)
 identity.go       # AgentIdentity value object (#848): deterministic AgentID, ctx key plumbing
 plan.go           # EffectiveRuntimePlan (#946 spec §6.2): canonical hash identity, Blocked reasons, redacted view
+authority.go      # D1 authority ceiling: explicit over-ceiling request blocks, config default clamps
+fingerprint.go    # D1 internal LaunchFingerprint + secret-free ConfigPolicyRevision + field-ownership table
 snapshot.go       # EffectiveAgentSpecSnapshot (#866): persisted under session context_json, versioned
-*_test.go         # 5 test files: identity, map, plan, resolver, snapshot
+*_test.go         # 7 test files: identity, map, plan, resolver, snapshot, authority, fingerprint
 ```
 
 ## WHERE TO LOOK
@@ -25,6 +27,9 @@ snapshot.go       # EffectiveAgentSpecSnapshot (#866): persisted under session c
 | Identity correlation | `identity.go:103` DeriveAgentID | sha1 of (userID, workspaceID, agentName, workerType) — stable across resume |
 | Identity ctx plumbing | `identity.go:166/182/197` | WithAgentIdentity / FromAgentIdentity / DropAgentIdentity on session context_json |
 | Runtime plan | `plan.go` | PlanVersion=1, PlanResolverID in hash input, ErrPlanBlocked for fail-closed surfaces |
+| Permission ceiling | `authority.go` | resolve FIRST, clamp SECOND; explicit request above ceiling blocks, config default clamps with a warning |
+| Internal launch identity | `fingerprint.go` | `LaunchFingerprint` ≠ public `PlanHash`; identifies a PLAN, never proves it was applied |
+| Field ownership | `fingerprint.go` OwnershipTable | who may decide each field, what clamps it, which rule a future change must not break |
 | Snapshot persistence | `snapshot.go` | SnapshotVersion=1, SnapshotContextKey=`_agent_spec`, ErrInvalidSnapshot → fail closed |
 
 ## KEY PATTERNS
@@ -38,6 +43,10 @@ snapshot.go       # EffectiveAgentSpecSnapshot (#866): persisted under session c
 **Versioned contracts**: bump `PlanVersion` / `SnapshotVersion` on any breaking shape change so consumers refuse to interpret an unknown plan/snapshot. `PlanResolverID` is part of the canonical plan hash — a new resolver generation yields a different plan identity.
 
 **Fail closed**: `ErrInvalidSnapshot` / `ErrPlanBlocked` results must never be treated as a legacy session with no policy boundary — log redacted diagnostic (shadow) or surface (fail-closed entry paths).
+
+**Authority is asymmetric on purpose**: an explicitly requested tier above the ceiling is BLOCKED, never quietly downgraded (the user asked for something specific); a config-derived tier above it is clamped with a visible warning (config is a guess, the ceiling is the operator's decision). Neither path can produce a plan more permissive than the ceiling.
+
+**Two identities, two jobs**: `PlanHash` is the public, redacted plan identity. `LaunchFingerprint` is the internal identity of the decisions that will actually be applied, and it carries `PlanCoverage` flags so an UNRESOLVED decision is distinguishable from a resolved empty one. Neither may be used as an authorization or approval cache key — only Worker-reported observed facts support that claim.
 
 **Wiring discipline**: behavior-changing integrations enter under shadow mode first. First-cut wires only `MapToStartParams` in the webchat entry path; `MapToSessionInfo` is contract + tests only (SessionInfo is built in the shared bridge layer — wiring is a follow-up slice, design spec §3.5/§9 finding F8).
 

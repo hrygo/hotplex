@@ -52,6 +52,10 @@ const (
 	supplementNew supplementDisposition = iota
 	supplementInjected
 	supplementBuffered
+	// supplementQueued means the input is durably queued and will be dispatched
+	// later. It is a committed disposition like the others: a retry must see
+	// the same durable answer rather than being admitted a second time.
+	supplementQueued
 	supplementNormal
 	supplementConflict
 	supplementCapacity

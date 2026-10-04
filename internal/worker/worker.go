@@ -93,6 +93,17 @@ const (
 	TypeUnknown     WorkerType = "unknown"
 )
 
+// Environment profiles (#946 plan unit E).
+const (
+	// EnvProfileCompat is today's behaviour and the default: the worker
+	// inherits the host environment minus a blocklist.
+	EnvProfileCompat = "compat"
+	// EnvProfileStrict starts from a minimal per-OS system allowlist. It
+	// narrows the ENVIRONMENT only; it is not filesystem or network
+	// isolation and must never be reported as such.
+	EnvProfileStrict = "strict"
+)
+
 // SessionStartParams encapsulates the parameters for creating a new worker session.
 // Introduced to reduce the risk of parameter ordering errors (e.g. botName vs botID)
 // across the 13-parameter StartSession call chain.
@@ -401,6 +412,20 @@ type SessionInfo struct {
 	// ConfigBlocklist holds additional env var names from worker.env_blocklist config.
 	// These are merged with the hardcoded per-worker blocklist in BuildEnv.
 	ConfigBlocklist []string
+	// EnvProfile selects how the worker process environment is built
+	// (#946 E). "" and any unrecognized value mean EnvProfileCompat, which is
+	// today's behaviour: inherit the host environment minus a blocklist.
+	//
+	// EnvProfileStrict starts from a minimal system allowlist instead. It
+	// narrows the ENVIRONMENT only — it is not filesystem or network
+	// isolation, and must never be reported as such.
+	EnvProfile string
+	// EnvAllowKeys names additional host variables a strict worker may
+	// inherit, on top of the OS system allowlist.
+	//
+	// This is operator configuration, never client input: a request must not
+	// be able to widen what the host environment leaks into a Worker process.
+	EnvAllowKeys []string
 	// PermissionMode controls how the worker handles permission requests (issue #789).
 	// Valid values: PermissionModeReadOnly|Workspace|AutoEdit|Bypass. Empty = "worker
 	// default" (CC/OCS apply bypass; Codex/ACP honor operator config); the bridge leaves

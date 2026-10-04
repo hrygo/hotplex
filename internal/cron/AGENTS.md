@@ -15,6 +15,8 @@ cron/
   executor.go    # Executor: starts worker session, sends prompt, waits for completion
   attached.go    # AttachedSessionHandler: dispatch callback into existing session
   delivery.go    # Delivery: extract response + route to platform, in-memory retry queue with exponential backoff
+  effect_delivery.go # EffectDelivery interface: gateway-owned delivery contract
+  occurrence.go  # Durable per-firing identity (trigger key + generation), content-free
   errors.go      # classifyError: string-based error classification (timeout/network/rate_limit/server/exec), isTemporaryError
   loader.go      # LoadFromYAML: name-idempotent upsert from YAML defs
   retry.go       # backoff schedule, scheduleRetry
@@ -39,6 +41,8 @@ cron/
 | Executor | `executor.go` Executor | StartSession → send prompt → poll completion |
 | Attached session dispatch | `attached.go` AttachedSessionHandler | ResumeAndInput (idle/terminated) or InjectInput (running) |
 | Result delivery | `delivery.go` Delivery | ResponseExtractor + PlatformDeliverer + retry queue + retryLoop |
+| Durable occurrence | `occurrence.go` OccurrenceStore | Trigger key + generation is the idempotency boundary; records the delivery owner |
+| Delivery owner | `types.go` DeliveryMode + `effect_delivery.go` | legacy_cli (prompt instructs the Agent) vs gateway (effect ledger sends); mutually exclusive, recorded per occurrence |
 | YAML batch import | `loader.go` LoadFromYAML | Name-based idempotent upsert, recompute next_run |
 | Error classification | `errors.go` | classifyError (timeout/network/rate_limit/server/exec), isTemporaryError |
 | Backoff retry | `retry.go` backoff | 30s→1m→5m→15m→1h exponential, scheduleRetry (job retry; see delivery.go for delivery retry) |

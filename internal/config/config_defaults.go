@@ -85,6 +85,30 @@ func Default() *Config {
 				Enabled: true,
 				Window:  60 * time.Second,
 			},
+			// Shadow is the only safe default: the plan is resolved, bound to
+			// the Worker run and compared against the legacy parameters, but
+			// nothing it says changes what actually launches. Both allowlists
+			// stay EMPTY, so even an "authoritative" mode line cannot turn the
+			// plan live for an unnamed entry or Worker.
+			RuntimePlan: RuntimePlanConfig{
+				Mode:                 RuntimePlanModeShadow,
+				AuthoritativeEntries: nil,
+				AuthoritativeWorkers: nil,
+			},
+		},
+		// The queue is OFF by default. Accepting into a queue whose dispatch
+		// path is not wired would accumulate inputs nobody ever sends, which is
+		// worse than refusing the input outright.
+		Execution: ExecutionConfig{
+			Queue: ExecutionQueueConfig{
+				Enabled:         false,
+				PerSession:      20,
+				Global:          1000,
+				MaxPayloadBytes: 64 << 10,
+				TTL:             24 * time.Hour,
+				SweepInterval:   time.Minute,
+				SweepBatch:      100,
+			},
 		},
 		Security: SecurityConfig{
 			APIKeyHeader:    "X-API-Key",

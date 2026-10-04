@@ -51,6 +51,10 @@ data/
 *.db-wal
 hotplex-worker.db*
 *.sqlite
+# The pre-migration database the upgrade tests and the native smoke run against.
+# A runtime database is ignored; this one is source, and regenerating it is
+# `go test ./internal/session -run TestBuildPreQueueFixture -update-fixtures`.
+!internal/session/testdata/*.db
 
 # --- Logs & Runtime ---
 *.log

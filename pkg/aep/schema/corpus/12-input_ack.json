@@ -9,7 +9,9 @@
     "data": {
       "client_message_id": "evt_client_1",
       "execution_id": "exec_1",
-      "status": "delivered"
+      "status": "delivered",
+      "input_mode": "primary",
+      "durability": "durable"
     }
   }
 }

@@ -126,18 +126,32 @@ type ControlData struct {
 ```go
 type ExecutionStatus string // accepted / delivered / unknown / failed
 
+type InputMode string // primary / injected / buffered / queued
+
+type InputDurability string // durable / volatile
+
 type InputAckData struct {
-    ClientMessageID string          `json:"client_message_id"`
-    ExecutionID     string          `json:"execution_id"`
-    Status          ExecutionStatus `json:"status"`
-    Duplicate       bool            `json:"duplicate,omitempty"`
-    ErrorCode       ErrorCode       `json:"error_code,omitempty"`
+    ClientMessageID   string          `json:"client_message_id"`
+    ExecutionID       string          `json:"execution_id"`
+    Status            ExecutionStatus `json:"status"`
+    Duplicate         bool            `json:"duplicate,omitempty"`
+    ErrorCode         ErrorCode       `json:"error_code,omitempty"`
+    InputMode         InputMode       `json:"input_mode,omitempty"`
+    Durability        InputDurability `json:"durability,omitempty"`
+    ParentExecutionID string          `json:"parent_execution_id,omitempty"`
 }
 ```
 
 新输入通常产生两次 ACK：持久化后的 `accepted`，以及 Worker 调用返回后的
 `delivered`、`unknown` 或 `failed`。`unknown` 表示存在重复副作用风险，Gateway
 不会自动重投。重复 Envelope 只返回当前记录，并将 `duplicate` 设为 `true`。
+
+`accepted` 必须结合 `durability` 解释：`durable` 表示已进入持久化账本，`delivered`
+仍在途；`volatile` 表示 Gateway 只在进程内存中暂存，重启可能丢失，且不会再来第二次
+ACK。`input_mode` 进一步区分派发方式：`primary` 普通输入、`injected` 注入当前 turn、
+`buffered` 内存暂存、`queued` 持久队列。`buffered + volatile` 的 `accepted` **不是**
+送达证明。`parent_execution_id` 在 `injected` / `buffered` 时关联正在执行的 turn。
+三个新字段均为 optional，缺失时按旧语义解释。
 
 #### `runtime.execution.{started,completed,failed}` — 执行生命周期
 
