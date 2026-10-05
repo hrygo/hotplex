@@ -35,6 +35,33 @@ type shutdownBlockingStore struct {
 	calls   atomic.Int64
 }
 
+type shutdownHookStore struct{ Store }
+
+func (s *shutdownHookStore) SetDelivery(context.Context, string, string, Status, string) error {
+	return nil
+}
+
+func TestRepairer_ShutdownHookCanCallShutdownWithCancelledContext(t *testing.T) {
+	t.Parallel()
+	r := NewRepairer(&shutdownHookStore{}, fastRepairConfig(), nil)
+	r.Enqueue(RepairIntent{ExecutionID: "hook", Kind: RepairDelivery, Status: string(StatusDelivered)})
+	r.SetSuccessHook(func(RepairIntent) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r.Shutdown(ctx)
+	})
+	done := make(chan struct{})
+	go func() {
+		r.Shutdown(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("success callback deadlocked while re-entering shutdown")
+	}
+}
+
 func (s *shutdownBlockingStore) SetDelivery(ctx context.Context, _, _ string, _ Status, _ string) error {
 	if s.calls.Add(1) != 1 {
 		return errors.New("concurrent retry while the first attempt is blocked")

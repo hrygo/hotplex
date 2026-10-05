@@ -222,6 +222,14 @@ def require_validated(repo: Path, state: dict) -> None:
 def publish(repo: Path, state_path: Path, state: dict, timeout: int) -> None:
     require_validated(repo, state)
     run_dir = state_path.parent
+    if state['phase'] == 'validated' and not capture(repo, ['git', 'status', '--porcelain']):
+        # A commit hook can leave a clean commit with changed contents. After
+        # revalidation, resume that commit instead of demanding another edit.
+        ahead = capture(repo, ['git', 'rev-list', '--count', f'{state["base_sha"]}..HEAD'])
+        if ahead == '0':
+            raise DeliveryError('No changes to deliver')
+        state.update(phase='committed', commit=capture(repo, ['git', 'rev-parse', 'HEAD']))
+        save(state_path, state)
     if state['phase'] == 'validated':
         if not capture(repo, ['git', 'status', '--porcelain']):
             raise DeliveryError('No changes to deliver')
@@ -244,7 +252,7 @@ def publish(repo: Path, state_path: Path, state: dict, timeout: int) -> None:
         save(state_path, state)
     # Resume safely if PR creation succeeded but the client lost its response.
     prs = json.loads(capture(repo, ['gh', 'pr', 'list', '--head', state['branch'],
-                                    '--base', state['base'], '--state', 'open', '--json', 'url']))
+                                    '--base', state['base'], '--state', 'all', '--json', 'url']))
     if prs:
         url = prs[0]['url']
     else:

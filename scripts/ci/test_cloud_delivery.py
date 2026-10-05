@@ -196,6 +196,26 @@ class DeliveryTests(unittest.TestCase):
                 delivery.publish(self.repo, self.path, self.state, 10)
         self.assertFalse((self.run / 'push.log').exists())
 
+    def test_clean_commit_can_be_revalidated_and_resume_publication(self):
+        self.install_hooks()
+        self.git('add', '--all')
+        self.git('commit', '-m', 'test: already committed implementation')
+        self.certify()
+        real_capture = delivery.capture
+        def fake_capture(repo, args):
+            if args[:3] == ['gh', 'pr', 'list']:
+                self.assertEqual(args[args.index('--state') + 1], 'all')
+                return '[{"url":"https://example.invalid/pr/closed"}]'
+            return real_capture(repo, args)
+        with patch.object(delivery, 'capture', side_effect=fake_capture):
+            with patch.object(delivery, 'bounded_command') as command:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    delivery.publish(self.repo, self.path, self.state, 10)
+        self.assertEqual(command.call_count, 1)
+        self.assertEqual(command.call_args.args[1][:2], ['git', 'push'])
+        self.assertEqual(self.state['phase'], 'published')
+        self.assertEqual(self.state['pr_url'], 'https://example.invalid/pr/closed')
+
     def test_timeout_stops_hung_command_and_preserves_log(self):
         with contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(delivery.DeliveryError, 'timed out'):
