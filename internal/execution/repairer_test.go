@@ -28,6 +28,102 @@ type blockingRuntimeStore struct {
 	once    sync.Once
 }
 
+type shutdownBlockingStore struct {
+	Store
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int64
+}
+
+func (s *shutdownBlockingStore) SetDelivery(ctx context.Context, _, _ string, _ Status, _ string) error {
+	if s.calls.Add(1) != 1 {
+		return errors.New("concurrent retry while the first attempt is blocked")
+	}
+	close(s.started)
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestRepairer_ShutdownDoesNotDrainWhileLoopIsProcessing(t *testing.T) {
+	t.Parallel()
+	store := &shutdownBlockingStore{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	cfg := fastRepairConfig()
+	cfg.ShutdownTimeout = 50 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	r := NewRepairer(store, cfg, nil)
+	t.Cleanup(func() {
+		close(store.release)
+		cancel()
+		r.wg.Wait()
+	})
+	r.Start(ctx)
+	r.Enqueue(RepairIntent{ExecutionID: "blocked", Kind: RepairDelivery, Status: string(StatusDelivered)})
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("background repair did not start")
+	}
+
+	r.Shutdown(context.Background())
+	require.EqualValues(t, 1, store.calls.Load(), "shutdown must not process an in-flight intent a second time")
+	require.Equal(t, 1, r.Backlog(), "a timed-out shutdown must leave the in-flight repair intact")
+}
+
+func TestRepairer_StartAfterShutdownDoesNotLaunchLoop(t *testing.T) {
+	t.Parallel()
+	r := NewRepairer(nil, fastRepairConfig(), nil)
+	r.Shutdown(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	r.Start(ctx)
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Start registered a processing loop after shutdown")
+	}
+}
+
+func TestRepairer_ConcurrentShutdownDrainsOnce(t *testing.T) {
+	t.Parallel()
+	store := &flakyStore{}
+	store.setFail(true)
+	cfg := fastRepairConfig()
+	cfg.ShutdownTimeout = 50 * time.Millisecond
+	cfg.InitialBackoff = time.Second
+	r := NewRepairer(store, cfg, nil)
+	r.Enqueue(RepairIntent{ExecutionID: "pending", Kind: RepairDelivery, Status: string(StatusDelivered)})
+	start := make(chan struct{})
+	done := make(chan struct{}, 2)
+	for range 2 {
+		go func() {
+			<-start
+			r.Shutdown(context.Background())
+			done <- struct{}{}
+		}()
+	}
+	close(start)
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent shutdown did not complete")
+		}
+	}
+	require.EqualValues(t, 1, atomic.LoadInt64(&store.calls), "shutdown callers must share one drain")
+}
+
 func (s *blockingRuntimeStore) FinishRuntime(ctx context.Context, execID, runID string, status RuntimeStatus, ec string) error {
 	if status == RuntimeUnknown {
 		s.once.Do(func() {

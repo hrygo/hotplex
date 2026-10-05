@@ -13,9 +13,13 @@ This directory contains installation and deployment scripts for HotPlex Worker G
 | `validate-acpx-spec.sh` | Validate ACPX spec via acpx CLI | `./scripts/validate-acpx-spec.sh` |
 | `verify_worker_native_commands.py` | Run bounded Live probes for four Worker native command paths | `python scripts/verify_worker_native_commands.py` |
 | `ci/select_go_tests.py` | Select the Go packages affected by a change set | `python scripts/ci/select_go_tests.py --full` |
+| `ci/cloud_delivery.py` | Deliver an explicit Issue through Codex, validation and a draft PR | `python scripts/ci/cloud_delivery.py run --issue N` |
 | `hotplex.service` | Systemd service unit | Install via `install.sh` |
 
 ## Installation Scripts
+
+For cloud task delivery, see [the pipeline guide](ci/CLOUD_DELIVERY.md). The
+runner reuses this repository's hooks and CI and keeps failed runs inspectable.
 
 ### install.sh
 

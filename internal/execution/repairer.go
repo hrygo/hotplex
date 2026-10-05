@@ -106,6 +106,11 @@ func NewRepairer(store Store, cfg RepairConfig, log *slog.Logger) *Repairer {
 
 func (r *Repairer) Start(ctx context.Context) {
 	r.start.Do(func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.closed.Load() {
+			return
+		}
 		r.wg.Add(1)
 		go r.loop(ctx)
 	})
@@ -317,34 +322,49 @@ func (r *Repairer) processIntent(ctx context.Context, intent *RepairIntent) erro
 
 func (r *Repairer) Shutdown(ctx context.Context) {
 	r.stop.Do(func() {
+		// Serialize Start's WaitGroup registration with shutdown. Closing before
+		// waiting also prevents a late Start from adding another processing loop.
+		r.mu.Lock()
+		r.closed.Store(true)
 		close(r.stopCh)
+		r.mu.Unlock()
+
+		shutdownCtx, cancel := context.WithTimeout(ctx, r.cfg.ShutdownTimeout)
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			r.wg.Wait()
+			close(done)
+		}()
+
+		// Intent retry fields belong to the processing loop. Drain only after
+		// that loop has released ownership; a timeout must not start a second
+		// processor against an in-flight intent. Once also serializes shutdowns.
+		select {
+		case <-done:
+			r.drain(shutdownCtx)
+		case <-shutdownCtx.Done():
+		}
+		if shutdownCtx.Err() != nil && r.Backlog() > 0 {
+			r.log.Warn("repairer shutdown timed out",
+				"backlog", r.Backlog(), "timeout", r.cfg.ShutdownTimeout)
+		}
 	})
-
-	done := make(chan struct{})
-	go func() {
-		r.wg.Wait()
-		close(done)
-	}()
-
-	r.drain(ctx)
-
-	select {
-	case <-done:
-	case <-time.After(r.cfg.ShutdownTimeout):
-		r.log.Warn("repairer shutdown timed out",
-			"backlog", r.Backlog(), "timeout", r.cfg.ShutdownTimeout)
-	}
-	r.closed.Store(true)
 }
 
 func (r *Repairer) drain(ctx context.Context) {
-	deadline := time.Now().Add(r.cfg.ShutdownTimeout)
-	for time.Now().Before(deadline) {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
 		r.processDue(ctx)
 		if r.Backlog() == 0 {
 			return
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
