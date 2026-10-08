@@ -140,6 +140,7 @@ export interface SessionDebugResponse {
 
 export interface AuditActivity {
   id: number;
+  chain_epoch?: string;
   ts: number;
   user_id: string;
   user_id_type: string;

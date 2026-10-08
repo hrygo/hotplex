@@ -60,22 +60,24 @@ const AnonymousUserID = "anonymous"
 // UserActivity is the row stored in the user_activity table.
 // Mirrors the 16-column schema in spec §5.1.
 type UserActivity struct {
-	ID           int64  `json:"id"`            // assigned by DB
-	Ts           int64  `json:"ts"`            // Unix ms
-	UserID       string `json:"user_id"`       // NOT NULL
-	UserIDType   string `json:"user_id_type"`  // NOT NULL
-	Platform     string `json:"platform"`      // NOT NULL
-	SessionID    string `json:"session_id"`    // empty for admin/api
-	Action       string `json:"action"`        // NOT NULL
-	ResourceType string `json:"resource_type"` // optional
-	ResourceID   string `json:"resource_id"`   // optional
-	Outcome      string `json:"outcome"`       // NOT NULL: success/failure/denied
-	DetailJSON   string `json:"detail_json"`   // NOT NULL: whitelisted fields per §5.9
-	EventRef     string `json:"event_ref"`     // optional: events.id or turns.id
-	IP           string `json:"ip"`            // optional
-	UserAgent    string `json:"user_agent"`    // optional
-	PrevHash     string `json:"prev_hash"`     // NOT NULL: "" for genesis
-	SelfHash     string `json:"self_hash"`     // NOT NULL: sha256(PrevHash || canonical(rest))
+	ID           int64  `json:"id"`                    // assigned by DB
+	ChainEpoch   string `json:"chain_epoch,omitempty"` // legacy or lifecycle-v2 chain
+	Ts           int64  `json:"ts"`                    // Unix ms
+	ExpiresAt    int64  `json:"expires_at,omitempty"`  // persisted lifecycle-v2 retention deadline, Unix ms
+	UserID       string `json:"user_id"`               // NOT NULL
+	UserIDType   string `json:"user_id_type"`          // NOT NULL
+	Platform     string `json:"platform"`              // NOT NULL
+	SessionID    string `json:"session_id"`            // empty for admin/api
+	Action       string `json:"action"`                // NOT NULL
+	ResourceType string `json:"resource_type"`         // optional
+	ResourceID   string `json:"resource_id"`           // optional
+	Outcome      string `json:"outcome"`               // NOT NULL: success/failure/denied
+	DetailJSON   string `json:"detail_json"`           // NOT NULL: whitelisted fields per §5.9
+	EventRef     string `json:"event_ref"`             // optional: events.id or turns.id
+	IP           string `json:"ip"`                    // optional
+	UserAgent    string `json:"user_agent"`            // optional
+	PrevHash     string `json:"prev_hash"`             // NOT NULL: "" for genesis
+	SelfHash     string `json:"self_hash"`             // NOT NULL: sha256(PrevHash || canonical(rest))
 }
 
 // IdentityLink maps one immutable audit subject (provider + subject) to a

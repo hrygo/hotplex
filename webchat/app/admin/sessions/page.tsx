@@ -1125,7 +1125,7 @@ export default function SessionsPage() {
                     {drawerActivities.length > 0 ? (
                       <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
                         {drawerActivities.map((act) => (
-                          <div key={act.id} className="p-3 rounded-[var(--radius-sm)] bg-[var(--bg-hover)] border border-[var(--border-subtle)] space-y-1">
+                          <div key={`${act.chain_epoch ?? 'legacy'}:${act.id}`} className="p-3 rounded-[var(--radius-sm)] bg-[var(--bg-hover)] border border-[var(--border-subtle)] space-y-1">
                             <div className="flex items-center justify-between text-xs">
                               <span className="font-bold text-[var(--text-primary)] font-mono">{act.action}</span>
                               <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${act.outcome === 'success' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>

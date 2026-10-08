@@ -217,6 +217,99 @@ func (b *Bridge) createAndLaunchWorker(params workerLaunchParams, startFn worker
 // before the Worker becomes observable through forwarding. A concurrent
 // first-writer mismatch fences this Worker instead of allowing it to run above
 // the already-established session ceiling.
+func (lifecycle *workerRunLifecycle) setTurnTimeoutHandler(handler func(uint64)) {
+	if lifecycle == nil {
+		return
+	}
+	lifecycle.turnTimeoutMu.Lock()
+	defer lifecycle.turnTimeoutMu.Unlock()
+	lifecycle.turnTimeoutHandler = handler
+	if handler != nil && !lifecycle.turnTimeoutDeadline.IsZero() {
+		lifecycle.scheduleTurnTimeoutLocked(lifecycle.turnTimeoutGeneration, lifecycle.turnTimeoutDeadline)
+	}
+}
+
+func (lifecycle *workerRunLifecycle) armTurnTimeout(deadline time.Time) uint64 {
+	if lifecycle == nil || deadline.IsZero() {
+		return 0
+	}
+	lifecycle.turnTimeoutMu.Lock()
+	defer lifecycle.turnTimeoutMu.Unlock()
+	lifecycle.turnTimeoutGeneration++
+	lifecycle.turnTimeoutDeadline = deadline
+	if lifecycle.turnTimeoutTimer != nil {
+		lifecycle.turnTimeoutTimer.Stop()
+		lifecycle.turnTimeoutTimer = nil
+	}
+	if lifecycle.turnTimeoutHandler != nil {
+		lifecycle.scheduleTurnTimeoutLocked(lifecycle.turnTimeoutGeneration, deadline)
+	}
+	return lifecycle.turnTimeoutGeneration
+}
+
+func (lifecycle *workerRunLifecycle) scheduleTurnTimeoutLocked(generation uint64, deadline time.Time) {
+	if lifecycle.turnTimeoutTimer != nil {
+		lifecycle.turnTimeoutTimer.Stop()
+	}
+	delay := time.Until(deadline)
+	if delay < 0 {
+		delay = 0
+	}
+	lifecycle.turnTimeoutTimer = time.AfterFunc(delay, func() {
+		lifecycle.turnTimeoutMu.Lock()
+		if lifecycle.turnTimeoutGeneration != generation || lifecycle.turnTimeoutDeadline.IsZero() {
+			lifecycle.turnTimeoutMu.Unlock()
+			return
+		}
+		handler := lifecycle.turnTimeoutHandler
+		lifecycle.turnTimeoutTimer = nil
+		lifecycle.turnTimeoutMu.Unlock()
+		if handler != nil {
+			handler(generation)
+		}
+	})
+}
+
+func (lifecycle *workerRunLifecycle) turnTimeoutCurrent(generation uint64) bool {
+	if lifecycle == nil {
+		return false
+	}
+	lifecycle.turnTimeoutMu.Lock()
+	defer lifecycle.turnTimeoutMu.Unlock()
+	return generation != 0 &&
+		generation == lifecycle.turnTimeoutGeneration &&
+		!lifecycle.turnTimeoutDeadline.IsZero()
+}
+
+func (lifecycle *workerRunLifecycle) stopTurnTimeout() {
+	if lifecycle == nil {
+		return
+	}
+	lifecycle.turnTimeoutMu.Lock()
+	defer lifecycle.turnTimeoutMu.Unlock()
+	lifecycle.turnTimeoutGeneration++
+	lifecycle.turnTimeoutDeadline = time.Time{}
+	if lifecycle.turnTimeoutTimer != nil {
+		lifecycle.turnTimeoutTimer.Stop()
+		lifecycle.turnTimeoutTimer = nil
+	}
+}
+
+func (lifecycle *workerRunLifecycle) clearTurnTimeoutHandler() {
+	if lifecycle == nil {
+		return
+	}
+	lifecycle.turnTimeoutMu.Lock()
+	defer lifecycle.turnTimeoutMu.Unlock()
+	lifecycle.turnTimeoutGeneration++
+	lifecycle.turnTimeoutDeadline = time.Time{}
+	lifecycle.turnTimeoutHandler = nil
+	if lifecycle.turnTimeoutTimer != nil {
+		lifecycle.turnTimeoutTimer.Stop()
+		lifecycle.turnTimeoutTimer = nil
+	}
+}
+
 func (b *Bridge) capturePermissionCeiling(ctx context.Context, sessionID string, w worker.Worker) error {
 	reporter, ok := w.(worker.PermissionCeilingReporter)
 	if !ok {
@@ -339,15 +432,73 @@ func (b *Bridge) LaunchPlanApplied(sessionID string) bool {
 // user's input to the worker. Safe to call when the accumulator does not yet
 // exist (it is created on-demand). Turn-Integrity Fix D.
 func (b *Bridge) RecordTurnStart(sessionID string) {
-	b.getOrInitAccum(sessionID, "", time.Now()).recordTurnStart(time.Now())
+	_, _, _, _ = b.RecordTurnStartForRun(sessionID, "")
+}
+
+// RecordTurnStartForRun records the input-path start stamp and arms the
+// current worker run's absolute timeout. The returned values are the exact
+// deadline snapshot to persist with the durable execution record.
+func (b *Bridge) RecordTurnStartForRun(sessionID, expectedRunID string) (startedAt, deadlineAt int64, policyRevision string, err error) {
+	started := time.Now()
+	acc := b.getOrInitAccum(sessionID, "", started)
+	if expectedRunID != "" {
+		binding, ok := b.currentWorkerRunBinding(sessionID, expectedRunID)
+		if !ok || binding.lifecycle == nil {
+			return 0, 0, "", errWorkerRunChanged
+		}
+		acc.recordTurnStart(started)
+		startedAt = started.UnixMilli()
+		if b.turnTimeout > 0 {
+			deadline := started.Add(b.turnTimeout)
+			binding.lifecycle.armTurnTimeout(deadline)
+			return startedAt, deadline.UnixMilli(), turnTimeoutRevision(b.turnTimeout), nil
+		}
+		return startedAt, 0, "", nil
+	}
+
+	acc.recordTurnStart(started)
+	startedAt = started.UnixMilli()
+	if b.turnTimeout <= 0 {
+		return startedAt, 0, "", nil
+	}
+	if binding, ok := b.currentWorkerRunBinding(sessionID, ""); ok && binding.lifecycle != nil {
+		deadline := started.Add(b.turnTimeout)
+		binding.lifecycle.armTurnTimeout(deadline)
+		return startedAt, deadline.UnixMilli(), turnTimeoutRevision(b.turnTimeout), nil
+	}
+	return startedAt, 0, "", nil
+}
+
+func turnTimeoutRevision(timeout time.Duration) string {
+	return fmt.Sprintf("worker.turn_timeout=%s", timeout)
+}
+
+func (b *Bridge) RecordTurnDeadlineForRun(sessionID, expectedRunID string, startedAt, deadlineAt int64) error {
+	if startedAt <= 0 || deadlineAt <= startedAt {
+		return errors.New("bridge: valid persisted turn deadline is required")
+	}
+	binding, ok := b.currentWorkerRunBinding(sessionID, expectedRunID)
+	if !ok || binding.lifecycle == nil {
+		return errWorkerRunChanged
+	}
+	b.getOrInitAccum(sessionID, "", time.UnixMilli(startedAt)).recordTurnStart(time.UnixMilli(startedAt))
+	binding.lifecycle.armTurnTimeout(time.UnixMilli(deadlineAt))
+	return nil
 }
 
 // ClearTurnStart clears the current turn's start stamp. Called by the input
 // path when delivery to the worker failed, so the subsequent Done does not
 // bill a turn that never started. Turn-Integrity Fix D.
 func (b *Bridge) ClearTurnStart(sessionID string) {
+	b.ClearTurnStartForRun(sessionID, "")
+}
+
+func (b *Bridge) ClearTurnStartForRun(sessionID, expectedRunID string) {
 	acc := b.getOrInitAccum(sessionID, "", time.Now())
 	acc.clearTurnStart()
+	if binding, ok := b.currentWorkerRunBinding(sessionID, expectedRunID); ok && binding.lifecycle != nil {
+		binding.lifecycle.stopTurnTimeout()
+	}
 }
 
 // consumeTurnStartMs reads and clears the current turn's start stamp. Called by

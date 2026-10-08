@@ -25,6 +25,37 @@ var (
 // Picked to avoid collision with other hotplex advisory locks (sentinel: "AUD17").
 const AuditAdvisoryLockKey int64 = 819207
 
+const lifecycleAuditAdvisoryLockKey int64 = AuditAdvisoryLockKey + 1
+
+type chainProfile struct {
+	activityTable   string
+	checkpointTable string
+	expiryColumn    string
+	expirySelect    string
+	epoch           string
+	advisoryLockKey int64
+	expiryDrivenGC  bool
+}
+
+var (
+	legacyChainProfile = chainProfile{
+		activityTable:   "user_activity",
+		checkpointTable: "audit_chain_checkpoints",
+		expirySelect:    "0",
+		epoch:           "legacy",
+		advisoryLockKey: AuditAdvisoryLockKey,
+	}
+	lifecycleChainProfile = chainProfile{
+		activityTable:   "user_activity_v2",
+		checkpointTable: "audit_chain_checkpoints_v2",
+		expiryColumn:    "expires_at",
+		expirySelect:    "expires_at",
+		epoch:           "lifecycle-v2",
+		advisoryLockKey: lifecycleAuditAdvisoryLockKey,
+		expiryDrivenGC:  true,
+	}
+)
+
 // Query holds the by-user activity search parameters.
 type Query struct {
 	UserID       string
@@ -110,30 +141,65 @@ type Tx interface {
 func NewStore(db *sql.DB, dialect dbutil.Dialect, writeMu *sqlutil.WriteMu, log *slog.Logger) (Store, error) {
 	switch dialect {
 	case dbutil.DialectSQLite:
-		return newSQLiteStore(db, writeMu, log), nil
+		return newSQLiteStoreWithProfile(db, writeMu, log, legacyChainProfile), nil
 	case dbutil.DialectPostgres:
-		return newPGStore(db, log), nil
+		return newPGStoreWithProfile(db, log, legacyChainProfile), nil
 	default:
 		return nil, fmt.Errorf("audit: unknown dialect %q", dialect)
 	}
+}
+
+// NewLifecycleStore returns the independent audit chain used by lifecycle-v2
+// writes. The legacy chain remains readable and keeps its configured retention.
+func NewLifecycleStore(db *sql.DB, dialect dbutil.Dialect, writeMu *sqlutil.WriteMu, log *slog.Logger) (Store, error) {
+	switch dialect {
+	case dbutil.DialectSQLite:
+		return newSQLiteStoreWithProfile(db, writeMu, log, lifecycleChainProfile), nil
+	case dbutil.DialectPostgres:
+		return newPGStoreWithProfile(db, log, lifecycleChainProfile), nil
+	default:
+		return nil, fmt.Errorf("audit: unknown dialect %q", dialect)
+	}
+}
+
+func activityInsertStatement(dialect dbutil.Dialect, profile chainProfile) string {
+	columns := "ts, user_id, user_id_type, platform, session_id, action, resource_type, resource_id, outcome, detail_json, event_ref, ip, user_agent, prev_hash, self_hash"
+	values := "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+	if profile.expiryColumn != "" {
+		columns += ", " + profile.expiryColumn
+		values += ", ?"
+	}
+	return dialect.Rebind(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", profile.activityTable, columns, values))
+}
+
+func activityInsertArgs(ua *UserActivity, profile chainProfile) []any {
+	args := []any{
+		ua.Ts, ua.UserID, ua.UserIDType, ua.Platform, ua.SessionID,
+		ua.Action, ua.ResourceType, ua.ResourceID, ua.Outcome, ua.DetailJSON, ua.EventRef,
+		ua.IP, ua.UserAgent, ua.PrevHash, ua.SelfHash,
+	}
+	if profile.expiryColumn != "" {
+		args = append(args, ua.ExpiresAt)
+	}
+	return args
 }
 
 // queryAsc is the shared ascending-order reader backing both dialects'
 // QueryAsc. It returns rows with id >= fromID in ascending id order, at
 // most `limit` rows (limit<=0 → empty result). The columns scanned must
 // match the canonical 16-field user_activity projection used by Query.
-func queryAsc(db *sql.DB, d dbutil.Dialect, ctx context.Context, fromID int64, limit int) ([]UserActivity, error) {
+func queryAsc(db *sql.DB, d dbutil.Dialect, profile chainProfile, ctx context.Context, fromID int64, limit int) ([]UserActivity, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	if limit > 1000 {
 		limit = 1000
 	}
-	sqlStr := d.Rebind(
-		"SELECT id, ts, user_id, user_id_type, platform, session_id, action, " +
-			"resource_type, resource_id, outcome, detail_json, event_ref, " +
-			"ip, user_agent, prev_hash, self_hash FROM user_activity" +
-			" WHERE id >= ? ORDER BY id ASC LIMIT ?")
+	sqlStr := d.Rebind(fmt.Sprintf(
+		"SELECT id, ts, user_id, user_id_type, platform, session_id, action, "+
+			"resource_type, resource_id, outcome, detail_json, event_ref, "+
+			"ip, user_agent, prev_hash, self_hash, %s FROM %s WHERE id >= ? ORDER BY id ASC LIMIT ?",
+		profile.expirySelect, profile.activityTable))
 	rows, err := db.QueryContext(ctx, sqlStr, fromID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("audit: query_asc: %w", err)
@@ -148,7 +214,7 @@ func queryAsc(db *sql.DB, d dbutil.Dialect, ctx context.Context, fromID int64, l
 			&ua.ID, &ua.Ts, &ua.UserID, &ua.UserIDType, &ua.Platform,
 			&sessionID, &ua.Action, &resourceType, &resourceID,
 			&ua.Outcome, &ua.DetailJSON, &eventRef, &ip, &userAgent,
-			&ua.PrevHash, &ua.SelfHash,
+			&ua.PrevHash, &ua.SelfHash, &ua.ExpiresAt,
 		); err != nil {
 			return nil, fmt.Errorf("audit: query_asc scan: %w", err)
 		}
@@ -158,6 +224,7 @@ func queryAsc(db *sql.DB, d dbutil.Dialect, ctx context.Context, fromID int64, l
 		ua.EventRef = eventRef.String
 		ua.IP = ip.String
 		ua.UserAgent = userAgent.String
+		ua.ChainEpoch = profile.epoch
 		results = append(results, ua)
 	}
 	return results, rows.Err()
@@ -172,13 +239,18 @@ type sqliteStore struct {
 	writeMu *sqlutil.WriteMu
 	log     *slog.Logger
 	d       dbutil.Dialect
+	profile chainProfile
 }
 
-func newSQLiteStore(db *sql.DB, writeMu *sqlutil.WriteMu, log *slog.Logger) *sqliteStore {
-	return &sqliteStore{db: db, writeMu: writeMu, log: log, d: dbutil.DialectSQLite}
+func newSQLiteStoreWithProfile(db *sql.DB, writeMu *sqlutil.WriteMu, log *slog.Logger, profile chainProfile) *sqliteStore {
+	return &sqliteStore{db: db, writeMu: writeMu, log: log, d: dbutil.DialectSQLite, profile: profile}
 }
 
 func (s *sqliteStore) Dialect() dbutil.Dialect { return s.d }
+
+func (s *sqliteStore) ChainEpoch() string { return s.profile.epoch }
+
+func (s *sqliteStore) UsesPersistedExpiry() bool { return s.profile.expiryDrivenGC }
 
 // BeginTx starts a write transaction. The process-wide writeMu is held for
 // the entire transaction lifetime to serialize against concurrent GC writes
@@ -215,11 +287,11 @@ func (s *sqliteStore) Query(ctx context.Context, q Query) ([]UserActivity, error
 		offset = 0
 	}
 
-	sqlStr := s.d.Rebind(
-		"SELECT id, ts, user_id, user_id_type, platform, session_id, action, " +
-			"resource_type, resource_id, outcome, detail_json, event_ref, " +
-			"ip, user_agent, prev_hash, self_hash FROM user_activity" +
-			where + " ORDER BY id DESC LIMIT ? OFFSET ?")
+	sqlStr := s.d.Rebind(fmt.Sprintf(
+		"SELECT id, ts, user_id, user_id_type, platform, session_id, action, "+
+			"resource_type, resource_id, outcome, detail_json, event_ref, "+
+			"ip, user_agent, prev_hash, self_hash, %s FROM %s",
+		s.profile.expirySelect, s.profile.activityTable) + where + " ORDER BY id DESC LIMIT ? OFFSET ?")
 	args = append(args, limit, offset)
 
 	rows, err := s.db.QueryContext(ctx, sqlStr, args...)
@@ -236,7 +308,7 @@ func (s *sqliteStore) Query(ctx context.Context, q Query) ([]UserActivity, error
 			&ua.ID, &ua.Ts, &ua.UserID, &ua.UserIDType, &ua.Platform,
 			&sessionID, &ua.Action, &resourceType, &resourceID,
 			&ua.Outcome, &ua.DetailJSON, &eventRef, &ip, &userAgent,
-			&ua.PrevHash, &ua.SelfHash,
+			&ua.PrevHash, &ua.SelfHash, &ua.ExpiresAt,
 		); err != nil {
 			return nil, fmt.Errorf("audit: scan: %w", err)
 		}
@@ -246,6 +318,7 @@ func (s *sqliteStore) Query(ctx context.Context, q Query) ([]UserActivity, error
 		ua.EventRef = eventRef.String
 		ua.IP = ip.String
 		ua.UserAgent = userAgent.String
+		ua.ChainEpoch = s.profile.epoch
 		results = append(results, ua)
 	}
 	return results, rows.Err()
@@ -402,7 +475,7 @@ func (s *sqliteStore) DeleteIdentityLink(ctx context.Context, id string) error {
 }
 
 func (s *sqliteStore) QueryAsc(ctx context.Context, fromID int64, limit int) ([]UserActivity, error) {
-	return queryAsc(s.db, s.d, ctx, fromID, limit)
+	return queryAsc(s.db, s.d, s.profile, ctx, fromID, limit)
 }
 
 // DeleteBefore prunes rows with ts < cutoff, anchored by a checkpoint
@@ -472,7 +545,7 @@ func deleteBeforeTx(ctx context.Context, tx Tx, cutoff time.Time) (int64, Checkp
 func (s *sqliteStore) SaveCheckpoint(ctx context.Context, c Checkpoint) error {
 	return s.writeMu.WithLock(func() error {
 		_, err := s.db.ExecContext(ctx,
-			s.d.Rebind("INSERT INTO audit_chain_checkpoints (pruned_at, last_self_hash, next_id) VALUES (?, ?, ?)"),
+			s.d.Rebind(fmt.Sprintf("INSERT INTO %s (pruned_at, last_self_hash, next_id) VALUES (?, ?, ?)", s.profile.checkpointTable)),
 			c.PrunedAt.UnixMilli(), c.LastSelfHash, c.NextID)
 		if err != nil {
 			return fmt.Errorf("audit: save checkpoint: %w", err)
@@ -485,7 +558,7 @@ func (s *sqliteStore) LatestCheckpoint(ctx context.Context) (*Checkpoint, error)
 	var c Checkpoint
 	var prunedAtMs int64
 	err := s.db.QueryRowContext(ctx,
-		s.d.Rebind("SELECT id, pruned_at, last_self_hash, next_id FROM audit_chain_checkpoints ORDER BY id DESC LIMIT 1"),
+		s.d.Rebind(fmt.Sprintf("SELECT id, pruned_at, last_self_hash, next_id FROM %s ORDER BY id DESC LIMIT 1", s.profile.checkpointTable)),
 	).Scan(&c.ID, &prunedAtMs, &c.LastSelfHash, &c.NextID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -500,7 +573,7 @@ func (s *sqliteStore) LatestCheckpoint(ctx context.Context) (*Checkpoint, error)
 func (s *sqliteStore) Close() error { return s.db.Close() }
 
 func (s *sqliteStore) Stats(ctx context.Context, q Query) (ActivityStats, error) {
-	return activityStats(s.db, s.d, ctx, q)
+	return activityStats(s.db, s.d, s.profile.activityTable, ctx, q)
 }
 
 // activityStats computes the ActivityStats aggregates (total + per-outcome +
@@ -510,7 +583,7 @@ func (s *sqliteStore) Stats(ctx context.Context, q Query) (ActivityStats, error)
 // keep each query simple and index-friendly; a third COUNT(*) provides total.
 // The filters in q are applied to every sub-query so the stats reflect the
 // exact same scoped set the timeline displays.
-func activityStats(db queryExecContext, d dbutil.Dialect, ctx context.Context, q Query) (ActivityStats, error) {
+func activityStats(db queryExecContext, d dbutil.Dialect, activityTable string, ctx context.Context, q Query) (ActivityStats, error) {
 	where, args := buildActivityWhere(q)
 	stats := ActivityStats{
 		ByOutcome:  make(map[string]int64),
@@ -518,7 +591,7 @@ func activityStats(db queryExecContext, d dbutil.Dialect, ctx context.Context, q
 	}
 
 	// Total count (scoped).
-	countSQL := d.Rebind("SELECT COUNT(*) FROM user_activity" + where)
+	countSQL := d.Rebind(fmt.Sprintf("SELECT COUNT(*) FROM %s", activityTable) + where)
 	var total int64
 	if err := db.QueryRowContext(ctx, countSQL, args...).Scan(&total); err != nil {
 		return stats, fmt.Errorf("audit: stats total: %w", err)
@@ -526,7 +599,7 @@ func activityStats(db queryExecContext, d dbutil.Dialect, ctx context.Context, q
 	stats.Total = total
 
 	// Per-outcome breakdown.
-	outcomeSQL := d.Rebind("SELECT outcome, COUNT(*) FROM user_activity" + where + " GROUP BY outcome")
+	outcomeSQL := d.Rebind(fmt.Sprintf("SELECT outcome, COUNT(*) FROM %s", activityTable) + where + " GROUP BY outcome")
 	orows, err := db.QueryContext(ctx, outcomeSQL, args...)
 	if err != nil {
 		return stats, fmt.Errorf("audit: stats by outcome: %w", err)
@@ -536,7 +609,7 @@ func activityStats(db queryExecContext, d dbutil.Dialect, ctx context.Context, q
 	}
 
 	// Per-platform breakdown.
-	platformSQL := d.Rebind("SELECT platform, COUNT(*) FROM user_activity" + where + " GROUP BY platform")
+	platformSQL := d.Rebind(fmt.Sprintf("SELECT platform, COUNT(*) FROM %s", activityTable) + where + " GROUP BY platform")
 	prows, err := db.QueryContext(ctx, platformSQL, args...)
 	if err != nil {
 		return stats, fmt.Errorf("audit: stats by platform: %w", err)
@@ -591,14 +664,9 @@ func (t *sqliteTx) Append(ctx context.Context, ua *UserActivity) error {
 	if t.done {
 		return ErrStoreClosed
 	}
-	_, err := t.tx.ExecContext(ctx, t.store.d.Rebind(
-		"INSERT INTO user_activity (ts, user_id, user_id_type, platform, session_id, "+
-			"action, resource_type, resource_id, outcome, detail_json, event_ref, "+
-			"ip, user_agent, prev_hash, self_hash) "+
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
-		ua.Ts, ua.UserID, ua.UserIDType, ua.Platform, ua.SessionID,
-		ua.Action, ua.ResourceType, ua.ResourceID, ua.Outcome, ua.DetailJSON, ua.EventRef,
-		ua.IP, ua.UserAgent, ua.PrevHash, ua.SelfHash,
+	_, err := t.tx.ExecContext(ctx,
+		activityInsertStatement(t.store.d, t.store.profile),
+		activityInsertArgs(ua, t.store.profile)...,
 	)
 	if err != nil {
 		return fmt.Errorf("audit: append: %w", err)
@@ -623,7 +691,7 @@ func (t *sqliteTx) SaveCheckpoint(ctx context.Context, c Checkpoint) error {
 		return ErrStoreClosed
 	}
 	_, err := t.tx.ExecContext(ctx, t.store.d.Rebind(
-		"INSERT INTO audit_chain_checkpoints (pruned_at, last_self_hash, next_id) VALUES (?, ?, ?)"),
+		fmt.Sprintf("INSERT INTO %s (pruned_at, last_self_hash, next_id) VALUES (?, ?, ?)", t.store.profile.checkpointTable)),
 		c.PrunedAt.UnixMilli(), c.LastSelfHash, c.NextID)
 	if err != nil {
 		return fmt.Errorf("audit: tx save checkpoint: %w", err)
@@ -637,7 +705,7 @@ func (t *sqliteTx) TailHash(ctx context.Context) (string, error) {
 	}
 	var h sql.NullString
 	err := t.tx.QueryRowContext(ctx,
-		"SELECT self_hash FROM user_activity ORDER BY id DESC LIMIT 1",
+		fmt.Sprintf("SELECT self_hash FROM %s ORDER BY id DESC LIMIT 1", t.store.profile.activityTable),
 	).Scan(&h)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -657,10 +725,18 @@ func (t *sqliteTx) LastRowBefore(ctx context.Context, cutoff time.Time) (int64, 
 	}
 	var id int64
 	var h sql.NullString
-	err := t.tx.QueryRowContext(ctx,
-		"SELECT id, self_hash FROM user_activity WHERE ts < ? ORDER BY id DESC LIMIT 1",
-		cutoff.UnixMilli(),
-	).Scan(&id, &h)
+	var query string
+	if t.store.profile.expiryDrivenGC {
+		table := t.store.profile.activityTable
+		expiryColumn := t.store.profile.expiryColumn
+		query = fmt.Sprintf(
+			"SELECT id, self_hash FROM %s WHERE id < COALESCE((SELECT MIN(id) FROM %s WHERE %s >= ?), (SELECT MAX(id)+1 FROM %s)) ORDER BY id DESC LIMIT 1",
+			table, table, expiryColumn, table,
+		)
+	} else {
+		query = fmt.Sprintf("SELECT id, self_hash FROM %s WHERE ts < ? ORDER BY id DESC LIMIT 1", t.store.profile.activityTable)
+	}
+	err := t.tx.QueryRowContext(ctx, query, cutoff.UnixMilli()).Scan(&id, &h)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, "", nil
 	}
@@ -674,7 +750,7 @@ func (t *sqliteTx) DeleteByIDLEQ(ctx context.Context, maxID int64) (int64, error
 	if t.done {
 		return 0, ErrStoreClosed
 	}
-	res, err := t.tx.ExecContext(ctx, "DELETE FROM user_activity WHERE id <= ?", maxID)
+	res, err := t.tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE id <= ?", t.store.profile.activityTable), maxID)
 	if err != nil {
 		return 0, fmt.Errorf("audit: delete by id: %w", err)
 	}
@@ -687,7 +763,7 @@ func (t *sqliteTx) RowCount(ctx context.Context) (int64, error) {
 		return 0, ErrStoreClosed
 	}
 	var n int64
-	err := t.tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM user_activity").Scan(&n)
+	err := t.tx.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", t.store.profile.activityTable)).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("audit: row count: %w", err)
 	}
@@ -717,16 +793,21 @@ func (t *sqliteTx) Rollback() error {
 // ---------------------------------------------------------------------------
 
 type pgStore struct {
-	db  *sql.DB
-	log *slog.Logger
-	d   dbutil.Dialect
+	db      *sql.DB
+	log     *slog.Logger
+	d       dbutil.Dialect
+	profile chainProfile
 }
 
-func newPGStore(db *sql.DB, log *slog.Logger) *pgStore {
-	return &pgStore{db: db, log: log, d: dbutil.DialectPostgres}
+func newPGStoreWithProfile(db *sql.DB, log *slog.Logger, profile chainProfile) *pgStore {
+	return &pgStore{db: db, log: log, d: dbutil.DialectPostgres, profile: profile}
 }
 
 func (s *pgStore) Dialect() dbutil.Dialect { return s.d }
+
+func (s *pgStore) ChainEpoch() string { return s.profile.epoch }
+
+func (s *pgStore) UsesPersistedExpiry() bool { return s.profile.expiryDrivenGC }
 
 func (s *pgStore) BeginTx(ctx context.Context) (Tx, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -734,11 +815,11 @@ func (s *pgStore) BeginTx(ctx context.Context) (Tx, error) {
 		return nil, fmt.Errorf("audit: pg begin tx: %w", err)
 	}
 	// Acquire advisory lock to serialize chain tail writes.
-	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", AuditAdvisoryLockKey); err != nil {
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", s.profile.advisoryLockKey); err != nil {
 		_ = tx.Rollback()
 		return nil, fmt.Errorf("audit: pg advisory lock: %w", err)
 	}
-	return &pgTx{tx: tx, d: s.d}, nil
+	return &pgTx{tx: tx, d: s.d, profile: s.profile}, nil
 }
 
 func (s *pgStore) Query(ctx context.Context, q Query) ([]UserActivity, error) {
@@ -757,11 +838,11 @@ func (s *pgStore) Query(ctx context.Context, q Query) ([]UserActivity, error) {
 		offset = 0
 	}
 
-	sqlStr := s.d.Rebind(
-		"SELECT id, ts, user_id, user_id_type, platform, session_id, action, " +
-			"resource_type, resource_id, outcome, detail_json, event_ref, " +
-			"ip, user_agent, prev_hash, self_hash FROM user_activity" +
-			where + " ORDER BY id DESC LIMIT ? OFFSET ?")
+	sqlStr := s.d.Rebind(fmt.Sprintf(
+		"SELECT id, ts, user_id, user_id_type, platform, session_id, action, "+
+			"resource_type, resource_id, outcome, detail_json, event_ref, "+
+			"ip, user_agent, prev_hash, self_hash, %s FROM %s",
+		s.profile.expirySelect, s.profile.activityTable) + where + " ORDER BY id DESC LIMIT ? OFFSET ?")
 	args = append(args, limit, offset)
 
 	rows, err := s.db.QueryContext(ctx, sqlStr, args...)
@@ -778,7 +859,7 @@ func (s *pgStore) Query(ctx context.Context, q Query) ([]UserActivity, error) {
 			&ua.ID, &ua.Ts, &ua.UserID, &ua.UserIDType, &ua.Platform,
 			&sessionID, &ua.Action, &resourceType, &resourceID,
 			&ua.Outcome, &ua.DetailJSON, &eventRef, &ip, &userAgent,
-			&ua.PrevHash, &ua.SelfHash,
+			&ua.PrevHash, &ua.SelfHash, &ua.ExpiresAt,
 		); err != nil {
 			return nil, fmt.Errorf("audit: pg scan: %w", err)
 		}
@@ -788,13 +869,14 @@ func (s *pgStore) Query(ctx context.Context, q Query) ([]UserActivity, error) {
 		ua.EventRef = eventRef.String
 		ua.IP = ip.String
 		ua.UserAgent = userAgent.String
+		ua.ChainEpoch = s.profile.epoch
 		results = append(results, ua)
 	}
 	return results, rows.Err()
 }
 
 func (s *pgStore) QueryAsc(ctx context.Context, fromID int64, limit int) ([]UserActivity, error) {
-	return queryAsc(s.db, s.d, ctx, fromID, limit)
+	return queryAsc(s.db, s.d, s.profile, ctx, fromID, limit)
 }
 
 func (s *pgStore) DeleteBefore(ctx context.Context, cutoff time.Time) (int64, error) {
@@ -815,7 +897,7 @@ func (s *pgStore) DeleteBefore(ctx context.Context, cutoff time.Time) (int64, er
 
 func (s *pgStore) SaveCheckpoint(ctx context.Context, c Checkpoint) error {
 	_, err := s.db.ExecContext(ctx,
-		"INSERT INTO audit_chain_checkpoints (pruned_at, last_self_hash, next_id) VALUES ($1, $2, $3)",
+		fmt.Sprintf("INSERT INTO %s (pruned_at, last_self_hash, next_id) VALUES ($1, $2, $3)", s.profile.checkpointTable),
 		c.PrunedAt.UnixMilli(), c.LastSelfHash, c.NextID)
 	if err != nil {
 		return fmt.Errorf("audit: pg save checkpoint: %w", err)
@@ -827,7 +909,7 @@ func (s *pgStore) LatestCheckpoint(ctx context.Context) (*Checkpoint, error) {
 	var c Checkpoint
 	var prunedAtMs int64
 	err := s.db.QueryRowContext(ctx,
-		"SELECT id, pruned_at, last_self_hash, next_id FROM audit_chain_checkpoints ORDER BY id DESC LIMIT 1",
+		fmt.Sprintf("SELECT id, pruned_at, last_self_hash, next_id FROM %s ORDER BY id DESC LIMIT 1", s.profile.checkpointTable),
 	).Scan(&c.ID, &prunedAtMs, &c.LastSelfHash, &c.NextID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -875,28 +957,24 @@ func (s *pgStore) DeleteIdentityLink(ctx context.Context, id string) error {
 func (s *pgStore) Close() error { return s.db.Close() }
 
 func (s *pgStore) Stats(ctx context.Context, q Query) (ActivityStats, error) {
-	return activityStats(s.db, s.d, ctx, q)
+	return activityStats(s.db, s.d, s.profile.activityTable, ctx, q)
 }
 
 // pgTx implements Tx for PostgreSQL with advisory lock serialization.
 type pgTx struct {
-	tx   *sql.Tx
-	d    dbutil.Dialect
-	done bool
+	tx      *sql.Tx
+	d       dbutil.Dialect
+	profile chainProfile
+	done    bool
 }
 
 func (t *pgTx) Append(ctx context.Context, ua *UserActivity) error {
 	if t.done {
 		return ErrStoreClosed
 	}
-	_, err := t.tx.ExecContext(ctx, t.d.Rebind(
-		"INSERT INTO user_activity (ts, user_id, user_id_type, platform, session_id, "+
-			"action, resource_type, resource_id, outcome, detail_json, event_ref, "+
-			"ip, user_agent, prev_hash, self_hash) "+
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
-		ua.Ts, ua.UserID, ua.UserIDType, ua.Platform, ua.SessionID,
-		ua.Action, ua.ResourceType, ua.ResourceID, ua.Outcome, ua.DetailJSON, ua.EventRef,
-		ua.IP, ua.UserAgent, ua.PrevHash, ua.SelfHash,
+	_, err := t.tx.ExecContext(ctx,
+		activityInsertStatement(t.d, t.profile),
+		activityInsertArgs(ua, t.profile)...,
 	)
 	if err != nil {
 		return fmt.Errorf("audit: pg append: %w", err)
@@ -910,7 +988,7 @@ func (t *pgTx) TailHash(ctx context.Context) (string, error) {
 	}
 	var h sql.NullString
 	err := t.tx.QueryRowContext(ctx,
-		"SELECT self_hash FROM user_activity ORDER BY id DESC LIMIT 1",
+		fmt.Sprintf("SELECT self_hash FROM %s ORDER BY id DESC LIMIT 1", t.profile.activityTable),
 	).Scan(&h)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -941,7 +1019,7 @@ func (t *pgTx) SaveCheckpoint(ctx context.Context, c Checkpoint) error {
 		return ErrStoreClosed
 	}
 	_, err := t.tx.ExecContext(ctx,
-		"INSERT INTO audit_chain_checkpoints (pruned_at, last_self_hash, next_id) VALUES ($1, $2, $3)",
+		fmt.Sprintf("INSERT INTO %s (pruned_at, last_self_hash, next_id) VALUES ($1, $2, $3)", t.profile.checkpointTable),
 		c.PrunedAt.UnixMilli(), c.LastSelfHash, c.NextID)
 	if err != nil {
 		return fmt.Errorf("audit: pg tx save checkpoint: %w", err)
@@ -955,10 +1033,18 @@ func (t *pgTx) LastRowBefore(ctx context.Context, cutoff time.Time) (int64, stri
 	}
 	var id int64
 	var h sql.NullString
-	err := t.tx.QueryRowContext(ctx,
-		"SELECT id, self_hash FROM user_activity WHERE ts < $1 ORDER BY id DESC LIMIT 1",
-		cutoff.UnixMilli(),
-	).Scan(&id, &h)
+	var query string
+	if t.profile.expiryDrivenGC {
+		table := t.profile.activityTable
+		expiryColumn := t.profile.expiryColumn
+		query = fmt.Sprintf(
+			"SELECT id, self_hash FROM %s WHERE id < COALESCE((SELECT MIN(id) FROM %s WHERE %s >= $1), (SELECT MAX(id)+1 FROM %s)) ORDER BY id DESC LIMIT 1",
+			table, table, expiryColumn, table,
+		)
+	} else {
+		query = fmt.Sprintf("SELECT id, self_hash FROM %s WHERE ts < $1 ORDER BY id DESC LIMIT 1", t.profile.activityTable)
+	}
+	err := t.tx.QueryRowContext(ctx, query, cutoff.UnixMilli()).Scan(&id, &h)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, "", nil
 	}
@@ -972,7 +1058,7 @@ func (t *pgTx) DeleteByIDLEQ(ctx context.Context, maxID int64) (int64, error) {
 	if t.done {
 		return 0, ErrStoreClosed
 	}
-	res, err := t.tx.ExecContext(ctx, "DELETE FROM user_activity WHERE id <= $1", maxID)
+	res, err := t.tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE id <= $1", t.profile.activityTable), maxID)
 	if err != nil {
 		return 0, fmt.Errorf("audit: pg delete by id: %w", err)
 	}
@@ -985,7 +1071,7 @@ func (t *pgTx) RowCount(ctx context.Context) (int64, error) {
 		return 0, ErrStoreClosed
 	}
 	var n int64
-	err := t.tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM user_activity").Scan(&n)
+	err := t.tx.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", t.profile.activityTable)).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("audit: pg row count: %w", err)
 	}

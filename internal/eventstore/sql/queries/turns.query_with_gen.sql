@@ -8,5 +8,6 @@ SELECT t.id, t.session_id, t.client_message_id, t.generation, t.turn_num, t.seq,
        t.tokens_out, t.duration_ms, t.cost_usd, t.created_at
 FROM turns t, latest_gen lg
 WHERE t.session_id = ? AND t.generation = lg.gen
+  AND ((t.expires_at > 0 AND t.expires_at > ?) OR (t.expires_at = 0 AND t.created_at > ?))
 ORDER BY t.id ASC
 LIMIT ? OFFSET ?

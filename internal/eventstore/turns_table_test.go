@@ -54,7 +54,8 @@ func newTestStoreWithTurnsTable(t *testing.T) *SQLiteStore {
 		tokens_out          INTEGER NOT NULL DEFAULT 0,
 		duration_ms         INTEGER NOT NULL DEFAULT 0,
 		cost_usd            REAL    NOT NULL DEFAULT 0.0,
-		created_at          INTEGER NOT NULL
+		created_at          INTEGER NOT NULL,
+		expires_at          INTEGER NOT NULL DEFAULT 0
 	)`)
 	require.NoError(t, err)
 
@@ -64,6 +65,73 @@ func newTestStoreWithTurnsTable(t *testing.T) *SQLiteStore {
 	require.NoError(t, err)
 
 	return store
+}
+
+func TestSQLiteStore_DeleteConversationBySession(t *testing.T) {
+	t.Parallel()
+	store := newTestStoreWithTurnsTable(t)
+	ctx := testCtx(t)
+	require.NoError(t, store.Append(ctx, &StoredEvent{
+		SessionID: "sess-purge", Seq: 1, Type: "message",
+		Data: json.RawMessage(`{"content":"private"}`), Direction: "outbound",
+		Source: SourceNormal, CreatedAt: time.Now().UnixMilli(),
+	}))
+	_, err := store.db.ExecContext(ctx,
+		`INSERT INTO turns (session_id, turn_num, role, content, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"sess-purge", 1, "user", "private", time.Now().UnixMilli())
+	require.NoError(t, err)
+
+	require.NoError(t, store.DeleteConversationBySession(ctx, "sess-purge"))
+
+	var eventCount, turnCount int
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE session_id = ?`, "sess-purge").Scan(&eventCount))
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM turns WHERE session_id = ?`, "sess-purge").Scan(&turnCount))
+	require.Zero(t, eventCount)
+	require.Zero(t, turnCount)
+}
+
+func TestSQLiteStore_DeleteConversationBySessionRollsBackTogether(t *testing.T) {
+	t.Parallel()
+	store := newTestStoreWithTurnsTable(t)
+	ctx := testCtx(t)
+	require.NoError(t, store.Append(ctx, &StoredEvent{
+		SessionID: "sess-purge-rollback", Seq: 1, Type: "message",
+		Data: json.RawMessage(`{"content":"private"}`), Direction: "outbound",
+		Source: SourceNormal, CreatedAt: time.Now().UnixMilli(),
+	}))
+	_, err := store.db.ExecContext(ctx,
+		`INSERT INTO turns (session_id, turn_num, role, content, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"sess-purge-rollback", 1, "user", "private", time.Now().UnixMilli())
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `CREATE TRIGGER reject_turn_purge BEFORE DELETE ON turns
+		BEGIN SELECT RAISE(ABORT, 'blocked'); END`)
+	require.NoError(t, err)
+
+	require.Error(t, store.DeleteConversationBySession(ctx, "sess-purge-rollback"))
+
+	var eventCount, turnCount int
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE session_id = ?`, "sess-purge-rollback").Scan(&eventCount))
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM turns WHERE session_id = ?`, "sess-purge-rollback").Scan(&turnCount))
+	require.Equal(t, 1, eventCount)
+	require.Equal(t, 1, turnCount)
+}
+
+func TestSQLiteStore_RejectsTurnAppendAfterSessionDeletion(t *testing.T) {
+	t.Parallel()
+	store := newTestStoreWithTurnsTable(t)
+	ctx := testCtx(t)
+
+	_, err := store.db.ExecContext(ctx, `INSERT INTO sessions (id, state) VALUES (?, 'deleted')`, "sess-deleted-turn")
+	require.NoError(t, err)
+
+	tx, err := store.BeginTx(ctx)
+	require.NoError(t, err)
+	err = tx.AppendTurn(ctx, &TurnWriteRequest{
+		SessionID: "sess-deleted-turn", Generation: 1, TurnNum: 1, Role: "user",
+		Content: "late", CreatedAt: time.Now().UnixMilli(),
+	})
+	require.ErrorIs(t, err, ErrSessionDeleted)
+	require.NoError(t, tx.Rollback())
 }
 
 // ─── TURN-001: turns table creation ─────────────────────────────────────────
@@ -594,6 +662,63 @@ func TestTurnsTable_DeleteExpiredTurns(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	require.Equal(t, "recent", records[0].Content)
+}
+
+func TestTurnsTable_PerRecordContentExpiry(t *testing.T) {
+	t.Parallel()
+	store := newTestStoreWithTurnsTable(t)
+	store.retention = RetentionPolicy{
+		Content: 10 * 24 * time.Hour,
+		Legacy:  30 * 24 * time.Hour,
+	}
+	ctx := testCtx(t)
+	now := time.Now().Truncate(time.Millisecond)
+
+	_, err := store.db.ExecContext(ctx,
+		`INSERT INTO sessions (id, lifecycle_policy) VALUES (?, 'v2')`, "s-exp")
+	require.NoError(t, err)
+
+	tx, err := store.BeginTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, tx.AppendTurn(ctx, &TurnWriteRequest{
+		SessionID: "s-exp", Generation: 1, TurnNum: 1, Role: RoleUser,
+		Content: "expired", Source: SourceNormal, CreatedAt: now.Add(-11 * 24 * time.Hour).UnixMilli(),
+	}))
+	require.NoError(t, tx.AppendTurn(ctx, &TurnWriteRequest{
+		SessionID: "s-exp", Generation: 1, TurnNum: 2, Role: RoleUser,
+		Content: "live", Source: SourceNormal, CreatedAt: now.Add(-9 * 24 * time.Hour).UnixMilli(),
+	}))
+	require.NoError(t, tx.Commit())
+
+	_, err = store.db.ExecContext(ctx, `INSERT INTO turns
+		(session_id, generation, turn_num, role, content, created_at, expires_at)
+		VALUES (?, 1, 3, 'user', 'legacy-expired', ?, 0)`,
+		"s-exp", now.Add(-31*24*time.Hour).UnixMilli())
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `INSERT INTO turns
+		(session_id, generation, turn_num, role, content, created_at, expires_at)
+		VALUES (?, 1, 4, 'user', 'legacy-live', ?, 0)`,
+		"s-exp", now.Add(-29*24*time.Hour).UnixMilli())
+	require.NoError(t, err)
+
+	var expiresAt int64
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT expires_at FROM turns WHERE session_id = ? AND turn_num = 2`, "s-exp").Scan(&expiresAt))
+	require.Equal(t, now.Add(24*time.Hour).UnixMilli(), expiresAt)
+
+	records, err := store.QueryTurns(ctx, "s-exp", 10, 0)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	require.Equal(t, []string{"live", "legacy-live"}, []string{records[0].Content, records[1].Content})
+
+	deleted, err := store.DeleteExpiredTurns(ctx, now.Add(-30*24*time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, int64(2), deleted)
+
+	records, err = store.QueryTurns(ctx, "s-exp", 10, 0)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	require.Equal(t, []string{"live", "legacy-live"}, []string{records[0].Content, records[1].Content})
 }
 
 // ─── TURN-020: TurnRecord ID type ──────────────────────────────────────────

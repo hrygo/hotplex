@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -408,4 +409,40 @@ func TestTraceWriter_PathFormat(t *testing.T) {
 
 	expected := filepath.Join(dir, "acp-trace-my-session.jsonl")
 	require.Equal(t, expected, tw.Path())
+}
+
+func TestPruneExpiredTraceFiles_SkipsActiveAndUnrelatedFiles(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	dir := t.TempDir()
+	expired, err := NewTraceWriter(dir, "expired")
+	require.NoError(t, err)
+	expiredPath := expired.Path()
+	require.NoError(t, expired.Close())
+	oldTime := now.Add(-72 * time.Hour)
+	require.NoError(t, os.Chtimes(expiredPath, oldTime, oldTime))
+
+	rotatedPath := expiredPath + ".1"
+	require.NoError(t, os.WriteFile(rotatedPath, []byte("old trace"), 0o600))
+	require.NoError(t, os.Chtimes(rotatedPath, oldTime, oldTime))
+
+	active, err := NewTraceWriter(dir, "active")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = active.Close() })
+	activePath := active.Path()
+	require.NoError(t, os.Chtimes(activePath, oldTime, oldTime))
+
+	unrelatedPath := filepath.Join(dir, "gateway.log")
+	require.NoError(t, os.WriteFile(unrelatedPath, []byte("log"), 0o600))
+	require.NoError(t, os.Chtimes(unrelatedPath, oldTime, oldTime))
+
+	deleted, err := PruneExpiredTraceFiles(dir, now, 48*time.Hour, 100)
+
+	require.NoError(t, err)
+	require.Equal(t, 2, deleted)
+	require.NoFileExists(t, expiredPath)
+	require.NoFileExists(t, rotatedPath)
+	require.FileExists(t, activePath)
+	require.FileExists(t, unrelatedPath)
 }

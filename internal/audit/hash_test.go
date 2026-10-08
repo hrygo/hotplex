@@ -22,6 +22,33 @@ func TestComputeSelfHash_GenesisHasStableValue(t *testing.T) {
 	require.Equal(t, h, h2, "hash must be deterministic")
 }
 
+func TestComputeSelfHashIncludesOnlyLifecycleV2Expiry(t *testing.T) {
+	t.Parallel()
+
+	legacy := &UserActivity{Ts: 1, UserID: "u", Action: ActionAuthLogin, Outcome: OutcomeSuccess}
+	legacyHash, err := ComputeSelfHash("", legacy)
+	require.NoError(t, err)
+	legacy.ExpiresAt = 1234
+	legacyHashWithExpiry, err := ComputeSelfHash("", legacy)
+	require.NoError(t, err)
+	require.Equal(t, legacyHash, legacyHashWithExpiry, "legacy hash payload must remain byte-compatible")
+
+	lifecycle := &UserActivity{
+		Ts:         1,
+		UserID:     "u",
+		Action:     ActionAuthLogin,
+		Outcome:    OutcomeSuccess,
+		ChainEpoch: lifecycleChainProfile.epoch,
+		ExpiresAt:  1234,
+	}
+	lifecycleHash, err := ComputeSelfHash("", lifecycle)
+	require.NoError(t, err)
+	lifecycle.ExpiresAt++
+	lifecycleHashWithChangedExpiry, err := ComputeSelfHash("", lifecycle)
+	require.NoError(t, err)
+	require.NotEqual(t, lifecycleHash, lifecycleHashWithChangedExpiry, "lifecycle expiry must be covered by the hash chain")
+}
+
 func TestComputeSelfHash_ChangesWithPrev(t *testing.T) {
 	t.Parallel()
 	ua := &UserActivity{Ts: 1700000000000, UserID: "u1", Action: ActionAuthLogin, Outcome: OutcomeSuccess}

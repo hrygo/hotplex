@@ -21,6 +21,7 @@ import (
 	"github.com/hrygo/hotplex/internal/messaging"
 	"github.com/hrygo/hotplex/internal/messaging/phrases"
 	"github.com/hrygo/hotplex/internal/messaging/stt"
+	"github.com/hrygo/hotplex/internal/observability"
 	"github.com/hrygo/hotplex/pkg/events"
 )
 
@@ -46,6 +47,7 @@ type Adapter struct {
 	injectExclude      []string
 	transcriber        Transcriber
 	turnSummaryEnabled bool
+	mediaRetention     time.Duration
 	ttsPipeline        *TTSPipeline
 	phrases            *phrases.Phrases
 	displayName        string
@@ -77,6 +79,7 @@ func (a *Adapter) ConfigureWith(config messaging.AdapterConfig) error {
 
 	// Shared adapter state (gate, backoff delays).
 	a.ConfigureShared(config)
+	a.mediaRetention = config.ExtrasDuration("media_retention")
 
 	// Feishu-specific: credentials.
 	a.appID = config.ExtrasString("app_id")
@@ -403,7 +406,7 @@ func extractTextFromContent(content string) string {
 
 const (
 	feishuMediaCleanupInterval = 6 * time.Hour
-	feishuMediaTTL             = 24 * time.Hour
+	defaultFeishuMediaTTL      = 24 * time.Hour
 )
 
 // feishuMediaSubdirs lists the media subdirectories owned by the Feishu adapter.
@@ -443,12 +446,16 @@ func (a *Adapter) doCleanupMedia() {
 }
 
 func (a *Adapter) cleanupMediaInDir(dir string) {
+	ttl := a.mediaRetention
+	if ttl <= 0 {
+		ttl = defaultFeishuMediaTTL
+	}
 	var deleted, freedBytes int64
 	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
-		if !info.IsDir() && time.Since(info.ModTime()) > feishuMediaTTL {
+		if !info.IsDir() && time.Since(info.ModTime()) > ttl {
 			if err := os.Remove(path); err != nil {
 				a.Log.Warn("feishu: failed to remove old media file", "path", path, "err", err)
 				return nil
@@ -462,5 +469,6 @@ func (a *Adapter) cleanupMediaInDir(dir string) {
 	if deleted > 0 {
 		a.Log.Debug("feishu: cleaned up old media files",
 			"dir", dir, "deleted", deleted, "freed_bytes", freedBytes)
+		observability.RecordLifecycleGCProcessed(context.Background(), observability.LifecycleGCProcessedMediaFile, deleted)
 	}
 }

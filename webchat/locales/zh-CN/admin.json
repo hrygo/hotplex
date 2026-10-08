@@ -598,6 +598,7 @@
       "network": "网络",
       "detail_json": "详情 JSON",
       "hash_chain": "哈希链",
+      "chain_epoch": "链版本",
       "prev_hash": "前驱",
       "self_hash": "当前",
       "hash_hint": "防篡改链",

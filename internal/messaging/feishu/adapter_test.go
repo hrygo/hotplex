@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -120,6 +122,28 @@ func TestAdapter_ConfigureWith(t *testing.T) {
 	require.Equal(t, "app123", a.appID)
 	require.Equal(t, "secret456", a.appSecret)
 	require.Equal(t, messaging.PlatformFeishu, a.Platform())
+}
+
+func TestCleanupMedia_UsesConfiguredRetention(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	a := &Adapter{
+		BaseAdapter: messaging.BaseAdapter[*FeishuConn]{
+			PlatformAdapter: messaging.PlatformAdapter{Log: logger},
+		},
+	}
+	require.NoError(t, a.ConfigureWith(messaging.AdapterConfig{
+		Extras: map[string]any{"media_retention": 2 * time.Hour},
+	}))
+
+	tmpDir := t.TempDir()
+	expiredFile := filepath.Join(tmpDir, "expired.txt")
+	require.NoError(t, os.WriteFile(expiredFile, []byte("expired"), 0o600))
+	oldTime := time.Now().Add(-3 * time.Hour)
+	require.NoError(t, os.Chtimes(expiredFile, oldTime, oldTime))
+
+	a.cleanupMediaInDir(tmpDir)
+
+	require.NoFileExists(t, expiredFile)
 }
 
 func TestAdapter_Start_MissingCredentials(t *testing.T) {

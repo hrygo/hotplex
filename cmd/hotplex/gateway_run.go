@@ -65,6 +65,7 @@ type eventStoreProvider interface {
 	eventstore.TurnQuerier
 	QueryBySession(ctx context.Context, sessionID string, cursor int64, dir eventstore.CursorDirection, limit int) (*eventstore.EventPage, error)
 	DeleteExpired(ctx context.Context, cutoff time.Time) (int64, error)
+	DeleteConversationBySession(ctx context.Context, sessionID string) error
 	Close() error
 }
 
@@ -276,14 +277,24 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 
 	// Audit subsystem (issue #833 P1): construct Store + Collector + GC + Verifier
 	// when audit.enabled=true. The collector batches events and fans out to sinks.
-	// GC prunes old rows; Verifier checks hash chain integrity.
+	// New writes use the lifecycle-v2 chain; the legacy chain retains its own
+	// retention and verification window.
 	var auditCollector *audit.Collector
 	var auditStore audit.Store
 	var auditGC *audit.GC
+	var lifecycleAuditGC *audit.GC
 	if cfg.Audit.Enabled {
-		auditStore, err = audit.NewStore(stores.sqlDB, stores.dialect, stores.writeMu, log)
+		legacyAuditStore, storeErr := audit.NewStore(stores.sqlDB, stores.dialect, stores.writeMu, log)
+		if storeErr != nil {
+			return fmt.Errorf("legacy audit store init: %w", storeErr)
+		}
+		lifecycleAuditStore, storeErr := audit.NewLifecycleStore(stores.sqlDB, stores.dialect, stores.writeMu, log)
+		if storeErr != nil {
+			return fmt.Errorf("lifecycle audit store init: %w", storeErr)
+		}
+		auditStore, err = audit.NewCombinedStore(stores.sqlDB, stores.dialect, legacyAuditStore, lifecycleAuditStore)
 		if err != nil {
-			return fmt.Errorf("audit store init: %w", err)
+			return fmt.Errorf("combined audit store init: %w", err)
 		}
 
 		var auditSinks []audit.AlertSink
@@ -312,27 +323,38 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 			return fmt.Errorf("audit spill open: %w", spillErr)
 		}
 
-		auditCollector = audit.NewCollector(auditStore, spill, auditSinks, log, audit.CollectorConfig{
+		auditCollector = audit.NewCollector(lifecycleAuditStore, spill, auditSinks, log, audit.CollectorConfig{
 			ChannelCap:        cfg.Audit.Collector.ChannelCap,
 			BatchSize:         cfg.Audit.Collector.BatchSize,
 			BatchInterval:     cfg.Audit.Collector.BatchInterval,
 			SinkTimeout:       5 * time.Second,
 			SpillBlockTimeout: 5 * time.Second,
+			FactsRetention:    cfg.Lifecycle.Audit.FactsRetention,
 		})
 		auditCollector.Start(ctx)
 
-		auditGC = audit.NewGC(auditStore, audit.GCConfig{
+		auditGC = audit.NewGC(legacyAuditStore, audit.GCConfig{
 			Retention: cfg.Audit.Retention,
 			Interval:  1 * time.Hour,
 		}, log)
-		auditVerifier := audit.NewVerifier(auditStore, audit.VerifierConfig{
+		lifecycleAuditGC = audit.NewGC(lifecycleAuditStore, audit.GCConfig{
+			Retention: cfg.Lifecycle.Audit.FactsRetention,
+			Interval:  cfg.Lifecycle.GC.Interval,
+		}, log)
+		legacyAuditVerifier := audit.NewVerifier(legacyAuditStore, audit.VerifierConfig{
+			Interval: 1 * time.Hour,
+		}, log)
+		lifecycleAuditVerifier := audit.NewVerifier(lifecycleAuditStore, audit.VerifierConfig{
 			Interval: 1 * time.Hour,
 		}, log)
 		go auditGC.Run(ctx)
-		go auditVerifier.Run(ctx)
+		go lifecycleAuditGC.Run(ctx)
+		go legacyAuditVerifier.Run(ctx)
+		go lifecycleAuditVerifier.Run(ctx)
 
 		log.Info("audit: subsystem initialized",
-			"retention", cfg.Audit.Retention,
+			"legacy_retention", cfg.Audit.Retention,
+			"lifecycle_facts_retention", cfg.Lifecycle.Audit.FactsRetention,
 			"channel_cap", cfg.Audit.Collector.ChannelCap,
 			"batch_size", cfg.Audit.Collector.BatchSize,
 			"sinks", len(auditSinks),
@@ -391,6 +413,11 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 		go session.NewCleanupRunner(log, cleanupStore, worker.CleanupSession).Run(ctx)
 	} else {
 		log.Warn("gateway: durable session cleanup unavailable for session store")
+	}
+	if purgeStore, ok := stores.session.(session.PurgeItemStore); ok {
+		go session.NewPurgeItemRunner(log, purgeStore, stores.event.DeleteConversationBySession).Run(ctx)
+	} else {
+		log.Warn("gateway: durable conversation-content cleanup unavailable for session store")
 	}
 
 	repaired, repairErr := sm.RepairRunningSessions(ctx)
@@ -566,7 +593,7 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 		TurnsQuerier:           stores.event, // SQLiteStore implements TurnQuerier
 		RetryCtrl:              retryCtrl,
 		AgentConfigDir:         agentConfigDir,
-		TurnTimeout:            cfg.Worker.TurnTimeout,
+		TurnTimeout:            config.EffectiveTurnTimeout(cfg),
 		WorkerEnv:              buildWorkerEnv(cfg),
 		WorkerEnvBlocklist:     cfg.Worker.EnvBlocklist,
 		CronEnv:                buildCronEnv(cfg),
@@ -891,11 +918,33 @@ func runGateway(configPath string, devMode bool, stopCh <-chan struct{}) (err er
 		log.Warn("Brain initialization failed (fail-open)", "err", err)
 	}
 
-	// Events and turns retain only their configured events.retention window.
-	// Audit plaintext has an independent retention policy. The GC captures this
-	// value at startup, so changing events.retention requires a gateway restart.
+	// New event and turn rows carry lifecycle.content.retention deadlines.
+	// events.retention is the fallback for legacy rows without per-record
+	// deadlines. Audit plaintext has an independent retention policy. The GC
+	// captures the legacy cutoff at startup, so changing events.retention
+	// requires a gateway restart.
 	eventsRetention := config.EffectiveEventsRetention(cfg)
 	go runEventsGC(ctx, stores, log, eventsRetention)
+	if cfg.Lifecycle.Policy == config.LifecyclePolicyV2 {
+		effects := effectStoreFor(log, stores)
+		if payloadGC, ok := effects.(effect.PayloadGCStore); ok {
+			go runEffectPayloadGC(ctx, payloadGC,
+				cfg.Lifecycle.EffectPayload.RetentionAfterSettlement,
+				cfg.Lifecycle.GC.Interval, cfg.Lifecycle.GC.BatchSize, log)
+		}
+		if attemptGC, ok := effects.(effect.AttemptGCStore); ok {
+			go runEffectAttemptGC(ctx, attemptGC,
+				cfg.Lifecycle.Facts.RetentionAfterSettlement,
+				cfg.Lifecycle.GC.Interval, cfg.Lifecycle.GC.BatchSize, log)
+		}
+		if executionGC, ok := stores.execution.(execution.LifecycleFactsGCStore); ok {
+			go runExecutionFactGC(ctx, executionGC,
+				cfg.Lifecycle.Facts.RetentionAfterSettlement,
+				cfg.Lifecycle.GC.Interval, cfg.Lifecycle.GC.BatchSize, log)
+		}
+		go runACPTraceGC(ctx, filepath.Join(config.HotplexHome(), "logs"),
+			cfg.Lifecycle.Trace.Retention, cfg.Lifecycle.GC.Interval, cfg.Lifecycle.GC.BatchSize, log)
+	}
 
 	leaseMgr.Start(ctx)
 	log.Info("gateway: lease manager started", "owner_instance_id", ownerInstanceID)
@@ -1344,7 +1393,10 @@ func initSQLiteStores(ctx context.Context, cfg *config.Config, log *slog.Logger)
 	}
 
 	// EventStore shares the session store's *sql.DB (schema managed by goose migration 002).
-	eventStore := eventstore.NewSQLiteStore(sessionStore.DB(), writeMu)
+	eventStore := eventstore.NewSQLiteStoreWithRetention(sessionStore.DB(), writeMu, eventstore.RetentionPolicy{
+		Content: cfg.Lifecycle.Content.Retention,
+		Legacy:  config.EffectiveEventsRetention(cfg),
+	})
 	executionStore, err := execution.NewSQLStore(ctx, sessionStore.DB(), dbutil.DialectSQLite, writeMu, log)
 	if err != nil {
 		_ = sessionStore.Close()
@@ -1379,7 +1431,10 @@ func initPGStores(ctx context.Context, cfg *config.Config, log *slog.Logger) (*g
 		return nil, fmt.Errorf("pg: session store: %w", err)
 	}
 
-	eventStore := eventstore.NewPGStore(db, log)
+	eventStore := eventstore.NewPGStoreWithRetention(db, log, eventstore.RetentionPolicy{
+		Content: cfg.Lifecycle.Content.Retention,
+		Legacy:  config.EffectiveEventsRetention(cfg),
+	})
 	executionStore, err := execution.NewSQLStore(ctx, db.DB, dbutil.DialectPostgres, nil, log)
 	if err != nil {
 		_ = db.Close()
@@ -1454,10 +1509,186 @@ func runEventsGC(ctx context.Context, stores *gatewayStores, log *slog.Logger, r
 			cutoff := time.Now().Add(-retention)
 			if n, err := stores.event.DeleteExpired(ctx, cutoff); err == nil && n > 0 {
 				log.Info("events gc: deleted expired events", "count", n)
+				observability.RecordLifecycleGCProcessed(ctx, observability.LifecycleGCProcessedEvent, n)
 			}
 			if n, err := stores.turnQuerier.DeleteExpiredTurns(ctx, cutoff); err == nil && n > 0 {
 				log.Info("events gc: deleted expired turns", "count", n)
+				observability.RecordLifecycleGCProcessed(ctx, observability.LifecycleGCProcessedTurn, n)
 			}
+		}
+	}
+}
+
+// runEffectPayloadGC blanks delivery bodies only after every effect that
+// references a snapshot has reached a settled terminal state. Identity rows
+// remain to prevent late retries from restoring expired content.
+func runEffectPayloadGC(
+	ctx context.Context,
+	store effect.PayloadGCStore,
+	retention, interval time.Duration,
+	batchSize int,
+	log *slog.Logger,
+) {
+	if store == nil || retention <= 0 {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+
+	runOnce := func() {
+		cutoff := time.Now().Add(-retention)
+		n, err := store.DeleteExpiredPayloads(ctx, cutoff, batchSize)
+		if err != nil {
+			log.Warn("effect payload gc: cleanup failed", "err", err)
+			return
+		}
+		if n > 0 {
+			log.Info("effect payload gc: expired delivery bodies", "count", n)
+			observability.RecordLifecycleGCProcessed(ctx, observability.LifecycleGCProcessedDeliveryPayload, n)
+		}
+	}
+
+	runOnce()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runOnce()
+		}
+	}
+}
+
+// runEffectAttemptGC removes detailed send-attempt evidence after settlement.
+// The terminal effect row remains as the idempotency marker; unresolved effects
+// and records without a reliable settlement clock are protected by the store.
+func runEffectAttemptGC(
+	ctx context.Context,
+	store effect.AttemptGCStore,
+	retention, interval time.Duration,
+	batchSize int,
+	log *slog.Logger,
+) {
+	if store == nil || retention <= 0 {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+
+	runOnce := func() {
+		cutoff := time.Now().Add(-retention)
+		n, err := store.DeleteSettledAttempts(ctx, cutoff, batchSize)
+		if err != nil {
+			log.Warn("effect attempt gc: cleanup failed", "err", err)
+			return
+		}
+		if n > 0 {
+			log.Info("effect attempt gc: expired settled attempt facts", "count", n)
+			observability.RecordLifecycleGCProcessed(ctx, observability.LifecycleGCProcessedDeliveryAttempt, n)
+		}
+	}
+
+	runOnce()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runOnce()
+		}
+	}
+}
+
+// runExecutionFactGC compacts old settled execution rows while preserving the
+// client idempotency key, payload fingerprint and terminal outcomes.
+func runExecutionFactGC(
+	ctx context.Context,
+	store execution.LifecycleFactsGCStore,
+	retention, interval time.Duration,
+	batchSize int,
+	log *slog.Logger,
+) {
+	if store == nil || retention <= 0 {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+
+	runOnce := func() {
+		cutoff := time.Now().Add(-retention)
+		n, err := store.CompactSettledFacts(ctx, cutoff, batchSize)
+		if err != nil {
+			log.Warn("execution fact gc: compaction failed", "err", err)
+			return
+		}
+		if n > 0 {
+			log.Info("execution fact gc: compacted settled execution details", "count", n)
+			observability.RecordLifecycleGCProcessed(ctx, observability.LifecycleGCProcessedExecutionDetail, n)
+		}
+	}
+
+	runOnce()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runOnce()
+		}
+	}
+}
+
+func runACPTraceGC(
+	ctx context.Context,
+	dir string,
+	retention, interval time.Duration,
+	batchSize int,
+	log *slog.Logger,
+) {
+	if interval <= 0 || batchSize <= 0 || retention <= 0 {
+		log.Warn("gateway: ACP trace GC disabled by invalid lifecycle settings",
+			"retention", retention, "interval", interval, "batch_size", batchSize)
+		return
+	}
+	runOnce := func() {
+		deleted, err := acp.PruneExpiredTraceFiles(dir, time.Now(), retention, batchSize)
+		if err != nil {
+			log.Warn("gateway: ACP trace GC failed", "err", err)
+			return
+		}
+		if deleted > 0 {
+			log.Debug("gateway: ACP trace GC removed expired files", "deleted", deleted)
+			observability.RecordLifecycleGCProcessed(ctx, observability.LifecycleGCProcessedACPTraceFile, int64(deleted))
+		}
+	}
+	runOnce()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runOnce()
 		}
 	}
 }

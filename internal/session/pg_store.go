@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hrygo/hotplex/internal/agentspec"
+	"github.com/hrygo/hotplex/internal/config"
 	"github.com/hrygo/hotplex/internal/dbutil"
 	"github.com/hrygo/hotplex/pkg/events"
 )
@@ -106,6 +107,55 @@ func (s *pgStore) UpdateWorkerSessionIDSQL(ctx context.Context, id, workerSessio
 		}
 	}
 	return nil
+}
+
+// AdvanceLifecycleDeadlines atomically advances only the session-level
+// lifecycle deadlines. Turn/event expiry remains independent and is not
+// inferred from this session aggregate.
+func (s *pgStore) AdvanceLifecycleDeadlines(
+	ctx context.Context,
+	id, policyRevision string,
+	lastInputAt, archiveAt, conversationExpiresAt, historyExpiresAt, updatedAt time.Time,
+) error {
+	ctx, cancel := upsertTimeout(ctx)
+	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := ensurePGLifecycleLock(ctx, tx, s.dialect.Rebind, id); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, s.queries["sessions.advance_lifecycle_deadlines"],
+		lastInputAt, lastInputAt,
+		archiveAt, archiveAt,
+		conversationExpiresAt, conversationExpiresAt,
+		historyExpiresAt, historyExpiresAt,
+		updatedAt, updatedAt,
+		id, config.LifecyclePolicyV2, policyRevision,
+	)
+	if err != nil {
+		return fmt.Errorf("session store: advance lifecycle deadlines: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("session store: lifecycle deadline rows affected: %w", err)
+	}
+	if updated == 0 {
+		var pending bool
+		if err := tx.QueryRowContext(ctx,
+			s.dialect.Rebind(`SELECT EXISTS(SELECT 1 FROM session_cleanup_tasks WHERE session_id = ?)`), id,
+		).Scan(&pending); err != nil {
+			return fmt.Errorf("session store: check cleanup task: %w", err)
+		}
+		if pending {
+			return ErrSessionCleanupPending
+		}
+		return ErrSessionNotFound
+	}
+	return tx.Commit()
 }
 
 // SetPermissionCeilingIfEmpty atomically captures the first effective Worker
@@ -225,6 +275,35 @@ func (s *pgStore) GetExpiredIdle(ctx context.Context, now time.Time) ([]string, 
 	return collectIDs(rows)
 }
 
+func (s *pgStore) ListExpiredLifecycleSessions(ctx context.Context, now time.Time, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, s.queries["store.select_expired_lifecycle_ids"], now, now, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("session store: select expired lifecycle sessions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return collectIDs(rows)
+}
+
+func (s *pgStore) GetLifecycleGCStatus(ctx context.Context, now time.Time) (lifecycleGCStatus, error) {
+	var status lifecycleGCStatus
+	var oldestEligible, oldestBlocked sql.NullTime
+	err := s.db.QueryRowContext(ctx, s.queries["store.lifecycle_gc_status_pg"], now, now, now).
+		Scan(&status.eligible, &status.blocked, &status.unknownExecutionHold, &oldestEligible, &oldestBlocked)
+	if err != nil {
+		return lifecycleGCStatus{}, fmt.Errorf("session store: get lifecycle GC status: %w", err)
+	}
+	if oldestEligible.Valid {
+		status.eligibleLag = lifecycleDeadlineLag(&oldestEligible.Time, now)
+	}
+	if oldestBlocked.Valid {
+		status.blockedLag = lifecycleDeadlineLag(&oldestBlocked.Time, now)
+	}
+	return status, nil
+}
+
 // DeleteTerminated removes terminated sessions older than the respective cutoffs.
 func (s *pgStore) DeleteTerminated(ctx context.Context, cronCutoff, defaultCutoff time.Time) ([]*SessionInfo, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -249,6 +328,13 @@ func (s *pgStore) DeleteTerminated(ctx context.Context, cronCutoff, defaultCutof
 	for _, id := range ids {
 		if err := ensurePGLifecycleLock(ctx, tx, s.dialect.Rebind, id); err != nil {
 			return nil, err
+		}
+		locked, err := lockSessionRowForLifecycleChange(ctx, tx, s.dialect.Rebind, id)
+		if err != nil {
+			return nil, err
+		}
+		if !locked {
+			continue
 		}
 		deletedRows, err := tx.QueryContext(ctx, s.queries["store.delete_terminated_by_id"], id, events.StateTerminated, cronCutoff, defaultCutoff)
 		if err != nil {

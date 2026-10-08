@@ -66,10 +66,18 @@ scrape_configs:
 |------|------|------|
 | `hotplex.session.created` | Counter | 累计创建 Session 数，label: `worker_type` |
 | `hotplex.session.terminated` | Counter | 终止 Session 数，label: `reason` |
-| `hotplex.session.deleted` | Counter | GC 物理删除 Session 数 |
+| `hotplex.session.deleted` | Counter | 进入逻辑删除状态的 Session 数；不代表远端或磁盘副本均已擦除 |
+| `hotplex.lifecycle.gc.failures` | Counter | 生命周期 GC 的查询或退役失败数，label: `phase`（`session_query` / `session_retire` / `status_query`） |
+| `hotplex.lifecycle.gc.processed` | Counter | 生命周期清理中被删除、脱敏或压缩的记录/文件数，label: `kind`（单位随类别为会话、行、文件或清理项；未知类别归为 `other`） |
+| `hotplex.lifecycle.gc.retirement.lag` | Histogram | v2 会话从最后一个必需历史期限到退役的延迟，单位秒；只记录已成功退役的会话 |
+| `hotplex.lifecycle.gc.backlog` | Gauge | 已到期且等待处理的 v2 会话数，label: `status`（`eligible` / `blocked`） |
+| `hotplex.lifecycle.gc.blocked_unknown_execution` | Gauge | 因 `unknown` 或 fence 执行证据而阻止退役的已到期 v2 会话数 |
+| `hotplex.lifecycle.gc.oldest_lag` | Gauge | 最老到期会话超过其最后必需期限的时长，单位秒，label: `status`（`eligible` / `blocked`） |
 | `hotplex.session.start.attempts` | Counter | Session 启动尝试次数，label: `worker_type` |
 | `hotplex.session.start.errors` | Counter | Session 启动错误数 |
 | `hotplex.session.start.duration` | Histogram | Session 启动耗时 |
+
+`hotplex.lifecycle.gc.processed` 的 `kind` 取值是固定集合：`session`（退役会话数）、`event` / `turn` / `audit_fact_legacy` / `audit_fact_v2` / `delivery_attempt`（删除的行数）、`delivery_payload`（脱敏的正文数）、`execution_detail`（压缩的执行记录数）、`acp_trace_file` / `media_file`（删除的文件数）、`conversation_purge_item`（完成的清理项数）和 `other`。不同类别的单位不同，不应跨类别求和。
 
 ### 终止原因标签
 
@@ -93,6 +101,15 @@ rate(hotplex_session_terminated_total{reason=~"crash|zombie"}[5m])
 
 # Session 启动 P99 延迟
 histogram_quantile(0.99, rate(hotplex_session_start_duration_bucket[5m]))
+
+# 当最老可清理会话超过 lifecycle.gc.max_lag 默认 1 小时时告警
+hotplex_lifecycle_gc_oldest_lag{status="eligible"} > 3600
+
+# 阻塞会话持续积压时通知运维检查执行、队列或清理义务
+hotplex_lifecycle_gc_backlog{status="blocked"} > 0
+
+# 未知执行状态需要人工或恢复流程收敛后才能清理
+hotplex_lifecycle_gc_blocked_unknown_execution > 0
 ```
 
 ## Worker 指标
@@ -481,6 +498,7 @@ increase(hotplex_audit_sink_failures_total[10m]) > 50
 | P99 执行延迟 | `worker.execution.duration` P99 | < 5s |
 | Worker 可用性 | `1 - crashes/starts` | >= 99% |
 | Pool 拒绝率 | `pool.acquire{result!="success"}` | < 0.1% |
+| Lifecycle GC 延迟 | `lifecycle.gc.oldest_lag{status="eligible"}` | <= `lifecycle.gc.max_lag` |
 
 ## 参考
 

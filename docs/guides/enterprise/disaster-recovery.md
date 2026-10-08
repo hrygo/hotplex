@@ -79,6 +79,8 @@ sqlite3 "${BACKUP_DIR}/hotplex-${TIMESTAMP}.db" "PRAGMA integrity_check;"
 find "$BACKUP_DIR" -name "*.db" -mtime +30 -delete
 ```
 
+HotPlex 的会话生命周期清理不会改写已有备份。若恢复的快照包含后来已删除的会话，恢复后这些数据可能重新出现；部署方应为在线及离线备份单独设定保留与销毁期限，并在恢复后按需重新执行清理。
+
 Cron 配置：
 
 ```

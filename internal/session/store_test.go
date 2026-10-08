@@ -136,6 +136,56 @@ func TestSQLiteStore_Upsert_WithContext(t *testing.T) {
 	require.Equal(t, "T123", got.PlatformKey["team_id"])
 }
 
+func TestSQLiteStore_Upsert_SessionLifecycleFields(t *testing.T) {
+	t.Parallel()
+
+	store, _ := helperDB(t)
+	ctx := t.Context()
+	now := time.Date(2026, time.October, 8, 12, 0, 0, 0, time.UTC)
+	info := &SessionInfo{
+		ID:                      "sess_lifecycle",
+		UserID:                  "user1",
+		WorkerType:              "claude_code",
+		State:                   events.StateCreated,
+		CreatedAt:               now,
+		UpdatedAt:               now,
+		LifecyclePolicy:         "v2",
+		LifecyclePolicyRevision: "rev-1",
+		RuntimeFinishedAt:       ptr(now.Add(-time.Hour)),
+		ArchiveAt:               ptr(now.Add(7 * 24 * time.Hour)),
+		ConversationExpiresAt:   ptr(now.Add(180 * 24 * time.Hour)),
+		LastContentExpiresAt:    ptr(now.Add(181 * 24 * time.Hour)),
+		HistoryExpiresAt:        ptr(now.Add(181 * 24 * time.Hour)),
+		LastInputAt:             ptr(now),
+	}
+	require.NoError(t, store.Upsert(ctx, info))
+
+	got, err := store.Get(ctx, info.ID)
+	require.NoError(t, err)
+	require.Equal(t, info.LifecyclePolicy, got.LifecyclePolicy)
+	require.Equal(t, info.LifecyclePolicyRevision, got.LifecyclePolicyRevision)
+	require.Equal(t, info.LastInputAt, got.LastInputAt)
+	require.Equal(t, info.RuntimeFinishedAt, got.RuntimeFinishedAt)
+	require.Equal(t, info.ArchiveAt, got.ArchiveAt)
+	require.Equal(t, info.ConversationExpiresAt, got.ConversationExpiresAt)
+	require.Equal(t, info.LastContentExpiresAt, got.LastContentExpiresAt)
+	require.Equal(t, info.HistoryExpiresAt, got.HistoryExpiresAt)
+
+	// General stale Upsert snapshots must not overwrite lifecycle deadlines
+	// written by the dedicated lifecycle update path.
+	future := now.Add(365 * 24 * time.Hour)
+	_, err = store.db.ExecContext(ctx,
+		`UPDATE sessions SET conversation_expires_at = ?, history_expires_at = ? WHERE id = ?`,
+		future, future, info.ID)
+	require.NoError(t, err)
+	require.NoError(t, store.Upsert(ctx, info))
+
+	got, err = store.Get(ctx, info.ID)
+	require.NoError(t, err)
+	require.Equal(t, future, *got.ConversationExpiresAt)
+	require.Equal(t, future, *got.HistoryExpiresAt)
+}
+
 // ─── SQLiteStore: List with pagination ───────────────────────────────────────
 
 func TestSQLiteStore_List_DefaultLimit(t *testing.T) {
@@ -261,6 +311,26 @@ func TestSQLiteStore_DeleteTerminated(t *testing.T) {
 	require.NoError(t, err, "recent cron session should survive")
 	_, err = store.Get(ctx, "normal_recent")
 	require.NoError(t, err, "recent normal session should survive")
+}
+
+func TestSQLiteStore_DeleteTerminated_PreservesLifecycleV2(t *testing.T) {
+	store, _ := helperDB(t)
+	ctx := t.Context()
+	now := time.Now()
+	require.NoError(t, store.Upsert(ctx, &SessionInfo{
+		ID: "v2_old_terminated", UserID: "u1", WorkerType: "claude_code",
+		State: events.StateTerminated, LifecyclePolicy: config.LifecyclePolicyV2,
+		CreatedAt: now.Add(-20 * 24 * time.Hour), UpdatedAt: now.Add(-8 * 24 * time.Hour),
+		ArchiveAt:             ptr(now.Add(-13 * 24 * time.Hour)),
+		ConversationExpiresAt: ptr(now.Add(160 * 24 * time.Hour)),
+		HistoryExpiresAt:      ptr(now.Add(160 * 24 * time.Hour)),
+	}))
+
+	_, err := store.DeleteTerminated(ctx, now.Add(-24*time.Hour), now.Add(-7*24*time.Hour))
+	require.NoError(t, err)
+
+	_, err = store.Get(ctx, "v2_old_terminated")
+	require.NoError(t, err, "v2 sessions must not use the legacy terminated-row cutoff")
 }
 
 // ─── SQLiteStore: GetSessionsByState ─────────────────────────────────────────

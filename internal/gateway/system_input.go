@@ -73,6 +73,9 @@ func (h *Handler) DispatchSystemInput(ctx context.Context, req cron.SystemInputR
 
 	record, duplicate, err := h.acceptInputExecution(ctx, env)
 	if err != nil {
+		if errors.Is(err, execution.ErrSessionExpired) {
+			return out, fmt.Errorf("%w: session %s has expired", ErrSystemInputRejected, req.SessionID)
+		}
 		if errors.Is(err, execution.ErrPayloadConflict) {
 			return out, fmt.Errorf("%w: occurrence %s already used with different input",
 				ErrSystemInputRejected, req.OccurrenceID)
@@ -132,11 +135,25 @@ func (h *Handler) DispatchSystemInput(ctx context.Context, req cron.SystemInputR
 	}
 
 	if h.bridge != nil {
-		h.bridge.RecordTurnStart(req.SessionID)
+		startedAt, deadlineAt, policyRevision, err := h.bridge.RecordTurnStartForRun(req.SessionID, workerRunID)
+		if err != nil {
+			return fail(events.ErrCodeInternalError, fmt.Errorf("turn deadline setup: %w", err))
+		}
+		if deadlineAt > 0 {
+			if err := h.executionStore.SetTurnDeadline(
+				ctx, record.ExecutionID, h.ownerInstanceID, startedAt, deadlineAt, policyRevision,
+			); err != nil {
+				h.bridge.ClearTurnStartForRun(req.SessionID, workerRunID)
+				return fail(events.ErrCodeInternalError, fmt.Errorf("turn deadline persistence: %w", err))
+			}
+		}
 	}
 	h.stopFence.BeginTurn(req.SessionID, workerRunID, record.ExecutionID)
 
 	if err := w.Input(ctx, req.Content, nil); err != nil {
+		if h.bridge != nil {
+			h.bridge.ClearTurnStartForRun(req.SessionID, workerRunID)
+		}
 		return fail(events.ErrCodeInternalError, fmt.Errorf("worker input: %w", err))
 	}
 

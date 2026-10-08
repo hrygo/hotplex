@@ -18,6 +18,7 @@ import (
 	"github.com/hrygo/hotplex/internal/messaging/phrases"
 	"github.com/hrygo/hotplex/internal/messaging/stt"
 	"github.com/hrygo/hotplex/internal/messaging/textutil"
+	"github.com/hrygo/hotplex/internal/observability"
 	"github.com/hrygo/hotplex/internal/session"
 	"github.com/hrygo/hotplex/pkg/events"
 
@@ -33,7 +34,7 @@ const (
 	dedupMaxEntries  = 5000
 	dedupTTL         = 30 * time.Minute
 	mediaCleanupInt  = 6 * time.Hour
-	mediaTTL         = 24 * time.Hour
+	defaultMediaTTL  = 24 * time.Hour
 	maxMessageLength = 3800            // Slack limit is ~4000
 	errPrefix        = "\u26a0\ufe0f " // ⚠️
 	// handlerMsgTimeout controls the context timeout for HandleTextMessage.
@@ -102,6 +103,7 @@ type Adapter struct {
 	assistantEnabled   *bool
 	transcriber        stt.Transcriber
 	turnSummaryEnabled bool
+	mediaRetention     time.Duration
 	ttsPipeline        *TTSPipeline
 	phrases            *phrases.Phrases
 	Extras             map[string]any
@@ -146,6 +148,7 @@ func (a *Adapter) ConfigureWith(config messaging.AdapterConfig) error {
 
 	// Shared: gate, backoff delays.
 	a.ConfigureShared(config)
+	a.mediaRetention = config.ExtrasDuration("media_retention")
 
 	// Platform-specific extras.
 	if v := config.ExtrasBoolPtr("assistant_enabled"); v != nil {
@@ -1256,12 +1259,16 @@ func (a *Adapter) cleanupMedia(ctx context.Context) {
 }
 
 func (a *Adapter) cleanupMediaInDir(dir string) {
+	ttl := a.mediaRetention
+	if ttl <= 0 {
+		ttl = defaultMediaTTL
+	}
 	var deleted, freedBytes int64
 	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
-		if !info.IsDir() && time.Since(info.ModTime()) > mediaTTL {
+		if !info.IsDir() && time.Since(info.ModTime()) > ttl {
 			if err := os.Remove(path); err != nil {
 				a.Log.Warn("slack: failed to remove old media file", "path", path, "err", err)
 				return nil
@@ -1275,6 +1282,7 @@ func (a *Adapter) cleanupMediaInDir(dir string) {
 	if deleted > 0 {
 		a.Log.Debug("slack: cleaned up old media files",
 			"dir", dir, "deleted", deleted, "freed_bytes", freedBytes)
+		observability.RecordLifecycleGCProcessed(context.Background(), observability.LifecycleGCProcessedMediaFile, deleted)
 	}
 }
 

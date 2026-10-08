@@ -99,6 +99,9 @@ var (
 	ErrNotFound = errors.New("execution: record not found")
 	// ErrPayloadConflict means a client message ID was reused with different data.
 	ErrPayloadConflict = errors.New("execution: client message id reused with different payload")
+	// ErrSessionExpired means a new input cannot be accepted because the
+	// session is retired or its v2 conversation deadline has passed.
+	ErrSessionExpired = errors.New("execution: session expired")
 	// ErrSessionBusy means the session already has an active (pending/running or
 	// fenced) execution and cannot accept a new one until the current one
 	// terminates or the fence is cleared.
@@ -112,6 +115,9 @@ var (
 	ErrLeaseExpired = errors.New("execution: lease expired")
 	// ErrRunMismatch means a conditional update did not match the expected worker_run_id.
 	ErrRunMismatch = errors.New("execution: worker run mismatch")
+	// ErrTurnDeadlineConflict means an execution already has a different
+	// immutable turn deadline.
+	ErrTurnDeadlineConflict = errors.New("execution: turn deadline conflict")
 	// ErrFenceConflict means a conditional fence action did not match: the
 	// record is missing, no longer fenced, or its fence_version moved on
 	// (another operator or gateway instance acted first). The caller must
@@ -173,6 +179,11 @@ type Record struct {
 	// FenceCreatedAt is the millisecond timestamp at which the current fence
 	// was raised; nil when the execution was never fenced.
 	FenceCreatedAt *int64
+	// TurnStartedAt and TurnDeadlineAt are immutable per-turn timestamps in
+	// Unix milliseconds. They remain NULL for legacy executions.
+	TurnStartedAt      *int64
+	TurnDeadlineAt     *int64
+	TurnPolicyRevision string
 }
 
 // AcceptRequest describes an input that must be durably accepted before dispatch.
@@ -217,6 +228,11 @@ type Store interface {
 	// MarkRunning transitions runtime_status from pending to running and records
 	// the worker_run_id. Called after active gate passes, before Worker.Input.
 	MarkRunning(ctx context.Context, executionID, ownerID, workerRunID string) error
+
+	// SetTurnDeadline stores the immutable absolute execution budget after the
+	// worker run is bound. Repeating the same snapshot is idempotent; a
+	// different deadline for the same execution is rejected.
+	SetTurnDeadline(ctx context.Context, executionID, ownerID string, startedAt, deadlineAt int64, policyRevision string) error
 
 	// FinishRuntime sets the terminal runtime status (completed/failed) for an
 	// execution matching executionID and workerRunID. Sets finished_at, releases

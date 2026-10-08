@@ -141,7 +141,8 @@ func TestSQLiteStore_UpdateWorkspace_WorkDirChangeBlockedByActiveSession(t *test
 	// Active session inserted after the handler's hypothetical Count pre-check.
 	_, err := store.db.ExecContext(ctx, queries["sessions.upsert_session"],
 		"sess-1", "u-1", "u-1", "", "", "", "claude_code", "running", "webchat", "{}", "/tmp/old", "",
-		int64(1700000000), int64(1700000000), int64(1800000000), int64(1800000000), "{}", "", "ck-1", "ws-1", "sess-1")
+		int64(1700000000), int64(1700000000), int64(1800000000), int64(1800000000), "{}", "", "ck-1", "ws-1",
+		"legacy", "", nil, nil, nil, nil, nil, nil, nil, "sess-1")
 	require.NoError(t, err)
 
 	ws, _ := store.GetWorkspaceByID(ctx, "ws-1")

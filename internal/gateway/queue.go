@@ -69,11 +69,15 @@ func (h *Handler) queueEnabled() bool {
 
 func (h *Handler) queueLimits() execution.QueueLimits {
 	cfg := h.queueConfig()
+	ttl := cfg.TTL
+	if cfg.InteractiveTTL > 0 {
+		ttl = cfg.InteractiveTTL
+	}
 	return execution.QueueLimits{
 		PerSession:      cfg.PerSession,
 		Global:          cfg.Global,
 		MaxPayloadBytes: cfg.MaxPayloadBytes,
-		TTL:             cfg.TTL,
+		TTL:             ttl,
 	}
 }
 

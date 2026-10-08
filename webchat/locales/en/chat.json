@@ -91,6 +91,7 @@
     "running": "Running",
     "idle": "Idle",
     "terminated": "Terminated",
+    "archived": "Archived",
     "deleted": "Deleted",
     "loading": "Loading...",
     "synthesizing": "Synthesizing Strategy",

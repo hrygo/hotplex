@@ -8,4 +8,5 @@ SELECT lg.gen, t.turn_num, t.seq, t.success, t.source,
        t.tokens_out, t.duration_ms, t.cost_usd, t.model, t.created_at
 FROM turns t, latest_gen lg
 WHERE t.session_id = ? AND t.generation = lg.gen AND t.role = 'assistant'
+  AND ((t.expires_at > 0 AND t.expires_at > ?) OR (t.expires_at = 0 AND t.created_at > ?))
 ORDER BY t.id ASC

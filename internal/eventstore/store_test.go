@@ -2,6 +2,7 @@ package eventstore
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -39,7 +40,21 @@ func newTestStore(t *testing.T) *SQLiteStore {
 		direction TEXT NOT NULL DEFAULT 'outbound',
 		source TEXT NOT NULL DEFAULT 'normal'
 			CHECK(source IN ('normal', 'crash', 'timeout', 'fresh_start')),
-		created_at INTEGER NOT NULL
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL DEFAULT 0
+	)`)
+	require.NoError(t, err)
+	_, err = store.db.Exec(`CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		state TEXT NOT NULL DEFAULT '',
+		lifecycle_policy TEXT,
+		last_content_expires_at DATETIME,
+		history_expires_at DATETIME,
+		deleted_at DATETIME
+	)`)
+	require.NoError(t, err)
+	_, err = store.db.Exec(`CREATE TABLE IF NOT EXISTS session_purge_jobs (
+		session_id TEXT PRIMARY KEY
 	)`)
 	require.NoError(t, err)
 	return store
@@ -147,6 +162,37 @@ func TestSQLiteStore_DeleteBySession(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+func TestSQLiteStore_RejectsAppendsAfterSessionDeletion(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	_, err := store.db.ExecContext(ctx, `INSERT INTO sessions (id, state) VALUES (?, 'deleted')`, "sess-deleted")
+	require.NoError(t, err)
+	err = store.Append(ctx, &StoredEvent{
+		SessionID: "sess-deleted", Seq: 1, Type: "message",
+		Data: raw(`{"content":"late"}`), Direction: "outbound",
+		Source: SourceNormal, CreatedAt: time.Now().UnixMilli(),
+	})
+	require.ErrorIs(t, err, ErrSessionDeleted)
+
+	// The purge job remains as a durable tombstone after session metadata is
+	// physically removed, so a delayed writer cannot recreate conversation data.
+	_, err = store.db.ExecContext(ctx, `DELETE FROM sessions WHERE id = ?`, "sess-deleted")
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `INSERT INTO session_purge_jobs (session_id) VALUES (?)`, "sess-deleted")
+	require.NoError(t, err)
+	err = store.Append(ctx, &StoredEvent{
+		SessionID: "sess-deleted", Seq: 2, Type: "message",
+		Data: raw(`{"content":"late"}`), Direction: "outbound",
+		Source: SourceNormal, CreatedAt: time.Now().UnixMilli(),
+	})
+	require.ErrorIs(t, err, ErrSessionDeleted)
+
+	_, err = store.QueryBySession(ctx, "sess-deleted", 0, CursorLatest, 10)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
 func TestSQLiteStore_LatestSeq(t *testing.T) {
 	t.Parallel()
 	store := newTestStore(t)
@@ -211,6 +257,85 @@ func TestSQLiteStore_DeleteExpired(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, page.Events, 1)
 	require.Equal(t, int64(2), page.Events[0].Seq)
+}
+
+func TestSQLiteStore_PerRecordContentExpiry(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t)
+	store.retention = RetentionPolicy{
+		Content: 10 * 24 * time.Hour,
+		Legacy:  30 * 24 * time.Hour,
+	}
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+
+	_, err := store.db.ExecContext(ctx,
+		`INSERT INTO sessions (id, lifecycle_policy) VALUES (?, 'v2')`, "s1")
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx,
+		`INSERT INTO sessions (id, lifecycle_policy) VALUES (?, 'legacy')`, "s-legacy")
+	require.NoError(t, err)
+
+	// New rows receive an immutable deadline from their creation time.
+	require.NoError(t, store.Append(ctx, &StoredEvent{
+		SessionID: "s1", Seq: 1, Type: "message", Data: json.RawMessage(`{}`),
+		Direction: "outbound", Source: SourceNormal, CreatedAt: now.Add(-11 * 24 * time.Hour).UnixMilli(),
+	}))
+	require.NoError(t, store.Append(ctx, &StoredEvent{
+		SessionID: "s1", Seq: 2, Type: "message", Data: json.RawMessage(`{}`),
+		Direction: "outbound", Source: SourceNormal, CreatedAt: now.Add(-9 * 24 * time.Hour).UnixMilli(),
+	}))
+
+	// Rows that predate the per-record policy keep the legacy zero deadline.
+	_, err = store.db.ExecContext(ctx, `INSERT INTO events
+		(session_id, seq, type, data, direction, source, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+		"s1", 3, "message", []byte(`{}`), "outbound", SourceNormal, now.Add(-31*24*time.Hour).UnixMilli())
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `INSERT INTO events
+		(session_id, seq, type, data, direction, source, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+		"s1", 4, "message", []byte(`{}`), "outbound", SourceNormal, now.Add(-29*24*time.Hour).UnixMilli())
+	require.NoError(t, err)
+
+	var expiresAt int64
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT expires_at FROM events WHERE session_id = ? AND seq = 2`, "s1").Scan(&expiresAt))
+	require.Equal(t, now.Add(time.Hour*24).UnixMilli(), expiresAt)
+	contentExpiresAt := expiresAt
+
+	require.NoError(t, store.Append(ctx, &StoredEvent{
+		SessionID: "s-legacy", Seq: 1, Type: "message", Data: json.RawMessage(`{}`),
+		Direction: "outbound", Source: SourceNormal, CreatedAt: now.UnixMilli(),
+	}))
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT expires_at FROM events WHERE session_id = ? AND seq = 1`, "s-legacy").Scan(&expiresAt))
+	require.Zero(t, expiresAt, "legacy sessions must keep the legacy retention window")
+
+	var lastContentExpiry, historyExpiry sql.NullTime
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT last_content_expires_at, history_expires_at FROM sessions WHERE id = ?`, "s1").
+		Scan(&lastContentExpiry, &historyExpiry))
+	require.True(t, lastContentExpiry.Valid)
+	require.True(t, historyExpiry.Valid)
+	require.WithinDuration(t, time.UnixMilli(contentExpiresAt), lastContentExpiry.Time, time.Millisecond)
+	require.WithinDuration(t, time.UnixMilli(contentExpiresAt), historyExpiry.Time, time.Millisecond)
+
+	// Reconfiguring retention does not rewrite deadlines already assigned.
+	store.retention.Content = 24 * time.Hour
+	page, err := store.QueryBySession(ctx, "s1", 0, CursorLatest, 10)
+	require.NoError(t, err)
+	require.Len(t, page.Events, 2)
+	require.Equal(t, []int64{2, 4}, []int64{page.Events[0].Seq, page.Events[1].Seq})
+
+	deleted, err := store.DeleteExpired(ctx, now.Add(-30*24*time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, int64(2), deleted)
+
+	page, err = store.QueryBySession(ctx, "s1", 0, CursorLatest, 10)
+	require.NoError(t, err)
+	require.Len(t, page.Events, 2)
+	require.Equal(t, []int64{2, 4}, []int64{page.Events[0].Seq, page.Events[1].Seq})
 }
 
 func TestSQLiteStore_Transaction(t *testing.T) {
@@ -379,8 +504,20 @@ func newTestStoreWithWriteMu(t *testing.T) *SQLiteStore {
 		direction TEXT NOT NULL DEFAULT 'outbound',
 		source TEXT NOT NULL DEFAULT 'normal'
 			CHECK(source IN ('normal', 'crash', 'timeout', 'fresh_start')),
-		created_at INTEGER NOT NULL DEFAULT 0
+		created_at INTEGER NOT NULL DEFAULT 0,
+		expires_at INTEGER NOT NULL DEFAULT 0
 	)`)
+	require.NoError(t, err)
+	_, err = store.db.Exec(`CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		state TEXT NOT NULL DEFAULT '',
+		lifecycle_policy TEXT,
+		last_content_expires_at DATETIME,
+		history_expires_at DATETIME,
+		deleted_at DATETIME
+	)`)
+	require.NoError(t, err)
+	_, err = store.db.Exec(`CREATE TABLE IF NOT EXISTS session_purge_jobs (session_id TEXT PRIMARY KEY)`)
 	require.NoError(t, err)
 	return store
 }

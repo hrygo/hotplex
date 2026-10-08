@@ -598,6 +598,7 @@
       "network": "Network",
       "detail_json": "Detail JSON",
       "hash_chain": "Hash Chain",
+      "chain_epoch": "Chain epoch",
       "prev_hash": "Previous",
       "self_hash": "Current",
       "hash_hint": "Tamper-evident chain",

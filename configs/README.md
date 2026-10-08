@@ -141,11 +141,13 @@ hotplex admin create --config "$(./scripts/dev.sh config)" --username admin
 
 | 字段 | 类型 | 默认值 | 热重载 | 说明 |
 |:-----|:-----|:-------|:------:|:-----|
-| `retention_period` | duration | `168h` (7天) | — | TERMINATED 会话在数据库中的保留时长。过期后 GC 扫描将其标记为 DELETED 并从数据库物理删除。较长的保留期支持会话历史回溯和调试 |
-| `gc_scan_interval` | duration | `1m` | ✅ | GC 后台扫描间隔。每次扫描检查：① IDLE 会话的 idle_expires_at 是否到期 → TERMINATED ② 会话的 max_lifetime 是否到期 → TERMINATED ③ TERMINATED 会话的 retention_period 是否到期 → DELETE。热重载通过 channel 信号重置 ticker，不中断正在执行的 GC 周期 |
+| `retention_period` | duration | `168h` (7天) | — | 兼容的 Session 运行到期时长；到期后终止运行并释放 Worker。它不是聊天正文或历史保留期 |
+| `gc_scan_interval` | duration | `1m` | ✅ | GC 后台扫描间隔。检查僵死 Worker、`expires_at` 运行到期、IDLE 空闲期限和 Legacy TERMINATED 记录期限。v2 归档及数据保留使用独立生命周期时钟 |
 | `max_concurrent` | int | `1000` | — | 全局最大并发活跃会话数（CREATED + RUNNING + IDLE）。超出时新会话创建请求被拒绝并返回 `POOL_EXHAUSTED` 错误。根据服务器内存和 Worker 资源需求调整。实际配额由 `pool.max_size` 控制 |
 | `event_store_enabled` | bool | `true` | — | 启用事件持久化。Bridge 在每个 `done` 事件时将完整 Envelope 写入 MessageStore，用于会话回放、调试和审计。关闭后不写事件日志，减少 I/O |
 | `event_store_type` | string | `sqlite` (代码: `""`) | — | 事件存储后端类型。目前仅支持 `"sqlite"`。空字符串表示未指定，依赖 config.yaml 设置 |
+
+新会话默认使用 `lifecycle.policy: v2`：7 天无输入显示归档标记；会话期限默认 180 天并由有效用户输入续期；每条正文从创建时间起默认保留 180 天。查看历史不会续期，输入也不会延长旧正文期限。逐条正文到期过滤、v2 会话自动退役和持久异步清理均已接线；存量期限变更须先预览，再单独确认 apply。
 
 ### pool — 会话池
 
@@ -179,6 +181,7 @@ Worker 进程启动时的工作目录遵循以下优先级覆盖逻辑：
 | `max_lifetime` | duration | `24h` | — | **绝对生存周期**。Worker 进程从启动开始计算的强制最大寿命。到期后无论是否活跃均会被终止。旨在通过定期刷新来清除潜在的内存泄漏或内部状态退化。Worker 可通过 resume 机制在下次请求时无缝重启。 |
 | `idle_timeout` | duration | `60m` | — | **闲置回收周期**（Idle Recycle）。Worker 在等待新输入（IDLE 状态）时的最大允许时长。每次接收到用户输入后该计时器都会重置。旨在及时释放不活跃会话占用的资源。较短的超时释放资源更快，但可能导致用户体感的冷启动增加。 |
 | `execution_timeout` | duration | `30m` | — | **僵死检测周期**（Zombie IO Timeout）。Worker 在执行中（RUNNING 状态）无任何 I/O 输出反馈的最大时长。用于检测并强制清理卡死、陷入无限循环或无响应的 Worker 进程，防止会话永久阻塞。 |
+| `turn_timeout` | duration | `30m` | — | 单轮输入到终结的绝对上限。流式输出不会重置期限；v2 的显式 `0` 仍使用 30 分钟默认值 |
 | `default_work_dir` | string | `~/.hotplex/workspace` | — | Worker 进程的默认工作目录。当 session 或 platform 未指定 `work_dir` 时使用。`~` 自动展开为用户主目录。目录不存在时自动创建（`mkdir -p`） |
 | `pid_dir` | string | `~/.hotplex/.pids/` | — | PID 文件目录。proc.Manager 在启动 Worker 时写入 PID 文件用于孤儿进程清理。网关重启时自动扫描此目录，杀死不再有父进程的孤儿 Worker |
 | `env_blocklist` | []string | `[]` | — | 环境变量黑名单。默认所有 `os.Environ()` 变量透传给 Worker，仅黑名单中的变量被过滤。条目以 `_` 结尾时按前缀匹配（如 `HOTPLEX_` 阻止所有 `HOTPLEX_*` 变量）。`HOTPLEX_WORKER_` 前缀的变量会被剥离前缀后注入（如 `HOTPLEX_WORKER_GITHUB_TOKEN` → `GITHUB_TOKEN`） |

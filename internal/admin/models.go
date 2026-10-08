@@ -3,6 +3,8 @@
 // in runtime serialization — handlers construct responses via respondJSON(map[string]any{...}).
 package admin
 
+import "time"
+
 // AppError is the schema-only mirror of web.AppError (internal/web). Defined
 // locally rather than imported so swaggo can resolve the type during OpenAPI
 // generation; the runtime envelope is produced by web.WriteAppError.
@@ -64,6 +66,27 @@ type GatewaySessionListResponse struct {
 	Limit    int    `json:"limit" example:"100"`
 	Offset   int    `json:"offset" example:"0"`
 	Platform string `json:"platform" example:"webchat"`
+}
+
+// GatewaySessionCleanupStatusResponse is the schema for GET /api/sessions/{id}/cleanup.
+type GatewaySessionCleanupStatusResponse struct {
+	JobID       string                            `json:"job_id"`
+	SessionID   string                            `json:"session_id"`
+	Status      string                            `json:"status" example:"in_progress"`
+	RequestedAt time.Time                         `json:"requested_at"`
+	UpdatedAt   time.Time                         `json:"updated_at"`
+	CompletedAt *time.Time                        `json:"completed_at,omitempty"`
+	Items       []GatewaySessionCleanupStatusItem `json:"items"`
+}
+
+// GatewaySessionCleanupStatusItem is a content-free cleanup component status.
+type GatewaySessionCleanupStatusItem struct {
+	Kind          string     `json:"kind" example:"conversation_content"`
+	Status        string     `json:"status" example:"retrying"`
+	Attempts      int        `json:"attempts" example:"2"`
+	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
+	CompletedAt   *time.Time `json:"completed_at,omitempty"`
+	ErrorCode     string     `json:"error_code,omitempty" example:"cleanup_failed"`
 }
 
 // GatewayCreateSessionResponse is returned by POST /api/sessions.
