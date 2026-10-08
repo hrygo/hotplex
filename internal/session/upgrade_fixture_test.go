@@ -185,6 +185,17 @@ func TestUpgradeFromPreQueueFixture(t *testing.T) {
 			`SELECT COUNT(*) FROM sessions WHERE id = 'sess-legacy' AND title = 'legacy run'`).Scan(&sessions))
 		require.Equal(t, 1, sessions, "the session must survive the upgrade")
 
+		var policy, revision string
+		var conversationExpiry, historyExpiry sql.NullTime
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT lifecycle_policy, lifecycle_policy_revision, conversation_expires_at, history_expires_at
+			 FROM sessions WHERE id = 'sess-legacy'`,
+		).Scan(&policy, &revision, &conversationExpiry, &historyExpiry))
+		require.Equal(t, "legacy", policy, "upgrade must preserve existing rows on their legacy policy")
+		require.Empty(t, revision, "upgrade must not fabricate a policy revision for old rows")
+		require.False(t, conversationExpiry.Valid, "upgrade must not invent a user-input-based expiry")
+		require.False(t, historyExpiry.Valid, "upgrade must not extend or shorten legacy history")
+
 		var effects, attempts int
 		require.NoError(t, db.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM effects WHERE effect_id = 'eff-legacy' AND status = 'delivered'`).Scan(&effects))
@@ -228,6 +239,18 @@ func TestUpgradeFromPreQueueFixture(t *testing.T) {
 			"exec-done":     {"delivered/completed", "", 0},
 			"exec-fenced":   {"unknown/unknown", "WORKER_RESPONSE_LOST", 1},
 		}, got)
+	})
+
+	t.Run("legacy executions keep no fabricated turn deadline", func(t *testing.T) {
+		var startedAt, deadlineAt sql.NullInt64
+		var revision string
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT turn_started_at, turn_deadline_at, turn_policy_revision
+			 FROM execution_inputs WHERE execution_id = 'exec-done'`,
+		).Scan(&startedAt, &deadlineAt, &revision))
+		require.False(t, startedAt.Valid)
+		require.False(t, deadlineAt.Valid)
+		require.Empty(t, revision)
 	})
 
 	t.Run("queue schema exists and admits queued", func(t *testing.T) {

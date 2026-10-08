@@ -112,6 +112,11 @@ function SessionRow({
                             >
                                 {t('chat:status.' + session.state, { defaultValue: stateLabel(session.state) })}
                             </span>
+                            {session.archived && (
+                                <span className="rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-[var(--text-muted)] bg-[var(--bg-elevated)]">
+                                    {t('chat:status.archived')}
+                                </span>
+                            )}
                         </div>
                         <span className="text-[10px] text-[var(--text-faint)] opacity-40">
                             •

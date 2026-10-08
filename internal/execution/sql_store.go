@@ -71,7 +71,8 @@ const executionColumns = `execution_id, session_id, client_message_id, payload_h
 	error_code, created_at, updated_at, delivered_at,
 	owner_instance_id, worker_run_id, lease_until,
 	runtime_status, runtime_error_code, started_at, finished_at, fence_reason,
-	fence_version, fence_created_at`
+	fence_version, fence_created_at, turn_started_at, turn_deadline_at,
+	turn_policy_revision`
 
 // ListRecent bounds. A caller that passes no limit gets a page, not a table
 // dump: the operator console is a browsing surface, and "return everything"
@@ -86,12 +87,13 @@ func (s *SQLStore) scanRecord(sc interface {
 }) (*Record, error) {
 	r := new(Record)
 	var deliveredAt, startedAt, finishedAt, fenceCreatedAt sql.NullInt64
+	var turnStartedAt, turnDeadlineAt sql.NullInt64
 	err := sc.Scan(
 		&r.ExecutionID, &r.SessionID, &r.ClientMessageID, &r.PayloadHash, &r.Status,
 		&r.ErrorCode, &r.CreatedAt, &r.UpdatedAt, &deliveredAt,
 		&r.OwnerInstanceID, &r.WorkerRunID, &r.LeaseUntil,
 		&r.RuntimeStatus, &r.RuntimeErrorCode, &startedAt, &finishedAt, &r.FenceReason,
-		&r.FenceVersion, &fenceCreatedAt,
+		&r.FenceVersion, &fenceCreatedAt, &turnStartedAt, &turnDeadlineAt, &r.TurnPolicyRevision,
 	)
 	if err != nil {
 		return nil, err
@@ -108,6 +110,12 @@ func (s *SQLStore) scanRecord(sc interface {
 	if fenceCreatedAt.Valid {
 		r.FenceCreatedAt = &fenceCreatedAt.Int64
 	}
+	if turnStartedAt.Valid {
+		r.TurnStartedAt = &turnStartedAt.Int64
+	}
+	if turnDeadlineAt.Valid {
+		r.TurnDeadlineAt = &turnDeadlineAt.Int64
+	}
 	return r, nil
 }
 
@@ -121,6 +129,37 @@ func (s *SQLStore) fenceEntryBump(setsFence bool) string {
 	}
 	return `, fence_version = CASE WHEN fence_reason = '' THEN fence_version + 1 ELSE fence_version END,
 	    fence_created_at = CASE WHEN fence_reason = '' THEN ` + s.dbNowMillisExpr() + ` ELSE fence_created_at END`
+}
+
+func (s *SQLStore) lockAcceptableSession(ctx context.Context, tx *sql.Tx, sessionID string) error {
+	result, err := tx.ExecContext(ctx, s.rebind(`UPDATE sessions SET state = state WHERE id = ?`), sessionID)
+	if err != nil {
+		return fmt.Errorf("execution: lock session for input acceptance: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("execution: session lock rows affected: %w", err)
+	}
+	if rows == 0 {
+		return ErrSessionExpired
+	}
+
+	var state, lifecyclePolicy string
+	var deletedAt, conversationExpiresAt sql.NullTime
+	if err := tx.QueryRowContext(ctx, s.rebind(`SELECT state, lifecycle_policy, deleted_at, conversation_expires_at
+		FROM sessions WHERE id = ?`), sessionID).Scan(&state, &lifecyclePolicy, &deletedAt, &conversationExpiresAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrSessionExpired
+		}
+		return fmt.Errorf("execution: read session lifecycle for input acceptance: %w", err)
+	}
+	if state == "deleted" || deletedAt.Valid {
+		return ErrSessionExpired
+	}
+	if lifecyclePolicy == "v2" && conversationExpiresAt.Valid && !conversationExpiresAt.Time.After(time.Now()) {
+		return ErrSessionExpired
+	}
+	return nil
 }
 
 func (s *SQLStore) Accept(ctx context.Context, request AcceptRequest) (*Record, bool, error) {
@@ -137,6 +176,19 @@ func (s *SQLStore) Accept(ctx context.Context, request AcceptRequest) (*Record, 
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()
 
+	// Retried client IDs keep their original idempotency result even when the
+	// session has since been retired. This read creates no new obligation.
+	existing, err := s.getByClientMessage(ctx, request.SessionID, request.ClientMessageID)
+	if err == nil {
+		if existing.PayloadHash != request.PayloadHash {
+			return existing, true, ErrPayloadConflict
+		}
+		return existing, true, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, false, err
+	}
+
 	now := time.Now().UnixMilli()
 	record := &Record{
 		ExecutionID:     "exec_" + uuid.NewString(),
@@ -152,8 +204,20 @@ func (s *SQLStore) Accept(ctx context.Context, request AcceptRequest) (*Record, 
 	}
 
 	var inserted bool
-	err := s.withWriteLock(func() error {
-		result, err := s.db.ExecContext(ctx, s.rebind(`
+	err = s.withWriteLock(func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("execution: begin input acceptance: %w", err)
+		}
+		fail := func(e error) error {
+			_ = tx.Rollback()
+			return e
+		}
+		if err := s.lockAcceptableSession(ctx, tx, request.SessionID); err != nil {
+			return fail(err)
+		}
+
+		result, err := tx.ExecContext(ctx, s.rebind(`
 			INSERT INTO execution_inputs
 				(execution_id, session_id, client_message_id, payload_hash, status, error_code,
 				 created_at, updated_at, owner_instance_id, worker_run_id, lease_until,
@@ -165,16 +229,16 @@ func (s *SQLStore) Accept(ctx context.Context, request AcceptRequest) (*Record, 
 			record.OwnerInstanceID, record.WorkerRunID, int64(LeaseTTL)*1000, record.RuntimeStatus)
 		if err != nil {
 			if s.dialect.IsUniqueViolation(err) {
-				return ErrSessionBusy
+				return fail(ErrSessionBusy)
 			}
-			return fmt.Errorf("execution: accept input: %w", err)
+			return fail(fmt.Errorf("execution: accept input: %w", err))
 		}
 		rows, err := result.RowsAffected()
 		if err != nil {
-			return fmt.Errorf("execution: accept rows affected: %w", err)
+			return fail(fmt.Errorf("execution: accept rows affected: %w", err))
 		}
 		inserted = rows == 1
-		return nil
+		return tx.Commit()
 	})
 	if err != nil {
 		return nil, false, err
@@ -187,7 +251,7 @@ func (s *SQLStore) Accept(ctx context.Context, request AcceptRequest) (*Record, 
 		return stored, false, nil
 	}
 
-	existing, err := s.getByClientMessage(ctx, request.SessionID, request.ClientMessageID)
+	existing, err = s.getByClientMessage(ctx, request.SessionID, request.ClientMessageID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -350,6 +414,72 @@ func (s *SQLStore) MarkRunning(ctx context.Context, executionID, ownerID, worker
 		return fmt.Errorf("execution: mark running: runtime_status is %q, expected pending", r.RuntimeStatus)
 	}
 	return nil
+}
+
+func (s *SQLStore) SetTurnDeadline(
+	ctx context.Context,
+	executionID, ownerID string,
+	startedAt, deadlineAt int64,
+	policyRevision string,
+) error {
+	if executionID == "" || ownerID == "" || startedAt <= 0 || deadlineAt <= startedAt || policyRevision == "" {
+		return errors.New("execution: valid execution, owner, turn timestamps, and policy revision are required")
+	}
+
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+
+	now := time.Now().UnixMilli()
+	var rows int64
+	err := s.withWriteLock(func() error {
+		result, err := s.db.ExecContext(ctx, s.rebind(`
+			UPDATE execution_inputs
+			SET turn_started_at = COALESCE(turn_started_at, ?),
+			    turn_deadline_at = COALESCE(turn_deadline_at, ?),
+			    turn_policy_revision = CASE
+			        WHEN turn_policy_revision = '' THEN ?
+			        ELSE turn_policy_revision
+			    END,
+			    updated_at = ?
+			WHERE execution_id = ? AND owner_instance_id = ? AND runtime_status = ?
+			  AND (
+			      turn_deadline_at IS NULL OR
+			      (turn_started_at = ? AND turn_deadline_at = ? AND turn_policy_revision = ?)
+			  )`),
+			startedAt, deadlineAt, policyRevision, now,
+			executionID, ownerID, RuntimeRunning,
+			startedAt, deadlineAt, policyRevision)
+		if err != nil {
+			return fmt.Errorf("execution: set turn deadline: %w", err)
+		}
+		rows, _ = result.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if rows > 0 {
+		return nil
+	}
+
+	record, err := s.getByID(ctx, executionID)
+	if err != nil {
+		return err
+	}
+	if record.OwnerInstanceID != ownerID {
+		return ErrOwnerMismatch
+	}
+	if record.TurnStartedAt != nil &&
+		record.TurnDeadlineAt != nil &&
+		*record.TurnStartedAt == startedAt &&
+		*record.TurnDeadlineAt == deadlineAt &&
+		record.TurnPolicyRevision == policyRevision {
+		return nil
+	}
+	if record.TurnDeadlineAt != nil {
+		return ErrTurnDeadlineConflict
+	}
+	return fmt.Errorf("execution: set turn deadline: runtime_status is %q, expected running", record.RuntimeStatus)
 }
 
 func (s *SQLStore) FinishRuntime(ctx context.Context, executionID, workerRunID string, status RuntimeStatus, errorCode string) error {

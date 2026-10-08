@@ -215,6 +215,7 @@ func startMessagingAdapters(ctx context.Context, deps *GatewayDeps) ([]messaging
 				Extras:  make(map[string]any),
 			}
 			acfg.Extras["turn_summary_enabled"] = appCfg.Messaging.TurnSummaryEnabled
+			acfg.Extras["media_retention"] = appCfg.Lifecycle.Media.Retention
 
 			// Chat access store (welcome card + analytics).
 			if deps.ChatAccessStore != nil {

@@ -11,9 +11,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/hrygo/hotplex/internal/audit"
+	"github.com/hrygo/hotplex/internal/admin"
 	"github.com/hrygo/hotplex/internal/config"
 	"github.com/hrygo/hotplex/internal/eventstore"
 	"github.com/hrygo/hotplex/internal/messaging"
@@ -35,21 +34,14 @@ type apiSM interface {
 }
 
 type GatewayAPI struct {
-	auth           *security.Authenticator
-	sm             apiSM
-	bridge         SessionStarter
-	cfgStore       *config.ConfigStore
-	turnsStore     eventstore.TurnQuerier
-	eventStore     EventStoreReader
-	wsStore        WorkspaceReader // WebChat 多租户 workspace 归属校验（spec ①）；nil = 未启用
-	log            *slog.Logger
-	auditCollector *audit.Collector // issue #833 P1; nil = audit disabled
-}
-
-// SetAuditCollector injects the audit collector for session.delete instrumentation.
-// Nil disables audit emission (no-op).
-func (g *GatewayAPI) SetAuditCollector(c *audit.Collector) {
-	g.auditCollector = c
+	auth       *security.Authenticator
+	sm         apiSM
+	bridge     SessionStarter
+	cfgStore   *config.ConfigStore
+	turnsStore eventstore.TurnQuerier
+	eventStore EventStoreReader
+	wsStore    WorkspaceReader // WebChat 多租户 workspace 归属校验（spec ①）；nil = 未启用
+	log        *slog.Logger
 }
 
 // EventStoreReader defines the subset of EventStore needed by the events API.
@@ -88,6 +80,10 @@ func (g *GatewayAPI) authorizeSession(w http.ResponseWriter, r *http.Request) (s
 	}
 	si, err := g.sm.Get(r.Context(), id)
 	if err != nil {
+		writeAppError(w, http.StatusNotFound, "NOT_FOUND", "not found")
+		return "", nil, false
+	}
+	if si.State == events.StateDeleted || si.DeletedAt != nil {
 		writeAppError(w, http.StatusNotFound, "NOT_FOUND", "not found")
 		return "", nil, false
 	}
@@ -340,13 +336,12 @@ func (g *GatewayAPI) CreateSession(w http.ResponseWriter, r *http.Request) {
 
 	// Idempotency check: if session exists and is active, just return it.
 	if si, err := g.sm.Get(r.Context(), id); err == nil {
-		if si.State != events.StateDeleted {
+		if si.State != events.StateDeleted && si.DeletedAt == nil {
 			respondJSON(w, map[string]string{"session_id": id})
 			return
 		}
-		// If it's deleted, we must physically remove it before re-creating
-		// to avoid StateMachine transition errors and primary key conflicts.
-		_ = g.sm.DeletePhysical(r.Context(), id)
+		writeAppError(w, http.StatusGone, "SESSION_DELETED", "session is deleted; create a new session")
+		return
 	}
 
 	startParams := worker.SessionStartParams{
@@ -396,10 +391,10 @@ func (g *GatewayAPI) GetSession(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, si)
 }
 
-// DeleteSession terminates and deletes a session.
+// DeleteSession marks a session deleted and schedules durable cleanup.
 //
 // @Summary      Delete session
-// @Description  Gracefully terminates the worker and physically deletes the session. Ownership check applies.
+// @Description  Marks the session deleted, immediately hides it from history, and schedules cleanup. Ownership check applies.
 // @Tags         Gateway API
 // @Security     ApiKeyAuth
 // @Param        id   path  string  true  "Session ID"
@@ -410,56 +405,88 @@ func (g *GatewayAPI) GetSession(w http.ResponseWriter, r *http.Request) {
 // @Failure      500  {object}  admin.ErrorResponse  "Failed to delete session"
 // @Router       /api/sessions/{id} [delete]
 func (g *GatewayAPI) DeleteSession(w http.ResponseWriter, r *http.Request) {
-	id, si, ok := g.authorizeSession(w, r)
+	id, _, ok := g.authorizeSession(w, r)
 	if !ok {
 		return
 	}
 
-	// Gracefully terminate the worker through the state machine before deleting.
-	// Transition sends SIGTERM → wait → SIGKILL and releases pool quota.
-	if err := g.sm.Transition(r.Context(), id, events.StateTerminated); err != nil {
-		g.log.Debug("gateway: pre-delete transition skipped", "session_id", id, "err", err)
-	}
-
-	if err := g.sm.DeletePhysical(r.Context(), id); err != nil {
+	ctx := session.WithDeleteAuditRequest(r.Context(), r.RemoteAddr, r.UserAgent())
+	if err := g.sm.Delete(ctx, id); err != nil {
 		g.log.Error("gateway: delete session failed", "session_id", id, "method", r.Method, "path", r.URL.Path, "err", err)
-		g.emitSessionDeleteAudit(r, si, id, audit.OutcomeFailure, err.Error())
 		writeAppError(w, http.StatusInternalServerError, "INTERNAL", "failed to delete session")
 		return
 	}
-	g.emitSessionDeleteAudit(r, si, id, audit.OutcomeSuccess, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// emitSessionDeleteAudit enqueues a session.delete audit event.
-// Uses context.Background() so audit never blocks on request cancellation.
-func (g *GatewayAPI) emitSessionDeleteAudit(r *http.Request, si *session.SessionInfo, sessionID, outcome, errMsg string) {
-	if g.auditCollector == nil {
+// GetSessionCleanupStatus returns non-content cleanup progress for a deleted
+// session. It authorizes through the purge job's immutable ownership snapshot.
+//
+// @Summary      Get session cleanup status
+// @Description  Returns bounded progress for a deleted session without exposing conversation content or provider error text.
+// @Tags         Gateway API
+// @Produce      json
+// @Security     ApiKeyAuth
+// @Param        id   path  string  true  "Session ID"
+// @Success      200  {object}  admin.GatewaySessionCleanupStatusResponse
+// @Failure      401  {object}  admin.ErrorResponse  "Unauthorized"
+// @Failure      403  {object}  admin.ErrorResponse  "Ownership required"
+// @Failure      404  {object}  admin.ErrorResponse  "Cleanup status not found"
+// @Failure      503  {object}  admin.ErrorResponse  "Cleanup status unavailable"
+// @Router       /api/sessions/{id}/cleanup [get]
+func (g *GatewayAPI) GetSessionCleanupStatus(w http.ResponseWriter, r *http.Request) {
+	userID, _, _, err := g.auth.AuthenticateRequest(r)
+	if err != nil {
+		writeAppError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized")
 		return
 	}
-	// #848: carry the unified identity keys so REST deletes correlate with WS/
-	// cron session events. errMsg (if any) is merged into the same payload.
-	// #866: stamp the effective-spec fingerprint when a snapshot was bound.
-	fields := session.AuditDetailFields(si.BotID, string(si.WorkerType), si.EffectiveIdentity())
-	si.SpecSnapshot.StampMetadata(fields)
-	if errMsg != "" {
-		fields["error"] = errMsg
+	id := r.PathValue("id")
+	if id == "" {
+		writeAppError(w, http.StatusBadRequest, "BAD_REQUEST", "session id required")
+		return
 	}
-	b, _ := json.Marshal(fields)
-	_ = g.auditCollector.Enqueue(context.Background(), &audit.UserActivity{
-		Ts:           time.Now().UnixMilli(),
-		UserID:       si.UserID,
-		UserIDType:   audit.UserIDTypePlatform,
-		Platform:     si.Platform,
-		SessionID:    sessionID,
-		Action:       audit.ActionSessionDelete,
-		ResourceType: "session",
-		ResourceID:   sessionID,
-		Outcome:      outcome,
-		DetailJSON:   string(b),
-		IP:           r.RemoteAddr,
-		UserAgent:    r.UserAgent(),
-	})
+	reader, ok := g.sm.(session.PurgeStatusReader)
+	if !ok {
+		writeAppError(w, http.StatusServiceUnavailable, "PURGE_STATUS_UNAVAILABLE", "cleanup status unavailable")
+		return
+	}
+	status, err := reader.GetPurgeStatus(r.Context(), id, userID)
+	if errors.Is(err, session.ErrPurgeNotFound) {
+		writeAppError(w, http.StatusNotFound, "NOT_FOUND", "cleanup status not found")
+		return
+	}
+	if err != nil {
+		g.log.Error("gateway: load session cleanup status failed", "session_id", id, "err", err)
+		writeAppError(w, http.StatusServiceUnavailable, "PURGE_STATUS_UNAVAILABLE", "cleanup status unavailable")
+		return
+	}
+	if status.WorkspaceID != "" && g.wsStore != nil {
+		ws, wsErr := g.wsStore.GetWorkspaceByID(r.Context(), status.WorkspaceID)
+		if wsErr != nil || ws.OwnerUserID != userID {
+			writeAppError(w, http.StatusForbidden, "WORKSPACE_FORBIDDEN", "ownership required")
+			return
+		}
+	}
+	response := admin.GatewaySessionCleanupStatusResponse{
+		JobID:       status.JobID,
+		SessionID:   status.SessionID,
+		Status:      string(status.Status),
+		RequestedAt: status.RequestedAt,
+		UpdatedAt:   status.UpdatedAt,
+		CompletedAt: status.CompletedAt,
+		Items:       make([]admin.GatewaySessionCleanupStatusItem, 0, len(status.Items)),
+	}
+	for _, item := range status.Items {
+		response.Items = append(response.Items, admin.GatewaySessionCleanupStatusItem{
+			Kind:          item.Kind,
+			Status:        string(item.Status),
+			Attempts:      item.Attempts,
+			NextAttemptAt: item.NextAttemptAt,
+			CompletedAt:   item.CompletedAt,
+			ErrorCode:     item.ErrorCode,
+		})
+	}
+	respondJSON(w, response)
 }
 
 // SwitchWorkDir changes the working directory for a session.

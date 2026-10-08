@@ -15,17 +15,19 @@ import (
 
 // pgStore implements EventStore + TurnQuerier using PostgreSQL.
 type pgStore struct {
-	db      *dbutil.DB
-	dialect dbutil.Dialect
-	sql     map[string]string // Rebound query cache (PG $N placeholders)
-	log     *slog.Logger
+	db        *dbutil.DB
+	dialect   dbutil.Dialect
+	sql       map[string]string // Rebound query cache (PG $N placeholders)
+	log       *slog.Logger
+	retention RetentionPolicy
 }
 
 // pgEventTx is a PostgreSQL-backed transaction for batch event and turn writes.
 type pgEventTx struct {
-	tx      *sql.Tx
-	sql     map[string]string // Reference to pgStore's rebound queries
-	dialect dbutil.Dialect
+	tx        *sql.Tx
+	sql       map[string]string // Reference to pgStore's rebound queries
+	dialect   dbutil.Dialect
+	retention RetentionPolicy
 }
 
 // Interface checks.
@@ -38,12 +40,20 @@ var (
 // are rebound to PG $N placeholders. The turns.insert query gets an additional
 // RETURNING id clause since PG does not support LastInsertId.
 func NewPGStore(db *dbutil.DB, log *slog.Logger) *pgStore {
+	return NewPGStoreWithRetention(db, log, RetentionPolicy{})
+}
+
+// NewPGStoreWithRetention creates a PostgreSQL store with explicit content
+// retention. Existing rows retain their zero per-record deadline and use the
+// legacy window.
+func NewPGStoreWithRetention(db *dbutil.DB, log *slog.Logger, retention RetentionPolicy) *pgStore {
 	d := db.Dialect()
 	s := &pgStore{
-		db:      db,
-		dialect: d,
-		sql:     make(map[string]string, len(queries)),
-		log:     log,
+		db:        db,
+		dialect:   d,
+		sql:       make(map[string]string, len(queries)),
+		log:       log,
+		retention: retention.normalized(),
 	}
 	for k, v := range queries {
 		s.sql[k] = d.Rebind(v)
@@ -59,11 +69,15 @@ func NewPGStore(db *dbutil.DB, log *slog.Logger) *pgStore {
 // ---------------------------------------------------------------------------
 
 func (s *pgStore) Append(ctx context.Context, event *StoredEvent) error {
-	ctx, cancel := withDefaultTimeout(ctx)
-	defer cancel()
-	_, err := s.db.ExecContext(ctx, s.sql["insert"],
-		event.SessionID, event.Seq, event.Type, event.Data, event.Direction, event.Source, event.CreatedAt)
+	tx, err := s.BeginTx(ctx)
 	if err != nil {
+		return err
+	}
+	if err := tx.Append(ctx, event); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("eventstore: append: %w", err)
 	}
 	return nil
@@ -74,13 +88,14 @@ func (s *pgStore) BeginTx(ctx context.Context) (EventTx, error) {
 	if err != nil {
 		return nil, fmt.Errorf("eventstore: begin tx: %w", err)
 	}
-	return &pgEventTx{tx: tx, sql: s.sql, dialect: s.dialect}, nil
+	return &pgEventTx{tx: tx, sql: s.sql, dialect: s.dialect, retention: s.retention}, nil
 }
 
 func (s *pgStore) QueryBySession(ctx context.Context, sessionID string, cursor int64, dir CursorDirection, limit int) (*EventPage, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	return queryBySession(ctx, s.db, s.sql, sessionID, cursor, dir, limit)
+	nowMS, legacyCutoffMS := s.retention.readWindow(time.Now())
+	return queryBySession(ctx, s.db, s.sql, sessionID, cursor, dir, limit, nowMS, legacyCutoffMS)
 }
 
 func (s *pgStore) DeleteBySession(ctx context.Context, sessionID string) error {
@@ -93,10 +108,31 @@ func (s *pgStore) DeleteBySession(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-func (s *pgStore) DeleteExpired(ctx context.Context, cutoff time.Time) (int64, error) {
+// DeleteConversationBySession atomically removes both event payloads and
+// materialized turns so a partial purge cannot leave a readable copy behind.
+func (s *pgStore) DeleteConversationBySession(ctx context.Context, sessionID string) error {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	res, err := s.db.ExecContext(ctx, s.sql["delete_expired"], cutoff.UnixMilli())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("eventstore: begin conversation deletion: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, query := range []string{s.sql["delete_by_session"], s.sql["turns.delete_by_session"]} {
+		if _, err := tx.ExecContext(ctx, query, sessionID); err != nil {
+			return fmt.Errorf("eventstore: delete conversation: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("eventstore: commit conversation deletion: %w", err)
+	}
+	return nil
+}
+
+func (s *pgStore) DeleteExpired(ctx context.Context, legacyCutoff time.Time) (int64, error) {
+	ctx, cancel := withDefaultTimeout(ctx)
+	defer cancel()
+	res, err := s.db.ExecContext(ctx, s.sql["delete_expired"], time.Now().UnixMilli(), legacyCutoff.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("eventstore: delete expired: %w", err)
 	}
@@ -113,10 +149,23 @@ func (s *pgStore) Close() error {
 // ---------------------------------------------------------------------------
 
 func (t *pgEventTx) Append(ctx context.Context, event *StoredEvent) error {
-	_, err := t.tx.ExecContext(ctx, t.sql["insert"],
-		event.SessionID, event.Seq, event.Type, event.Data, event.Direction, event.Source, event.CreatedAt)
+	if err := ensureSessionWritable(ctx, t.tx, event.SessionID, t.dialect.Rebind, true); err != nil {
+		return err
+	}
+	expiresAt, err := contentExpiryForSession(
+		ctx, t.tx, t.sql["lifecycle.get_content_policy"], t.retention,
+		event.SessionID, event.CreatedAt, event.ExpiresAt,
+	)
+	if err != nil {
+		return fmt.Errorf("eventstore: resolve content expiry: %w", err)
+	}
+	_, err = t.tx.ExecContext(ctx, t.sql["insert"],
+		event.SessionID, event.Seq, event.Type, event.Data, event.Direction, event.Source, event.CreatedAt, expiresAt)
 	if err != nil {
 		return fmt.Errorf("eventstore: tx append: %w", err)
+	}
+	if err := updateSessionContentDeadline(ctx, t.tx, t.sql["lifecycle.update_session_content_deadline"], event.SessionID, expiresAt); err != nil {
+		return fmt.Errorf("eventstore: tx update session content deadline: %w", err)
 	}
 	return nil
 }
@@ -139,20 +188,34 @@ func (t *pgEventTx) QueryRowContext(ctx context.Context, query string, args ...a
 }
 
 func (t *pgEventTx) AppendTurn(ctx context.Context, turn *TurnWriteRequest) error {
+	if err := ensureSessionWritable(ctx, t.tx, turn.SessionID, t.dialect.Rebind, true); err != nil {
+		return err
+	}
 	var successVal any
 	if turn.Success != nil {
 		successVal = t.dialect.BoolValue(*turn.Success)
 	}
 
+	expiresAt, err := contentExpiryForSession(
+		ctx, t.tx, t.sql["lifecycle.get_content_policy"], t.retention,
+		turn.SessionID, turn.CreatedAt, turn.ExpiresAt,
+	)
+	if err != nil {
+		return fmt.Errorf("eventstore: resolve turn content expiry: %w", err)
+	}
+
 	var id int64
-	err := t.tx.QueryRowContext(ctx, t.sql["turns.insert"],
+	err = t.tx.QueryRowContext(ctx, t.sql["turns.insert"],
 		turn.SessionID, nullableClientMessageID(turn.ClientMessageID), turn.Generation, turn.TurnNum, turn.Seq, turn.Role, turn.Content,
 		turn.Platform, turn.UserID, turn.Model, successVal, turn.Source, turn.ToolsJSON, turn.ToolCount,
 		turn.TokensInput, turn.TokensCacheWrite, turn.TokensCacheRead, turn.TokensOut,
-		turn.DurationMs, turn.CostUSD, turn.CreatedAt,
+		turn.DurationMs, turn.CostUSD, turn.CreatedAt, expiresAt,
 	).Scan(&id)
 	if err != nil {
 		return fmt.Errorf("eventstore: tx append turn: %w", err)
+	}
+	if err := updateSessionContentDeadline(ctx, t.tx, t.sql["lifecycle.update_session_content_deadline"], turn.SessionID, expiresAt); err != nil {
+		return fmt.Errorf("eventstore: tx update session content deadline: %w", err)
 	}
 	return nil
 }
@@ -172,7 +235,8 @@ func (t *pgEventTx) Rollback() error {
 func (s *pgStore) QueryTurns(ctx context.Context, sessionID string, limit, offset int) ([]*TurnRecord, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	rows, err := s.db.QueryContext(ctx, s.sql["turns.query_with_gen"], sessionID, sessionID, limit, offset)
+	nowMS, legacyCutoffMS := s.retention.readWindow(time.Now())
+	rows, err := s.db.QueryContext(ctx, s.sql["turns.query_with_gen"], sessionID, sessionID, nowMS, legacyCutoffMS, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("eventstore: query turns: %w", err)
 	}
@@ -183,7 +247,8 @@ func (s *pgStore) QueryTurns(ctx context.Context, sessionID string, limit, offse
 func (s *pgStore) QueryTurnsBefore(ctx context.Context, sessionID string, beforeID int64, limit int) ([]*TurnRecord, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	rows, err := s.db.QueryContext(ctx, s.sql["turns.query_before"], sessionID, beforeID, limit)
+	nowMS, legacyCutoffMS := s.retention.readWindow(time.Now())
+	rows, err := s.db.QueryContext(ctx, s.sql["turns.query_before"], sessionID, beforeID, nowMS, legacyCutoffMS, limit)
 	if err != nil {
 		return nil, fmt.Errorf("eventstore: query turns before: %w", err)
 	}
@@ -200,7 +265,8 @@ func (s *pgStore) QueryTurnsBefore(ctx context.Context, sessionID string, before
 func (s *pgStore) QueryLatestTurns(ctx context.Context, sessionID string, limit int) ([]*TurnRecord, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	rows, err := s.db.QueryContext(ctx, s.sql["turns.query_latest"], sessionID, sessionID, limit)
+	nowMS, legacyCutoffMS := s.retention.readWindow(time.Now())
+	rows, err := s.db.QueryContext(ctx, s.sql["turns.query_latest"], sessionID, sessionID, nowMS, legacyCutoffMS, limit)
 	if err != nil {
 		return nil, fmt.Errorf("eventstore: query latest turns: %w", err)
 	}
@@ -217,7 +283,8 @@ func (s *pgStore) QueryLatestTurns(ctx context.Context, sessionID string, limit 
 func (s *pgStore) QueryTurnStats(ctx context.Context, sessionID string) (*TurnStats, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	rows, err := s.db.QueryContext(ctx, s.sql["turns.stats_with_gen"], sessionID, sessionID)
+	nowMS, legacyCutoffMS := s.retention.readWindow(time.Now())
+	rows, err := s.db.QueryContext(ctx, s.sql["turns.stats_with_gen"], sessionID, sessionID, nowMS, legacyCutoffMS)
 	if err != nil {
 		return nil, fmt.Errorf("eventstore: query turn stats: %w", err)
 	}
@@ -261,10 +328,10 @@ func (s *pgStore) LatestSeq(ctx context.Context, sessionID string) (int64, error
 	return seq, nil
 }
 
-func (s *pgStore) DeleteExpiredTurns(ctx context.Context, cutoff time.Time) (int64, error) {
+func (s *pgStore) DeleteExpiredTurns(ctx context.Context, legacyCutoff time.Time) (int64, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	res, err := s.db.ExecContext(ctx, s.sql["turns.delete_expired"], cutoff.UnixMilli())
+	res, err := s.db.ExecContext(ctx, s.sql["turns.delete_expired"], time.Now().UnixMilli(), legacyCutoff.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("eventstore: delete expired turns: %w", err)
 	}

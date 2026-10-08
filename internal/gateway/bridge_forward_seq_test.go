@@ -41,7 +41,35 @@ func newCollectorBridgeForSeqTest(t *testing.T, sessionID string, knownSeq int64
 		direction TEXT NOT NULL DEFAULT 'outbound',
 		source TEXT NOT NULL DEFAULT 'normal'
 			CHECK(source IN ('normal', 'crash', 'timeout', 'fresh_start')),
-		created_at INTEGER NOT NULL
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL DEFAULT 0
+	)`)
+	require.NoError(t, err)
+	createEventStoreSessionBarrierSchema(t, db)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS turns (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT NOT NULL,
+		client_message_id TEXT,
+		generation INTEGER NOT NULL DEFAULT 1,
+		turn_num INTEGER NOT NULL,
+		seq INTEGER NOT NULL DEFAULT 0,
+		role TEXT NOT NULL,
+		content TEXT NOT NULL DEFAULT '',
+		platform TEXT NOT NULL DEFAULT '',
+		user_id TEXT NOT NULL DEFAULT '',
+		model TEXT NOT NULL DEFAULT '',
+		success INTEGER,
+		source TEXT NOT NULL DEFAULT 'normal',
+		tools_json TEXT,
+		tool_count INTEGER NOT NULL DEFAULT 0,
+		tokens_input INTEGER NOT NULL DEFAULT 0,
+		tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+		tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+		tokens_out INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0,
+		cost_usd REAL NOT NULL DEFAULT 0.0,
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL DEFAULT 0
 	)`)
 	require.NoError(t, err)
 
@@ -132,6 +160,48 @@ func TestProcessForwardedEvent_NoCollectorPreservesWorkerSeq(t *testing.T) {
 	// Hub SeqGen should NOT have been used (collector is nil, worker seq != 0).
 	require.Equal(t, int64(0), hub.NextSeqPeek(sessionID),
 		"Hub SeqGen must not advance when collector is disabled and worker provided a non-zero seq")
+}
+
+func TestFinishTurnTimeoutPersistsFailureAndAllocatesOrderedEvents(t *testing.T) {
+	t.Parallel()
+
+	const sessionID = "turn-timeout-terminal"
+	b, eventStore := newCollectorBridgeForSeqTest(t, sessionID, 0)
+	execStore := &fakeExecutionStore{
+		openRecord: &execution.Record{ExecutionID: "execution-1"},
+	}
+	b.executionStore = execStore
+	b.turnTimeout = 30 * time.Minute
+	fc := &forwardContext{
+		sessionID:   sessionID,
+		workerRunID: "worker-run-1",
+		sessOwner:   "owner-1",
+	}
+
+	b.finishTurnTimeout(sessionID, fc, syntheticTurnParams{
+		SessionID: sessionID,
+		Reason:    "turn_timeout",
+		Message:   "Turn exceeded 30m time limit",
+		Source:    eventstore.SourceTimeout,
+		Owner:     "owner-1",
+	})
+
+	require.Equal(t, execution.RuntimeFailed, execStore.finishStatus)
+	require.Equal(t, "worker-run-1", execStore.finishRunID)
+	require.Equal(t, int64(3), b.hub.NextSeqPeek(sessionID),
+		"timeout Error, persisted synthetic Done, and runtime failure fact must allocate in order")
+	require.NoError(t, b.collector.Flush())
+	page, err := eventStore.QueryBySession(t.Context(), sessionID, 0, eventstore.CursorLatest, 10)
+	require.NoError(t, err)
+	require.Len(t, page.Events, 2)
+	require.Equal(t, []string{string(events.Error), string(events.Done)}, []string{
+		page.Events[0].Type,
+		page.Events[1].Type,
+	})
+	require.Equal(t, []int64{1, 2}, []int64{
+		page.Events[0].Seq,
+		page.Events[1].Seq,
+	})
 }
 
 // TestProcessForwardedEvent_DoneArrivesAfterTheRuntimeFactItOvertakes pins the

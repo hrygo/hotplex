@@ -33,6 +33,7 @@ type mockSessionStateChecker struct {
 	workers        map[string]worker.Worker
 	defaultWorker  worker.Worker
 	defaultSession *session.SessionInfo
+	lastTermReason string
 }
 
 func (m *mockSessionStateChecker) Get(_ context.Context, id string) (*session.SessionInfo, error) {
@@ -53,6 +54,11 @@ func (m *mockSessionStateChecker) GetWorker(id string) worker.Worker {
 }
 
 func (m *mockSessionStateChecker) Transition(_ context.Context, _ string, _ events.SessionState) error {
+	return nil
+}
+
+func (m *mockSessionStateChecker) TransitionWithReason(_ context.Context, _ string, _ events.SessionState, reason string) error {
+	m.lastTermReason = reason
 	return nil
 }
 
@@ -236,6 +242,17 @@ func TestExecutor_Execute_Success(t *testing.T) {
 	gotKey, err := e.Execute(context.Background(), testJob(), testTrigger(), 5*time.Second)
 	require.NoError(t, err)
 	require.NotEmpty(t, gotKey)
+}
+
+func TestExecutor_TerminateSessionUsesCronCompletionReason(t *testing.T) {
+	t.Parallel()
+
+	sm := &mockSessionStateChecker{}
+	e := newTestExecutor(&mockBridge{}, sm)
+
+	e.terminateSession("cron-session")
+
+	require.Equal(t, "cron_complete", sm.lastTermReason)
 }
 
 // TestExecutor_Execute_NormalizesEmptyPlatformToCron verifies that a pure

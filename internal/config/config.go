@@ -83,6 +83,62 @@ func (c *Config) Validate() []string {
 	if c.Session.RetentionPeriod <= 0 {
 		errs = append(errs, "session.retention_period must be positive")
 	}
+	if c.Worker.TurnTimeout < 0 {
+		errs = append(errs, "worker.turn_timeout must be non-negative")
+	}
+	switch c.Lifecycle.Policy {
+	case LifecyclePolicyLegacy, LifecyclePolicyV2:
+	default:
+		errs = append(errs, "lifecycle.policy must be one of legacy|v2")
+	}
+	if c.Lifecycle.Conversation.ArchiveAfter <= 0 {
+		errs = append(errs, "lifecycle.conversation.archive_after must be positive")
+	}
+	if c.Lifecycle.Conversation.RetentionAfterLastInput <= 0 {
+		errs = append(errs, "lifecycle.conversation.retention_after_last_input must be positive")
+	}
+	if c.Lifecycle.Conversation.ArchiveAfter > c.Lifecycle.Conversation.RetentionAfterLastInput {
+		errs = append(errs, "lifecycle.conversation.archive_after must not exceed retention_after_last_input")
+	}
+	if c.Lifecycle.Content.Retention <= 0 {
+		errs = append(errs, "lifecycle.content.retention must be positive")
+	}
+	if c.Lifecycle.EffectPayload.RetentionAfterSettlement <= 0 {
+		errs = append(errs, "lifecycle.effect_payload.retention_after_settlement must be positive")
+	}
+	if c.Lifecycle.Facts.RetentionAfterSettlement <= 0 {
+		errs = append(errs, "lifecycle.facts.retention_after_settlement must be positive")
+	}
+	if c.Lifecycle.Audit.FactsRetention <= 0 {
+		errs = append(errs, "lifecycle.audit.facts_retention must be positive")
+	}
+	if c.Lifecycle.Audit.ContentRetention <= 0 {
+		errs = append(errs, "lifecycle.audit.content_retention must be positive")
+	}
+	if c.Lifecycle.Audit.CaptureContent {
+		errs = append(errs, "lifecycle.audit.capture_content is unsupported until audit payloads have independent retention storage")
+	}
+	if c.Lifecycle.Audit.CaptureContent && c.Lifecycle.Audit.ContentRetention > c.Lifecycle.Content.Retention {
+		errs = append(errs, "lifecycle.audit.content_retention must not exceed lifecycle.content.retention when audit content capture is enabled")
+	}
+	if c.Lifecycle.Media.Retention <= 0 {
+		errs = append(errs, "lifecycle.media.retention must be positive")
+	}
+	if c.Lifecycle.Trace.Retention <= 0 {
+		errs = append(errs, "lifecycle.trace.retention must be positive")
+	}
+	if c.Lifecycle.GC.BatchSize <= 0 {
+		errs = append(errs, "lifecycle.gc.batch_size must be positive")
+	}
+	if c.Lifecycle.GC.Interval <= 0 {
+		errs = append(errs, "lifecycle.gc.interval must be positive")
+	}
+	if c.Lifecycle.GC.MaxLag <= 0 {
+		errs = append(errs, "lifecycle.gc.max_lag must be positive")
+	}
+	if c.Execution.Queue.InteractiveTTL <= 0 {
+		errs = append(errs, "execution.queue.interactive_ttl must be positive")
+	}
 	if c.Pool.MaxSize <= 0 {
 		errs = append(errs, "pool.max_size must be positive")
 	}

@@ -91,6 +91,7 @@
     "running": "运行中",
     "idle": "空闲",
     "terminated": "已终止",
+    "archived": "已归档",
     "deleted": "已删除",
     "loading": "加载中...",
     "synthesizing": "综合策略中",

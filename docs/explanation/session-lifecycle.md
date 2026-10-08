@@ -8,6 +8,8 @@ description: HotPlex 5 状态机 Session 管理：状态流转、确定性 ID、
 
 > 为什么 HotPlex 的 Session 需要 5 个状态（而非常见的 3 个），以及这套状态机如何支撑 Worker 进程的完整生命周期管理。
 
+![HotPlex 会话数据保留、归档与清理时间线](../assets/data-lifecycle.webp)
+
 ## 核心问题
 
 HotPlex Gateway 是一个多租户的 AI Agent 接入层。每个用户会话背后运行着一个独立的 Worker 进程（如 Claude Code CLI）。Session 管理需要解决三个核心矛盾：
@@ -174,9 +176,9 @@ pool.AcquireMemory(userID) -> MemoryExceeded
 
 配额释放使用 CAS（Compare-And-Swap）语义的 `DetachWorkerIf`，防止 stale goroutine 误释放新 Worker 的配额。旧 `forwardEvents` goroutine 在 Worker 崩溃后退出时，如果发现当前 Worker 已经被替换，会跳过释放操作，避免 pool double-release。
 
-### GC：三层清理策略
+### GC 与独立生命周期时钟
 
-Session GC 由一个后台 goroutine 驱动（默认 60 秒扫描一次），执行三层清理：
+Session GC 由一个后台 goroutine 驱动（默认 60 秒扫描一次），处理运行回收和 Legacy 终止记录清理：
 
 **第 0 层：Zombie IO 轮询**（RUNNING 状态）
 ```
@@ -186,7 +188,7 @@ Session GC 由一个后台 goroutine 驱动（默认 60 秒扫描一次），执
 
 **第 1 层：Max Lifetime 到期**
 ```
-Session 的 expires_at = created_at + RetentionPeriod。
+Session 的 expires_at 由 session.retention_period 设置，并可在有效输入后重置。
 到期后强制 TERMINATED，释放 Worker 进程。
 ```
 
@@ -198,11 +200,15 @@ IDLE session 的 idle_expires_at = entered_idle_at + IdleTimeout。
 
 **第 3 层：TERMINATED 记录清理**
 ```
-TERMINATED session 按 source 差异化保留：
+Legacy TERMINATED session 按 source 差异化保留：
   cron 类：updated_at ≤ now - cron_term_retention（默认 24h）→ DELETE
   其他：updated_at ≤ now - term_retention（默认 7d）→ DELETE
 ```
-TERMINATED 记录在保留期内作为"resume 决策标志"——它们的存在告诉 Gateway 可以尝试 `--resume` 恢复对话历史。
+v2 会话不进入这条短期 Legacy 删除路径。其归档、会话和正文分别使用 `lifecycle.conversation.archive_after`、`lifecycle.conversation.retention_after_last_input` 与 `lifecycle.content.retention`：默认 7 天标记归档，180 天保留会话，单条正文各自保留 180 天。正文读取会排除已过期内容；v2 会话到期后，GC 会先检查运行和恢复义务，再退役会话并排队异步清理。用户主动删除也会建立持久清理任务；所有者可通过 `GET /api/sessions/{id}/cleanup` 查询会话元数据、正文和 Worker 副本的清理状态。Legacy 存量数据可经 Admin API 只读预览并逐批显式延长期限；缺失可靠活动时间或已经删除的数据不会被自动补造或恢复。
+
+**删除范围**：HotPlex 会立即隐藏本地历史、禁止续聊，并异步清理 HotPlex 管理的聊天正文和关联 Worker 会话；少量清理状态、执行去重和审计事实仍按各自保留期保存。删除不会撤回 Slack、飞书等外部平台上已经发送的消息，也不会修改已生成的数据库备份。恢复包含已删除会话的旧备份可能使这些数据重新出现。外部消息保留由对应平台管理；备份保留、销毁及恢复后的再次清理由部署方管理。
+
+v2 轮次的 `worker.turn_timeout` 是绝对期限，默认 30 分钟；流式输出不会延长该期限。`worker.idle_timeout` 仍独立负责空闲 Worker 回收，因此延长聊天历史不会延长 Worker 运行时间。
 
 ### Fast Reconnect 优化
 
@@ -250,7 +256,7 @@ if ms.info.State == RUNNING && ms.worker != nil {
 
 3. **IDLE 超时不可按 Session 定制**：所有 IDLE Session 共享同一个 `IdleTimeout`，不支持"A 用户的 Session 保留 1 小时，B 用户的保留 5 分钟"。
 
-4. **TERMINATED 记录不自动清理**：为了保留 resume 能力，TERMINATED 记录不会自动物理删除。长期运行后数据库可能积累大量历史记录，需要管理员手动清理。
+4. **到期退役采用安全门控**：v2 会话过期后由 GC 发起退役，先复核期限和持久化状态，再原子写入删除标记与 cleanup outbox。仍有活动 Worker、未完成或状态未知的输入/执行、排队任务或清理任务时会跳过；存量 legacy 会话不会自动升级策略。用户主动删除和到期退役共用可重试的持久清理任务，进度可查询。
 
 ### 并发安全边界
 

@@ -50,7 +50,16 @@ const MaxClientKeyLen = 256
 var (
 	sessionsActiveByState sync.Map // map[string]*atomic.Int64 — key is state name
 	workersRunningByType  sync.Map // map[string]*atomic.Int64 — key is worker_type
+	lifecycleGCGauges     lifecycleGCMetricsSnapshot
 )
+
+type lifecycleGCMetricsSnapshot struct {
+	eligibleBacklog      atomic.Int64
+	blockedBacklog       atomic.Int64
+	unknownExecutionHold atomic.Int64
+	eligibleLagNanos     atomic.Int64
+	blockedLagNanos      atomic.Int64
+}
 
 // sessionsActiveGauge tracks the count of sessions per state.
 func sessionsActiveGauge(key string) *atomic.Int64 {
@@ -103,6 +112,37 @@ func init() {
 			})
 			return nil
 		}, workerGauge)
+
+		backlogGauge := observability.LifecycleGCBacklog()
+		unknownBlockedGauge := observability.LifecycleGCUnknownBlocked()
+		oldestLagGauge := observability.LifecycleGCOldestLag()
+		_, err = m.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
+			o.ObserveInt64(
+				backlogGauge,
+				lifecycleGCGauges.eligibleBacklog.Load(),
+				metric.WithAttributes(attribute.String("status", "eligible")),
+			)
+			o.ObserveInt64(
+				backlogGauge,
+				lifecycleGCGauges.blockedBacklog.Load(),
+				metric.WithAttributes(attribute.String("status", "blocked")),
+			)
+			o.ObserveInt64(unknownBlockedGauge, lifecycleGCGauges.unknownExecutionHold.Load())
+			o.ObserveFloat64(
+				oldestLagGauge,
+				float64(lifecycleGCGauges.eligibleLagNanos.Load())/float64(time.Second),
+				metric.WithAttributes(attribute.String("status", "eligible")),
+			)
+			o.ObserveFloat64(
+				oldestLagGauge,
+				float64(lifecycleGCGauges.blockedLagNanos.Load())/float64(time.Second),
+				metric.WithAttributes(attribute.String("status", "blocked")),
+			)
+			return nil
+		}, backlogGauge, unknownBlockedGauge, oldestLagGauge)
+		if err != nil {
+			slog.Warn("session: failed to register lifecycle GC gauges", "err", err)
+		}
 	})
 }
 
@@ -122,9 +162,10 @@ type Manager struct {
 	riMu         sync.RWMutex
 	runningIndex map[string]struct{}
 
-	gcStop  context.CancelFunc
-	gcDone  chan struct{}
-	gcReset chan time.Duration // signals GC ticker reset
+	gcStop                 context.CancelFunc
+	gcDone                 chan struct{}
+	gcReset                chan time.Duration // signals GC ticker reset
+	lifecycleGCLagExceeded atomic.Bool
 
 	OnTerminate func(sessionID string)
 	OnDelete    func(ctx context.Context, info SessionInfo)
@@ -216,7 +257,22 @@ type SessionInfo struct {
 	UpdatedAt     time.Time           `json:"updated_at"`
 	ExpiresAt     *time.Time          `json:"expires_at,omitempty"`
 	IdleExpiresAt *time.Time          `json:"idle_expires_at,omitempty"`
-	Context       map[string]any      `json:"context,omitempty"`
+	// Lifecycle fields are independent of runtime expiry. Only dedicated
+	// lifecycle operations may change them; ordinary session Upserts preserve
+	// the values already stored in the database.
+	LifecyclePolicy         string     `json:"lifecycle_policy,omitempty"`
+	LifecyclePolicyRevision string     `json:"lifecycle_policy_revision,omitempty"`
+	LastInputAt             *time.Time `json:"last_input_at,omitempty"`
+	RuntimeFinishedAt       *time.Time `json:"runtime_finished_at,omitempty"`
+	ArchiveAt               *time.Time `json:"archive_at,omitempty"`
+	ConversationExpiresAt   *time.Time `json:"conversation_expires_at,omitempty"`
+	LastContentExpiresAt    *time.Time `json:"last_content_expires_at,omitempty"`
+	HistoryExpiresAt        *time.Time `json:"history_expires_at,omitempty"`
+	DeletedAt               *time.Time `json:"deleted_at,omitempty"`
+	// Archived is a response projection derived from ArchiveAt. It is not
+	// persisted and does not change the AEP runtime state.
+	Archived bool           `json:"archived,omitempty"`
+	Context  map[string]any `json:"context,omitempty"`
 	// WorkerSessionID is the session ID used by the worker runtime itself.
 	// Only populated for workers that auto-generate their own session IDs (OpenCode Server).
 	// For Claude Code this is always empty — the gateway's ID IS the worker's session ID
@@ -383,6 +439,10 @@ func (m *Manager) CreateWithBot(ctx context.Context, id, userID, botID, botName 
 	if _, isCron := platformKey["cron_job_id"]; isCron {
 		source = SourceCron
 	}
+	lifecycle, err := newInitialLifecycleState(now, m.cfg.Lifecycle)
+	if err != nil {
+		return nil, err
+	}
 	info := &SessionInfo{
 		ID:           id,
 		UserID:       userID,
@@ -402,6 +462,7 @@ func (m *Manager) CreateWithBot(ctx context.Context, id, userID, botID, botName 
 		ClientKey:    clientKey,
 		WorkspaceID:  workspaceID,
 	}
+	lifecycle.apply(info)
 	// Bind the AgentIdentity snapshot (#848) from the final creation inputs.
 	bindIdentity(info)
 	// Capture the effective runtime policy snapshot (#866) so it survives
@@ -446,10 +507,11 @@ func (m *Manager) emitSessionCreateAudit(userID, botID, platform, sessionID, wor
 
 // emitSessionDeleteAudit enqueues a session.delete audit event.
 // Uses context.Background() so audit never blocks the caller.
-func (m *Manager) emitSessionDeleteAudit(userID, botID, platform, sessionID, workerType, outcome string, id agentspec.AgentIdentity, snap *agentspec.EffectiveAgentSpecSnapshot) {
+func (m *Manager) emitSessionDeleteAudit(ctx context.Context, userID, botID, platform, sessionID, workerType, outcome string, id agentspec.AgentIdentity, snap *agentspec.EffectiveAgentSpecSnapshot) {
 	if m.auditCollector == nil {
 		return
 	}
+	request := deleteAuditRequestFromContext(ctx)
 	_ = m.auditCollector.Enqueue(context.Background(), &audit.UserActivity{
 		Ts:           time.Now().UnixMilli(),
 		UserID:       userID,
@@ -461,6 +523,8 @@ func (m *Manager) emitSessionDeleteAudit(userID, botID, platform, sessionID, wor
 		ResourceID:   sessionID,
 		Outcome:      outcome,
 		DetailJSON:   auditDetailJSON(botID, workerType, id, snap),
+		IP:           request.IP,
+		UserAgent:    request.UserAgent,
 	})
 }
 
@@ -554,8 +618,13 @@ func (m *Manager) Get(ctx context.Context, id string) (*SessionInfo, error) {
 	m.mu.RUnlock()
 	if ok {
 		ms.mu.RLock()
+		if ms.deleting {
+			ms.mu.RUnlock()
+			return nil, ErrSessionCleanupPending
+		}
 		info := ms.info
 		ms.mu.RUnlock()
+		updateArchiveProjection(&info, time.Now())
 		return &info, nil
 	}
 
@@ -564,20 +633,36 @@ func (m *Manager) Get(ctx context.Context, id string) (*SessionInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	updateArchiveProjection(info, time.Now())
 
 	m.mu.Lock()
 	// Double-check: another goroutine may have populated this while we loaded from store.
 	if existing, ok := m.sessions[id]; ok {
 		m.mu.Unlock()
 		existing.mu.RLock()
+		if existing.deleting {
+			existing.mu.RUnlock()
+			return nil, ErrSessionCleanupPending
+		}
 		cached := existing.info
 		existing.mu.RUnlock()
+		updateArchiveProjection(&cached, time.Now())
 		return &cached, nil
 	}
 	m.sessions[id] = &managedSession{info: *info, log: m.log.With("worker_type", info.WorkerType, "channel", info.Platform)}
 	m.mu.Unlock()
 
 	return info, nil
+}
+
+// GetPurgeStatus reads a deletion job through its persisted user ownership
+// snapshot. The status remains available after the deleted session is hidden.
+func (m *Manager) GetPurgeStatus(ctx context.Context, sessionID, userID string) (*PurgeStatus, error) {
+	reader, ok := m.store.(PurgeStatusReader)
+	if !ok {
+		return nil, ErrPurgeStatusNotReady
+	}
+	return reader.GetPurgeStatus(ctx, sessionID, userID)
 }
 
 // IsSeqActive reports whether a session may still allocate or persist AEP
@@ -759,7 +844,7 @@ func (m *Manager) transitionState(ctx context.Context, ms *managedSession, from,
 		observability.SessionDeleted().Add(ctx, 1)
 	}
 
-	m.notifyStateChange(ctx, ms.info.ID, to, "")
+	m.notifyStateChange(ctx, ms.info.ID, to, "", termReason, candidate.LifecyclePolicy)
 
 	m.updateRunningIndexForTransition(ms.info.ID, from, to)
 
@@ -818,7 +903,7 @@ func (m *Manager) forceTerminateInMemory(ctx context.Context, ms *managedSession
 	sessionsActiveGauge(string(events.StateTerminated)).Add(1)
 	observability.SessionTerminated().Add(ctx, 1, metric.WithAttributes(attribute.String("reason", termReason)))
 
-	m.notifyStateChange(ctx, ms.info.ID, events.StateTerminated, termReason)
+	m.notifyStateChange(ctx, ms.info.ID, events.StateTerminated, termReason, termReason, ms.info.LifecyclePolicy)
 
 	return workerToKill
 }
@@ -1106,49 +1191,64 @@ func (m *Manager) detachWorkerUnchecked(id string, expected worker.Worker) bool 
 // Lock ordering: m.mu → ms.mu (same as AttachWorker/DetachWorker to avoid deadlock).
 // DB write is performed outside locks to avoid holding mutexes during I/O.
 func (m *Manager) Delete(ctx context.Context, id string) error {
-	// Acquire m.mu first to maintain consistent lock order with AttachWorker.
-	var workerToTerminate worker.Worker
 	m.mu.Lock()
 	ms, ok := m.sessions[id]
-	if !ok {
+	if ok {
+		ms.mu.Lock()
+		if ms.deleting {
+			ms.mu.Unlock()
+			m.mu.Unlock()
+			return ErrSessionCleanupPending
+		}
+		candidate := ms.info
+		wasRunning := candidate.State == events.StateRunning
+		now := time.Now()
+		candidate.State = events.StateDeleted
+		candidate.UpdatedAt = now
+		if candidate.DeletedAt == nil {
+			candidate.DeletedAt = &now
+		}
+		ms.deleting = true
+		ms.mu.Unlock()
 		m.mu.Unlock()
-		if cleanup, ok := m.store.(CleanupTaskStore); ok {
-			_, err := cleanup.DeletePhysicalWithCleanup(ctx, id)
-			if err == nil {
-				m.notifyRuntimeRelease(ctx, id)
-			}
-			return err
-		}
-		var deletedInfo *SessionInfo
-		if m.OnDelete != nil {
-			if info, err := m.store.Get(ctx, id); err == nil {
-				deletedInfo = info
-			}
-		}
-		if err := m.store.DeletePhysical(ctx, id); err != nil {
-			return err
-		}
-		m.notifyRuntimeRelease(ctx, id)
-		if deletedInfo != nil {
-			m.notifyDelete(*deletedInfo)
-		}
-		return nil
+		return m.persistDelete(ctx, id, ms, candidate, nil, wasRunning)
 	}
 
-	ms.mu.Lock()
-	workerType := ms.info.WorkerType
-	uid := ms.info.UserID
-	platform := ms.info.Platform
-	botID := ms.info.BotID
-	wasRunning := ms.info.State == events.StateRunning
-	// Copy-on-write: build candidate, persist, commit on success.
-	candidate := ms.info
-	candidate.State = events.StateDeleted
-	candidate.UpdatedAt = time.Now()
-	ms.deleting = true
-	ms.mu.Unlock()
+	// Install a cache tombstone before loading the row. This blocks Get,
+	// AttachWorker, and sequence producers while the durable delete barrier is
+	// being established, even when the session was not previously cached.
+	ms = &managedSession{info: SessionInfo{ID: id}, deleting: true, log: m.log.With("session_id", id)}
+	m.sessions[id] = ms
 	m.mu.Unlock()
 
+	info, err := m.store.Get(ctx, id)
+	if err != nil {
+		m.mu.Lock()
+		if current, exists := m.sessions[id]; exists && current == ms {
+			delete(m.sessions, id)
+		}
+		m.mu.Unlock()
+		if errors.Is(err, ErrSessionNotFound) {
+			m.notifyRuntimeRelease(ctx, id)
+			return nil
+		}
+		return err
+	}
+	candidate := *info
+	wasRunning := candidate.State == events.StateRunning
+	now := time.Now()
+	candidate.State = events.StateDeleted
+	candidate.UpdatedAt = now
+	if candidate.DeletedAt == nil {
+		candidate.DeletedAt = &now
+	}
+	return m.persistDelete(ctx, id, ms, candidate, info, wasRunning)
+}
+
+// persistDelete commits the durable tombstone and cleanup task before removing
+// the in-memory entry. original is non-nil when Delete installed a cold-cache
+// tombstone and loaded the session from Store.
+func (m *Manager) persistDelete(ctx context.Context, id string, ms *managedSession, candidate SessionInfo, original *SessionInfo, wasRunning bool) error {
 	var persistErr error
 	if cleanup, ok := m.store.(CleanupTaskStore); ok {
 		persistErr = cleanup.MarkDeletedWithCleanup(ctx, &candidate)
@@ -1157,28 +1257,36 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	}
 	if persistErr != nil {
 		m.mu.Lock()
-		if current, exists := m.sessions[id]; exists {
-			current.mu.Lock()
-			current.deleting = false
-			current.mu.Unlock()
+		if current, exists := m.sessions[id]; exists && current == ms {
+			if original != nil {
+				m.sessions[id] = &managedSession{
+					info: *original,
+					log:  m.log.With("worker_type", original.WorkerType, "channel", original.Platform),
+				}
+			} else {
+				ms.mu.Lock()
+				ms.deleting = false
+				ms.mu.Unlock()
+			}
 		}
 		m.mu.Unlock()
-		m.emitSessionDeleteAudit(uid, botID, platform, id, string(workerType), audit.OutcomeFailure, candidate.EffectiveIdentity(), candidate.SpecSnapshot)
+		m.emitSessionDeleteAudit(ctx, candidate.UserID, candidate.BotID, candidate.Platform, id, string(candidate.WorkerType), audit.OutcomeFailure, candidate.EffectiveIdentity(), candidate.SpecSnapshot)
 		return persistErr
 	}
 
 	// AttachWorker observes deleting under the same mutex, so no worker can be
 	// attached during the durable state-and-outbox transaction above.
+	var workerToTerminate worker.Worker
 	m.mu.Lock()
-	if _, exists := m.sessions[id]; exists {
+	if current, exists := m.sessions[id]; exists && current == ms {
 		ms.mu.Lock()
 		ms.info = candidate
 		if ms.worker != nil {
 			workerToTerminate = ms.worker
-			workersRunningGauge(string(workerType)).Add(-1)
+			workersRunningGauge(string(candidate.WorkerType)).Add(-1)
 			// Release against the workspace the quota was acquired on at attach
 			// time (review P2 quota-drift fix), not the live ms.info.WorkspaceID.
-			m.pool.ReleaseForWorkspace(ctx, uid, ms.attachedWorkspaceID)
+			m.pool.ReleaseForWorkspace(ctx, candidate.UserID, ms.attachedWorkspaceID)
 		}
 		ms.mu.Unlock()
 		delete(m.sessions, id)
@@ -1188,7 +1296,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	}
 	m.mu.Unlock()
 
-	m.notifyStateChange(ctx, id, events.StateDeleted, "session deleted")
+	m.notifyStateChange(ctx, id, events.StateDeleted, "session deleted", "session_deleted", candidate.LifecyclePolicy)
 	m.terminateWorkerGracefully(ctx, workerToTerminate, id)
 	m.notifyRuntimeRelease(ctx, id)
 	if _, ok := m.store.(CleanupTaskStore); !ok {
@@ -1196,7 +1304,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	}
 
 	m.log.Info("session: deleted", "session_id", id)
-	m.emitSessionDeleteAudit(uid, botID, platform, id, string(workerType), audit.OutcomeSuccess, candidate.EffectiveIdentity(), candidate.SpecSnapshot)
+	m.emitSessionDeleteAudit(ctx, candidate.UserID, candidate.BotID, candidate.Platform, id, string(candidate.WorkerType), audit.OutcomeSuccess, candidate.EffectiveIdentity(), candidate.SpecSnapshot)
 	return nil
 }
 
@@ -1462,7 +1570,15 @@ func (m *Manager) Lock(id string) (release func(), err error) {
 
 // List returns all sessions from Store. Use ListActive for in-memory active sessions only.
 func (m *Manager) List(ctx context.Context, userID, platform, workspaceID string, limit, offset int) ([]*SessionInfo, error) {
-	return m.store.List(ctx, userID, platform, workspaceID, limit, offset)
+	sessions, err := m.store.List(ctx, userID, platform, workspaceID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	for _, info := range sessions {
+		updateArchiveProjection(info, now)
+	}
+	return sessions, nil
 }
 
 // ListActive returns in-memory active sessions (no DB round-trip).
@@ -1470,11 +1586,13 @@ func (m *Manager) ListActive() []*SessionInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	now := time.Now()
 	sessions := make([]*SessionInfo, 0, len(m.sessions))
 	for _, ms := range m.sessions {
 		ms.mu.RLock()
 		info := ms.info
 		ms.mu.RUnlock()
+		updateArchiveProjection(&info, now)
 		sessions = append(sessions, &info)
 	}
 	return sessions
@@ -1524,6 +1642,80 @@ func (m *Manager) ResetExpiry(ctx context.Context, id string) error {
 		info.ExpiresAt = ptr(time.Now().Add(m.cfg.Session.RetentionPeriod))
 		return func() { info.ExpiresAt = prev }
 	})
+}
+
+// RecordInputAccepted advances the v2 session-level deadlines after a new
+// durable input acceptance. The stored policy revision must match the active
+// configuration; older sessions are left unchanged rather than being
+// retroactively assigned a different retention policy.
+func (m *Manager) RecordInputAccepted(ctx context.Context, id string, acceptedAt time.Time) error {
+	if m == nil {
+		return ErrSessionNotFound
+	}
+	if acceptedAt.IsZero() {
+		return fmt.Errorf("session: accepted input time must be set")
+	}
+
+	cfg := m.cfg
+	if m.cfgStore != nil {
+		if current := m.cfgStore.Load(); current != nil {
+			cfg = current
+		}
+	}
+	if cfg == nil {
+		return fmt.Errorf("session: lifecycle configuration is unavailable")
+	}
+
+	candidate, err := newInitialLifecycleState(acceptedAt, cfg.Lifecycle)
+	if err != nil {
+		return err
+	}
+	if candidate.policy != config.LifecyclePolicyV2 {
+		return nil
+	}
+
+	ms := m.getManagedSession(ctx, id)
+	if ms == nil {
+		return ErrSessionNotFound
+	}
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ms.info.LifecyclePolicy != config.LifecyclePolicyV2 ||
+		ms.info.LifecyclePolicyRevision == "" ||
+		ms.info.LifecyclePolicyRevision != candidate.revision {
+		return nil
+	}
+
+	lastInputAt := latestLifecycleTime(ms.info.LastInputAt, acceptedAt)
+	archiveAt := latestLifecycleTime(ms.info.ArchiveAt, *candidate.archiveAt)
+	conversationExpiresAt := latestLifecycleTime(ms.info.ConversationExpiresAt, *candidate.conversationExpiresAt)
+	historyExpiresAt := latestLifecycleTime(ms.info.HistoryExpiresAt, *candidate.historyExpiresAt)
+	updatedAt := latestLifecycleTime(&ms.info.UpdatedAt, time.Now())
+
+	store, ok := m.store.(lifecycleDeadlineStore)
+	if !ok {
+		return fmt.Errorf("session: store does not support lifecycle deadline updates")
+	}
+	if err := store.AdvanceLifecycleDeadlines(
+		ctx,
+		id,
+		candidate.revision,
+		lastInputAt,
+		archiveAt,
+		conversationExpiresAt,
+		historyExpiresAt,
+		updatedAt,
+	); err != nil {
+		return fmt.Errorf("session: persist input lifecycle deadlines: %w", err)
+	}
+
+	ms.info.LastInputAt = ptr(lastInputAt)
+	ms.info.ArchiveAt = ptr(archiveAt)
+	ms.info.ConversationExpiresAt = ptr(conversationExpiresAt)
+	ms.info.HistoryExpiresAt = ptr(historyExpiresAt)
+	ms.info.UpdatedAt = updatedAt
+	return nil
 }
 
 // WorkerHealthStatuses returns a snapshot of health for all active worker processes.
@@ -1765,6 +1957,155 @@ func (m *Manager) gc(ctx context.Context) {
 			}
 		}
 	}
+
+	// 5. Retire v2 conversations only after both the logical session and all
+	// retained history are past their persisted deadlines, and no execution
+	// recovery obligation remains. The store rechecks every condition while
+	// holding the session lifecycle lock before it creates cleanup outbox work.
+	lifecycleStore, ok := m.store.(lifecycleRetirementStore)
+	if !ok {
+		return
+	}
+	candidateCfg := m.cfg
+	if m.cfgStore != nil {
+		if current := m.cfgStore.Load(); current != nil {
+			candidateCfg = current
+		}
+	}
+	limit := candidateCfg.Lifecycle.GC.BatchSize
+	candidates, err := lifecycleStore.ListExpiredLifecycleSessions(ctx, now, limit)
+	if err != nil {
+		observability.LifecycleGCFailures().Add(ctx, 1, metric.WithAttributes(attribute.String("phase", "session_query")))
+		m.log.Error("session: gc (lifecycle expiry query) failed", "err", err)
+		return
+	}
+	for _, id := range candidates {
+		m.retireExpiredLifecycleSession(ctx, lifecycleStore, id, now)
+	}
+	m.refreshLifecycleGCStatus(ctx, now, candidateCfg.Lifecycle.GC.MaxLag)
+}
+
+func (m *Manager) refreshLifecycleGCStatus(ctx context.Context, now time.Time, maxLag time.Duration) {
+	statusStore, ok := m.store.(lifecycleGCStatusStore)
+	if !ok {
+		return
+	}
+	status, err := statusStore.GetLifecycleGCStatus(ctx, now)
+	if err != nil {
+		observability.LifecycleGCFailures().Add(ctx, 1, metric.WithAttributes(attribute.String("phase", "status_query")))
+		m.log.Warn("session: gc lifecycle status query failed", "err", err)
+		return
+	}
+
+	eligibleLag := status.eligibleLag
+	blockedLag := status.blockedLag
+	lifecycleGCGauges.eligibleBacklog.Store(status.eligible)
+	lifecycleGCGauges.blockedBacklog.Store(status.blocked)
+	lifecycleGCGauges.unknownExecutionHold.Store(status.unknownExecutionHold)
+	lifecycleGCGauges.eligibleLagNanos.Store(int64(eligibleLag))
+	lifecycleGCGauges.blockedLagNanos.Store(int64(blockedLag))
+
+	if eligibleLag > maxLag || blockedLag > maxLag {
+		if m.lifecycleGCLagExceeded.CompareAndSwap(false, true) {
+			m.log.Warn(
+				"session: lifecycle GC overdue backlog exceeds max lag",
+				"eligible_backlog", status.eligible,
+				"blocked_backlog", status.blocked,
+				"oldest_eligible_lag", eligibleLag,
+				"oldest_blocked_lag", blockedLag,
+				"max_lag", maxLag,
+			)
+		}
+		return
+	}
+	m.lifecycleGCLagExceeded.Store(false)
+}
+
+func (m *Manager) retireExpiredLifecycleSession(ctx context.Context, store lifecycleRetirementStore, id string, now time.Time) {
+	m.mu.Lock()
+	ms, cached := m.sessions[id]
+	if cached {
+		ms.mu.Lock()
+		if ms.deleting || ms.worker != nil || ms.info.State == events.StateRunning ||
+			ms.info.LifecyclePolicy != config.LifecyclePolicyV2 {
+			ms.mu.Unlock()
+			m.mu.Unlock()
+			return
+		}
+		ms.deleting = true
+		ms.mu.Unlock()
+	} else {
+		ms = &managedSession{
+			info:     SessionInfo{ID: id},
+			deleting: true,
+			log:      m.log.With("session_id", id),
+		}
+		m.sessions[id] = ms
+	}
+	m.mu.Unlock()
+
+	retired, err := store.RetireExpiredLifecycleSession(ctx, id, now)
+	if err != nil || retired == nil {
+		m.mu.Lock()
+		if current, exists := m.sessions[id]; exists && current == ms {
+			if cached {
+				ms.mu.Lock()
+				ms.deleting = false
+				ms.mu.Unlock()
+			} else {
+				delete(m.sessions, id)
+			}
+		}
+		m.mu.Unlock()
+		if err != nil {
+			observability.LifecycleGCFailures().Add(ctx, 1, metric.WithAttributes(attribute.String("phase", "session_retire")))
+			m.log.Warn("session: gc lifecycle retirement failed", "session_id", id, "err", err)
+		}
+		return
+	}
+
+	m.mu.Lock()
+	if current, exists := m.sessions[id]; exists && current == ms {
+		ms.mu.Lock()
+		ms.info.State = events.StateDeleted
+		ms.info.DeletedAt = ptr(now)
+		ms.info.UpdatedAt = now
+		ms.mu.Unlock()
+		delete(m.sessions, id)
+	}
+	m.mu.Unlock()
+
+	m.notifyStateChange(ctx, id, events.StateDeleted, "session retention expired", "retention_expired", retired.LifecyclePolicy)
+	m.notifyRuntimeRelease(ctx, id)
+	m.emitSessionDeleteAudit(ctx, retired.UserID, retired.BotID, retired.Platform, id,
+		string(retired.WorkerType), audit.OutcomeSuccess, retired.EffectiveIdentity(), retired.SpecSnapshot)
+	observability.SessionDeleted().Add(ctx, 1)
+	observability.RecordLifecycleGCProcessed(ctx, observability.LifecycleGCProcessedSession, 1)
+	observability.LifecycleGCRetirementLag().Record(ctx, lifecycleExpirationLag(retired, now).Seconds())
+}
+
+func lifecycleExpirationLag(info *SessionInfo, now time.Time) time.Duration {
+	if info == nil {
+		return 0
+	}
+	var latestDeadline time.Time
+	if info.ConversationExpiresAt != nil {
+		latestDeadline = *info.ConversationExpiresAt
+	}
+	if info.LastContentExpiresAt != nil && info.LastContentExpiresAt.After(latestDeadline) {
+		latestDeadline = *info.LastContentExpiresAt
+	}
+	if latestDeadline.IsZero() || now.Before(latestDeadline) {
+		return 0
+	}
+	return now.Sub(latestDeadline)
+}
+
+func lifecycleDeadlineLag(deadline *time.Time, now time.Time) time.Duration {
+	if deadline == nil || now.Before(*deadline) {
+		return 0
+	}
+	return now.Sub(*deadline)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1787,7 +2128,7 @@ func (m *Manager) safeCall(fn func()) {
 }
 
 // notifyStateChange sends state change and termination callbacks.
-func (m *Manager) notifyStateChange(ctx context.Context, sessionID string, state events.SessionState, message string) {
+func (m *Manager) notifyStateChange(ctx context.Context, sessionID string, state events.SessionState, message, terminationReason, lifecyclePolicy string) {
 	if m.StateNotifier != nil {
 		notify := func() { m.StateNotifier(ctx, sessionID, state, message) }
 		if state == events.StateDeleted {
@@ -1799,7 +2140,9 @@ func (m *Manager) notifyStateChange(ctx context.Context, sessionID string, state
 			m.safeGo(notify)
 		}
 	}
-	if (state == events.StateTerminated || state == events.StateDeleted) && m.OnTerminate != nil {
+	notifyTermination := state == events.StateDeleted ||
+		(state == events.StateTerminated && shouldNotifyTerminationCleanup(lifecyclePolicy, terminationReason))
+	if notifyTermination && m.OnTerminate != nil {
 		m.safeGo(func() { m.OnTerminate(sessionID) })
 	}
 }

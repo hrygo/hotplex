@@ -32,6 +32,31 @@ type Store interface {
 	Close() error
 }
 
+type lifecycleDeadlineStore interface {
+	AdvanceLifecycleDeadlines(
+		ctx context.Context,
+		id, policyRevision string,
+		lastInputAt, archiveAt, conversationExpiresAt, historyExpiresAt, updatedAt time.Time,
+	) error
+}
+
+type lifecycleRetirementStore interface {
+	ListExpiredLifecycleSessions(ctx context.Context, now time.Time, limit int) ([]string, error)
+	RetireExpiredLifecycleSession(ctx context.Context, id string, now time.Time) (*SessionInfo, error)
+}
+
+type lifecycleGCStatus struct {
+	eligible             int64
+	blocked              int64
+	unknownExecutionHold int64
+	eligibleLag          time.Duration
+	blockedLag           time.Duration
+}
+
+type lifecycleGCStatusStore interface {
+	GetLifecycleGCStatus(ctx context.Context, now time.Time) (lifecycleGCStatus, error)
+}
+
 var _ Store = (*SQLiteStore)(nil)
 
 // SQLiteStore implements Store using SQLite.
@@ -169,6 +194,57 @@ func (s *SQLiteStore) UpdateWorkerSessionIDSQL(ctx context.Context, id, workerSe
 	})
 }
 
+// AdvanceLifecycleDeadlines updates only the session-level lifecycle deadlines.
+// It does not set content expiry because turns/events have no per-record policy
+// or expiry timestamp yet.
+func (s *SQLiteStore) AdvanceLifecycleDeadlines(
+	ctx context.Context,
+	id, policyRevision string,
+	lastInputAt, archiveAt, conversationExpiresAt, historyExpiresAt, updatedAt time.Time,
+) error {
+	ctx, cancel := upsertTimeout(ctx)
+	defer cancel()
+
+	return s.writeMu.WithLock(func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := ensureSQLiteLifecycleLock(ctx, tx, id); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, queries["sessions.advance_lifecycle_deadlines"],
+			lastInputAt, lastInputAt,
+			archiveAt, archiveAt,
+			conversationExpiresAt, conversationExpiresAt,
+			historyExpiresAt, historyExpiresAt,
+			updatedAt, updatedAt,
+			id, config.LifecyclePolicyV2, policyRevision,
+		)
+		if err != nil {
+			return fmt.Errorf("session store: advance lifecycle deadlines: %w", err)
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("session store: lifecycle deadline rows affected: %w", err)
+		}
+		if updated == 0 {
+			var pending bool
+			if err := tx.QueryRowContext(ctx,
+				`SELECT EXISTS(SELECT 1 FROM session_cleanup_tasks WHERE session_id = ?)`, id,
+			).Scan(&pending); err != nil {
+				return fmt.Errorf("session store: check cleanup task: %w", err)
+			}
+			if pending {
+				return ErrSessionCleanupPending
+			}
+			return ErrSessionNotFound
+		}
+		return tx.Commit()
+	})
+}
+
 // SetPermissionCeilingIfEmpty atomically captures the first effective Worker
 // permission ceiling and returns the authoritative stored value.
 func (s *SQLiteStore) SetPermissionCeilingIfEmpty(ctx context.Context, id, ceiling string) (string, error) {
@@ -285,13 +361,17 @@ func scanSession(sc rowScanner) (*SessionInfo, error) {
 	var info SessionInfo
 	var ctxJSON, platformKeyStr sql.NullString
 	var expiresAt, idleExpiresAt sql.NullTime
+	var lastInputAt, runtimeFinishedAt, archiveAt, conversationExpiresAt sql.NullTime
+	var lastContentExpiresAt, historyExpiresAt, deletedAt sql.NullTime
 	var createdAt, updatedAt time.Time
 
 	err := sc.Scan(
 		&info.ID, &info.UserID, &info.OwnerID, &info.WorkerSessionID, &info.WorkerType, &info.State, &info.BotID, &info.BotName,
 		&info.Platform, &platformKeyStr, &info.WorkDir, &info.Title,
 		&createdAt, &updatedAt, &expiresAt, &idleExpiresAt, &ctxJSON, &info.Source, &info.ClientKey, &info.WorkspaceID,
-		&info.PermissionCeiling,
+		&info.PermissionCeiling, &info.LifecyclePolicy, &info.LifecyclePolicyRevision,
+		&lastInputAt, &runtimeFinishedAt, &archiveAt, &conversationExpiresAt,
+		&lastContentExpiresAt, &historyExpiresAt, &deletedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -304,6 +384,27 @@ func scanSession(sc rowScanner) (*SessionInfo, error) {
 	}
 	if idleExpiresAt.Valid {
 		info.IdleExpiresAt = &idleExpiresAt.Time
+	}
+	if lastInputAt.Valid {
+		info.LastInputAt = &lastInputAt.Time
+	}
+	if runtimeFinishedAt.Valid {
+		info.RuntimeFinishedAt = &runtimeFinishedAt.Time
+	}
+	if archiveAt.Valid {
+		info.ArchiveAt = &archiveAt.Time
+	}
+	if conversationExpiresAt.Valid {
+		info.ConversationExpiresAt = &conversationExpiresAt.Time
+	}
+	if lastContentExpiresAt.Valid {
+		info.LastContentExpiresAt = &lastContentExpiresAt.Time
+	}
+	if historyExpiresAt.Valid {
+		info.HistoryExpiresAt = &historyExpiresAt.Time
+	}
+	if deletedAt.Valid {
+		info.DeletedAt = &deletedAt.Time
 	}
 	if ctxJSON.Valid && ctxJSON.String != "" {
 		if err := json.Unmarshal([]byte(ctxJSON.String), &info.Context); err != nil {
@@ -420,6 +521,55 @@ func (s *SQLiteStore) GetExpiredIdle(ctx context.Context, now time.Time) ([]stri
 	return collectIDs(rows)
 }
 
+func (s *SQLiteStore) ListExpiredLifecycleSessions(ctx context.Context, now time.Time, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, queries["store.select_expired_lifecycle_ids"], now, now, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("session store: select expired lifecycle sessions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return collectIDs(rows)
+}
+
+func (s *SQLiteStore) GetLifecycleGCStatus(ctx context.Context, now time.Time) (lifecycleGCStatus, error) {
+	var status lifecycleGCStatus
+	var oldestEligible, oldestBlocked sql.NullString
+	err := s.db.QueryRowContext(ctx, queries["store.lifecycle_gc_status"], now, now, now).
+		Scan(&status.eligible, &status.blocked, &status.unknownExecutionHold, &oldestEligible, &oldestBlocked)
+	if err != nil {
+		return lifecycleGCStatus{}, fmt.Errorf("session store: get lifecycle GC status: %w", err)
+	}
+	if oldestEligible.Valid {
+		deadline, err := parseSQLiteDateTime(oldestEligible.String)
+		if err != nil {
+			return lifecycleGCStatus{}, fmt.Errorf("session store: parse oldest eligible lifecycle deadline: %w", err)
+		}
+		status.eligibleLag = lifecycleDeadlineLag(&deadline, now)
+	}
+	if oldestBlocked.Valid {
+		deadline, err := parseSQLiteDateTime(oldestBlocked.String)
+		if err != nil {
+			return lifecycleGCStatus{}, fmt.Errorf("session store: parse oldest blocked lifecycle deadline: %w", err)
+		}
+		status.blockedLag = lifecycleDeadlineLag(&deadline, now)
+	}
+	return status, nil
+}
+
+func parseSQLiteDateTime(value string) (time.Time, error) {
+	const sqliteDateTimeLayout = "2006-01-02 15:04:05.999999999 -0700 MST"
+	deadline, err := time.Parse(sqliteDateTimeLayout, value)
+	if err == nil {
+		return deadline, nil
+	}
+	if rfc3339, rfcErr := time.Parse(time.RFC3339Nano, value); rfcErr == nil {
+		return rfc3339, nil
+	}
+	return time.Time{}, fmt.Errorf("unsupported SQLite datetime %q: %w", value, err)
+}
+
 // Events lifecycle is managed independently — session deletion does not cascade to events.
 func (s *SQLiteStore) DeleteTerminated(ctx context.Context, cronCutoff, defaultCutoff time.Time) ([]*SessionInfo, error) {
 	deleted := make([]*SessionInfo, 0)
@@ -445,6 +595,13 @@ func (s *SQLiteStore) DeleteTerminated(ctx context.Context, cronCutoff, defaultC
 		for _, id := range ids {
 			if err := ensureSQLiteLifecycleLock(ctx, tx, id); err != nil {
 				return err
+			}
+			locked, err := lockSessionRowForLifecycleChange(ctx, tx, identityRebind, id)
+			if err != nil {
+				return err
+			}
+			if !locked {
+				continue
 			}
 			deletedRows, err := tx.QueryContext(ctx, queries["store.delete_terminated_by_id"], id, events.StateTerminated, cronCutoff, defaultCutoff)
 			if err != nil {

@@ -91,35 +91,30 @@ func gwTestCollector(t *testing.T) (*audit.Collector, func(t *testing.T) []audit
 	return c, query
 }
 
-// TestBuildToolCallDetail_SensitiveTool verifies sensitive tools (Bash) store
-// full input with secrets masked (spec §5.3 sensitive-behavior full store).
-func TestBuildToolCallDetail_SensitiveTool(t *testing.T) {
+// TestBuildToolCallDetail_OmitsInput verifies tool input is not copied into
+// audit facts, including for tools that can contain commands or file contents.
+func TestBuildToolCallDetail_OmitsInput(t *testing.T) {
 	t.Parallel()
-	// NOTE: uses an obviously-fake placeholder body (not a real key) so GitHub
-	// push protection does not flag this test fixture. The mask regex matches
-	// the hpk_ prefix regardless of the body.
 	tc := events.ToolCallData{
 		ID:   "tc1",
 		Name: "Bash",
 		Input: map[string]any{
-			"command": `export API_KEY="hpk_FAKEPLACEHOLDER1234" && curl https://example.com`,
+			"command": `echo PRIVATE_COMMAND_BODY`,
 		},
 	}
 	detail := buildToolCallDetail(&tc)
 	var d map[string]any
 	require.NoError(t, json.Unmarshal([]byte(detail), &d))
 	require.Equal(t, "Bash", d["name"])
-	require.Equal(t, true, d["sensitive"])
-	// Full input present (not just a sha256/preview pair).
-	input, ok := d["input"].(string)
-	require.True(t, ok, "sensitive tool should store full 'input'")
-	// The structurally sensitive API_KEY field must be fully redacted.
-	require.NotContains(t, input, "FAKEPLACEHOLDER1234", "raw secret must be masked")
-	require.Contains(t, input, audit.RedactedValue)
+	require.Equal(t, true, d["success"])
+	require.NotContains(t, d, "input")
+	require.NotContains(t, d, "input_sha256")
+	require.NotContains(t, d, "input_preview")
+	require.NotContains(t, detail, "PRIVATE_COMMAND_BODY")
 }
 
-// TestBuildToolCallDetail_NonSensitiveTool verifies non-sensitive tools store
-// a sha256 + truncated preview, never the full input.
+// TestBuildToolCallDetail_NonSensitiveTool verifies non-sensitive tool input
+// is omitted instead of retaining a preview or a guessable content hash.
 func TestBuildToolCallDetail_NonSensitiveTool(t *testing.T) {
 	t.Parallel()
 	tc := events.ToolCallData{
@@ -133,17 +128,10 @@ func TestBuildToolCallDetail_NonSensitiveTool(t *testing.T) {
 	var d map[string]any
 	require.NoError(t, json.Unmarshal([]byte(detail), &d))
 	require.Equal(t, "Read", d["name"])
-	require.Nil(t, d["sensitive"], "non-sensitive tool must not mark itself sensitive")
-	require.Contains(t, d, "input_sha256")
-	require.Contains(t, d, "input_preview")
-	// input_preview must NOT contain the raw serialized input verbatim — it is
-	// truncated JSON. For this tiny input it fits, but the field must be the
-	// preview, not "input".
-	preview, _ := d["input_preview"].(string)
-	require.Contains(t, preview, "/etc/hosts")
-	// sha256 must be a 64-char hex string.
-	sha, _ := d["input_sha256"].(string)
-	require.Len(t, sha, 64)
+	require.NotContains(t, d, "input")
+	require.NotContains(t, d, "input_sha256")
+	require.NotContains(t, d, "input_preview")
+	require.NotContains(t, detail, "/etc/hosts")
 }
 
 func TestBuildToolCallDetail_NonSensitiveToolRedactsCredentials(t *testing.T) {
@@ -162,17 +150,19 @@ func TestBuildToolCallDetail_NonSensitiveToolRedactsCredentials(t *testing.T) {
 	detail := buildToolCallDetail(&tc)
 	require.NotContains(t, detail, "FAKE_PREVIEW_TOKEN_123456")
 	require.NotContains(t, detail, "FAKE_PRIVATE_BODY")
-	require.Contains(t, detail, "[REDACTED]")
+	require.NotContains(t, detail, "config.json")
+	require.NotContains(t, detail, "private_key")
+	require.NotContains(t, detail, "input")
 }
 
-func TestBuildToolCallDetail_LowercaseBashIsSensitive(t *testing.T) {
+func TestBuildToolCallDetail_LowercaseBashOmitsInput(t *testing.T) {
 	t.Parallel()
 	tc := events.ToolCallData{ID: "tc-bash", Name: "bash", Input: map[string]any{"command": "pwd"}}
 	detail := buildToolCallDetail(&tc)
 	var d map[string]any
 	require.NoError(t, json.Unmarshal([]byte(detail), &d))
-	require.Equal(t, true, d["sensitive"])
-	require.Contains(t, d, "input")
+	require.NotContains(t, d, "input")
+	require.NotContains(t, detail, "pwd")
 }
 
 // TestBuildToolCallDetail_NoInput covers parameterless tools.
@@ -183,13 +173,12 @@ func TestBuildToolCallDetail_NoInput(t *testing.T) {
 	var d map[string]any
 	require.NoError(t, json.Unmarshal([]byte(detail), &d))
 	require.Equal(t, "ListTools", d["name"])
-	require.Contains(t, d, "input_sha256")
+	require.NotContains(t, d, "input_sha256")
 	require.NotContains(t, d, "input_preview")
 	require.NotContains(t, d, "input")
 }
 
-// TestBuildToolCallDetail_ACPExtFields verifies kind/title are recorded when
-// present (ACP worker extension fields).
+// TestBuildToolCallDetail_ACPExtFields verifies metadata values are omitted.
 func TestBuildToolCallDetail_ACPExtFields(t *testing.T) {
 	t.Parallel()
 	tc := events.ToolCallData{
@@ -202,8 +191,9 @@ func TestBuildToolCallDetail_ACPExtFields(t *testing.T) {
 	detail := buildToolCallDetail(&tc)
 	var d map[string]any
 	require.NoError(t, json.Unmarshal([]byte(detail), &d))
-	require.Equal(t, "edit: main.go", d["title"])
-	require.Equal(t, "edit", d["kind"])
+	require.NotContains(t, d, "title")
+	require.NotContains(t, d, "kind")
+	require.NotContains(t, detail, "main.go")
 }
 
 // TestMaskSensitiveInput covers the PII redaction patterns (spec §5.9).
@@ -294,7 +284,7 @@ func TestEmitToolCallAudit_Enqueues(t *testing.T) {
 		sessPlatform: "feishu",
 		sessOwner:    "ou_testuser",
 	}
-	tc := events.ToolCallData{ID: "tc-audit-1", Name: "Bash", Input: map[string]any{"command": "ls"}}
+	tc := events.ToolCallData{ID: "tc-audit-1", Name: "Bash", Input: map[string]any{"command": "PRIVATE_TOOL_BODY"}}
 
 	b.emitToolCallAudit(fc, &tc)
 
@@ -311,7 +301,9 @@ func TestEmitToolCallAudit_Enqueues(t *testing.T) {
 	require.Equal(t, "tool", r.ResourceType)
 	require.Equal(t, "tc-audit-1", r.ResourceID)
 	require.Contains(t, r.DetailJSON, "Bash")
-	require.Contains(t, r.DetailJSON, `"sensitive":true`)
+	require.NotContains(t, r.DetailJSON, "PRIVATE_TOOL_BODY")
+	require.NotContains(t, r.DetailJSON, `"input"`)
+	require.NotContains(t, r.DetailJSON, `"input_sha256"`)
 }
 
 // TestEmitToolCallAudit_AnonymousFallback verifies empty owner falls back to
@@ -384,9 +376,9 @@ func TestEmitPermissionRequestAudit(t *testing.T) {
 	require.Equal(t, "sess-req-1", r.SessionID)
 	require.Equal(t, "permission", r.ResourceType)
 	require.Equal(t, "req-pr-1", r.ResourceID)
-	require.Contains(t, r.DetailJSON, `"tool_name":"Bash"`)
-	require.Contains(t, r.DetailJSON, "Execute shell script")
-	require.Contains(t, r.DetailJSON, "ls")
+	require.NotContains(t, r.DetailJSON, "Bash")
+	require.NotContains(t, r.DetailJSON, "Execute shell script")
+	require.NotContains(t, r.DetailJSON, "ls")
 }
 
 func TestEmitInteractionAudit_PermissionResponse(t *testing.T) {
@@ -411,7 +403,7 @@ func TestEmitInteractionAudit_PermissionResponse(t *testing.T) {
 	require.Equal(t, "permission", r.ResourceType)
 	require.Equal(t, "req-p1", r.ResourceID)
 	require.Contains(t, r.DetailJSON, `"allowed":true`)
-	require.Contains(t, r.DetailJSON, "approved by user")
+	require.NotContains(t, r.DetailJSON, "approved by user")
 
 	// Test Allowed = false (Denied)
 	h.emitInteractionAudit("u-1", "webchat", "sess-p2", events.PermissionResponse, map[string]any{
@@ -425,7 +417,7 @@ func TestEmitInteractionAudit_PermissionResponse(t *testing.T) {
 	require.Equal(t, audit.ActionPermissionResponse, r2.Action)
 	require.Equal(t, audit.OutcomeDenied, r2.Outcome)
 	require.Contains(t, r2.DetailJSON, `"allowed":false`)
-	require.Contains(t, r2.DetailJSON, "user denied")
+	require.NotContains(t, r2.DetailJSON, "user denied")
 }
 
 func TestEmitInteractionAudit_QuestionResponse(t *testing.T) {
@@ -444,7 +436,7 @@ func TestEmitInteractionAudit_QuestionResponse(t *testing.T) {
 	require.Equal(t, audit.OutcomeSuccess, r.Outcome)
 	require.Equal(t, "question", r.ResourceType)
 	require.Equal(t, "req-q1", r.ResourceID)
-	require.Contains(t, r.DetailJSON, "Option A")
+	require.NotContains(t, r.DetailJSON, "Option A")
 }
 
 func TestEmitInteractionAudit_ElicitationResponse(t *testing.T) {
@@ -453,8 +445,9 @@ func TestEmitInteractionAudit_ElicitationResponse(t *testing.T) {
 	h := &Handler{auditCollector: c}
 
 	h.emitInteractionAudit("u-3", "slack", "sess-e1", events.ElicitationResponse, events.ElicitationResponseData{
-		ID:     "req-e1",
-		Action: "decline",
+		ID:      "req-e1",
+		Action:  "decline",
+		Content: map[string]any{"answer": "PRIVATE_ANSWER"},
 	}, "")
 
 	require.Eventually(t, func() bool { return len(query(t)) >= 1 }, 2*time.Second, 5*time.Millisecond)
@@ -464,4 +457,5 @@ func TestEmitInteractionAudit_ElicitationResponse(t *testing.T) {
 	require.Equal(t, "elicitation", r.ResourceType)
 	require.Equal(t, "req-e1", r.ResourceID)
 	require.Contains(t, r.DetailJSON, `"action":"decline"`)
+	require.NotContains(t, r.DetailJSON, "PRIVATE_ANSWER")
 }

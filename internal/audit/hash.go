@@ -23,6 +23,7 @@ type hashableFields struct {
 	EventRef     string `json:"event_ref"`
 	IP           string `json:"ip"`
 	UserAgent    string `json:"user_agent"`
+	ExpiresAt    int64  `json:"expires_at,omitempty"`
 }
 
 // ComputeSelfHash returns sha256(prevHash || canonical(ua fields except prev/self_hash)).
@@ -30,6 +31,10 @@ type hashableFields struct {
 func ComputeSelfHash(prevHash string, ua *UserActivity) (string, error) {
 	if ua == nil {
 		return "", fmt.Errorf("audit: nil UserActivity")
+	}
+	expiresAt := int64(0)
+	if ua.ChainEpoch == lifecycleChainProfile.epoch {
+		expiresAt = ua.ExpiresAt
 	}
 	payload, err := json.Marshal(hashableFields{
 		Ts:           ua.Ts,
@@ -45,6 +50,7 @@ func ComputeSelfHash(prevHash string, ua *UserActivity) (string, error) {
 		EventRef:     ua.EventRef,
 		IP:           ua.IP,
 		UserAgent:    ua.UserAgent,
+		ExpiresAt:    expiresAt,
 	})
 	if err != nil {
 		return "", fmt.Errorf("audit: hash marshal: %w", err)

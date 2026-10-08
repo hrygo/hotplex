@@ -260,7 +260,7 @@ func TestActivityService_Export_CSV(t *testing.T) {
 	store := &mockAuditStore{
 		queryFn: func(ctx context.Context, q audit.Query) ([]audit.UserActivity, error) {
 			return []audit.UserActivity{
-				{ID: 1, Ts: 1700000000000, UserID: "u1", Action: "auth.login", Outcome: "success"},
+				{ID: 1, Ts: 1700000000000, UserID: "u1", Action: "auth.login", Outcome: "success", ChainEpoch: "legacy"},
 			}, nil
 		},
 	}
@@ -274,8 +274,10 @@ func TestActivityService_Export_CSV(t *testing.T) {
 	records, err := r.ReadAll()
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, len(records), 2) // header + 1 row
-	require.Equal(t, "id", records[0][0])
-	require.Equal(t, "1", records[1][0])
+	require.Equal(t, "chain_epoch", records[0][0])
+	require.Equal(t, "legacy", records[1][0])
+	require.Equal(t, "id", records[0][1])
+	require.Equal(t, "1", records[1][1])
 }
 
 func TestActivityService_Export_DefaultFormat(t *testing.T) {
@@ -396,12 +398,13 @@ func TestEncodeCSV(t *testing.T) {
 	records, err := r.ReadAll()
 	require.NoError(t, err)
 	require.Len(t, records, 3) // header + 2 rows
-	require.Equal(t, "id", records[0][0])
-	require.Equal(t, "user_id", records[0][2])
-	require.Equal(t, "1", records[1][0])
-	require.Equal(t, "u1", records[1][2])
-	require.Equal(t, "2", records[2][0])
-	require.Equal(t, "u2", records[2][2])
+	require.Equal(t, "chain_epoch", records[0][0])
+	require.Equal(t, "id", records[0][1])
+	require.Equal(t, "user_id", records[0][3])
+	require.Equal(t, "1", records[1][1])
+	require.Equal(t, "u1", records[1][3])
+	require.Equal(t, "2", records[2][1])
+	require.Equal(t, "u2", records[2][3])
 }
 
 // TestEncodeCSV_FormulaInjectionSanitized verifies that attacker-controlled
@@ -426,9 +429,9 @@ func TestEncodeCSV_FormulaInjectionSanitized(t *testing.T) {
 	records, err := r.ReadAll()
 	require.NoError(t, err)
 	require.Len(t, records, 2) // header + 1 row
-	// user_id column index 2; user_agent column index 11 (see encodeCSV header).
-	require.Equal(t, "'=cmd|'/c calc'!A0", records[1][2], "user_id must be prefixed to neutralize formula")
-	require.Equal(t, "'@SUM(1+1)*cmd|'/c calc'!A0", records[1][11], "user_agent must be prefixed")
+	// chain_epoch adds one leading column; user_id is index 3 and user_agent index 12.
+	require.Equal(t, "'=cmd|'/c calc'!A0", records[1][3], "user_id must be prefixed to neutralize formula")
+	require.Equal(t, "'@SUM(1+1)*cmd|'/c calc'!A0", records[1][12], "user_agent must be prefixed")
 }
 
 // TestSanitizeCSVCell verifies the cell sanitizer covers all OWASP-listed

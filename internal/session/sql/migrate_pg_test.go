@@ -44,16 +44,14 @@ func openTestPGDB(t *testing.T) *sql.DB {
 	return db
 }
 
-// TestMigrations_PG_023UserActivity_TriggerBlocksUpdate is the PostgreSQL
-// counterpart to TestMigrations_023UserActivity_AppliesAndIsImmutable. It
-// guards the audit system's core tamper-evidence invariant on PG: migration
-// 023 creates a BEFORE UPDATE trigger that must reject every mutation of
-// user_activity (review I4 — the PR shipped with zero PG migration tests).
+// TestMigrations_PG_AuditChainsStayImmutable is the PostgreSQL counterpart
+// to TestMigrations_AuditChainsApplyAndStayImmutable. It guards both audit
+// epochs' tamper-evidence and checkpoint-anchored cleanup contracts.
 //
 // A semantic bug here (e.g. the trigger firing AFTER instead of BEFORE, or
 // the function existing but never bound to the table) would let UPDATEs
 // succeed silently and defeat the entire audit chain's tamper-evidence.
-func TestMigrations_PG_023UserActivity_TriggerBlocksUpdate(t *testing.T) {
+func TestMigrations_PG_AuditChainsStayImmutable(t *testing.T) {
 	ctx := context.Background()
 	db := openTestPGDB(t)
 	defer func() { _ = db.Close() }()
@@ -81,6 +79,24 @@ func TestMigrations_PG_023UserActivity_TriggerBlocksUpdate(t *testing.T) {
 	// BEFORE UPDATE with no WHEN clause, so it fires unconditionally.
 	_, err = db.ExecContext(ctx, `UPDATE user_activity SET ts = ts`)
 	require.Error(t, err, "self-assign UPDATE must also be blocked")
+
+	var v2ID int64
+	err = db.QueryRowContext(ctx, `INSERT INTO user_activity_v2
+		(ts, user_id, user_id_type, platform, action, outcome, detail_json, prev_hash, self_hash, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		RETURNING id`,
+		1700000000000, "u_v2", "system", "api", "auth.login", "success", "{}", "", "hash-v2", 1700000000000+180*24*60*60*1000).
+		Scan(&v2ID)
+	require.NoError(t, err, "insert into lifecycle-v2 audit chain")
+	_, err = db.ExecContext(ctx, `UPDATE user_activity_v2 SET expires_at=0 WHERE id=$1`, v2ID)
+	require.Error(t, err, "lifecycle-v2 audit updates must be rejected")
+	_, err = db.ExecContext(ctx, `DELETE FROM user_activity_v2 WHERE id=$1`, v2ID)
+	require.Error(t, err, "unanchored lifecycle-v2 audit deletes must be rejected")
+	_, err = db.ExecContext(ctx, `INSERT INTO audit_chain_checkpoints_v2 (pruned_at, last_self_hash, next_id) VALUES ($1, $2, $3)`,
+		time.Now().UnixMilli(), "hash-v2", v2ID+1)
+	require.NoError(t, err, "checkpoint must anchor the lifecycle-v2 prefix")
+	_, err = db.ExecContext(ctx, `DELETE FROM user_activity_v2 WHERE id=$1`, v2ID)
+	require.NoError(t, err, "checkpoint-anchored lifecycle-v2 cleanup must be allowed")
 }
 
 // TestMigrations_PG_030AuditNoDelete_BlocksUnauthorizedRowDeletes is the

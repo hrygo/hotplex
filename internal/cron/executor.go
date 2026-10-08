@@ -300,7 +300,15 @@ func (e *Executor) Execute(
 func (e *Executor) terminateSession(sessionKey string) {
 	termCtx, cancel := context.WithTimeout(context.Background(), base.GracefulShutdownTimeout)
 	defer cancel()
-	if termErr := e.sm.Transition(termCtx, sessionKey, events.StateTerminated); termErr != nil {
+	var termErr error
+	if reasoned, ok := e.sm.(interface {
+		TransitionWithReason(context.Context, string, events.SessionState, string) error
+	}); ok {
+		termErr = reasoned.TransitionWithReason(termCtx, sessionKey, events.StateTerminated, "cron_complete")
+	} else {
+		termErr = e.sm.Transition(termCtx, sessionKey, events.StateTerminated)
+	}
+	if termErr != nil {
 		e.log.Warn("cron executor: failed to terminate session", "session_id", sessionKey, "err", termErr)
 	}
 }

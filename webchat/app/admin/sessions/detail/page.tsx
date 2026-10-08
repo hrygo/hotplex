@@ -781,7 +781,7 @@ export default function SessionDetailPage() {
               {activities.length > 0 ? (
                 <div className="space-y-2.5">
                   {activities.map((act) => (
-                    <div key={act.id} className="p-4 rounded-[var(--radius-md)] bg-[var(--bg-hover)] border border-[var(--border-subtle)] flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs">
+                    <div key={`${act.chain_epoch ?? 'legacy'}:${act.id}`} className="p-4 rounded-[var(--radius-md)] bg-[var(--bg-hover)] border border-[var(--border-subtle)] flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs">
                       <div className="space-y-1">
                         <div className="flex items-center gap-2">
                           <span className="font-bold text-[var(--text-primary)] font-mono">{act.action}</span>

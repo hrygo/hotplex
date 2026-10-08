@@ -12,7 +12,7 @@ description: 用户行为审计系统、不可变存储、跨渠道身份追踪�
 
 ## 1. 审计系统概览
 
-HotPlex 内建**用户行为审计子系统**（`user_activity`），对所有用户操作产生不可篡改的审计记录。该系统采用 **SHA-256 Hash Chain + Append-only 存储**设计，确保审计日志的完整性和不可抵赖性。
+HotPlex 内建**用户行为审计子系统**，对用户操作产生不可篡改的审计记录。生命周期 v2 将新事实写入独立的 `user_activity_v2` 链；升级前的 `user_activity` 是 legacy 链。两条链都采用 **SHA-256 Hash Chain + Append-only 存储**。
 
 ### 1.1 核心设计
 
@@ -54,9 +54,9 @@ HotPlex 内建**用户行为审计子系统**（`user_activity`），对所有�
 |------|------------|------|
 | 认证 | `auth.login` / `auth.logout` / `auth.apikey_used` / `auth.denied` | 凭证登录/登出、API Key 使用、认证拒绝（`auth.token_validated` 常量保留但不再触发） |
 | Session | `session.create` / `session.delete` | 会话创建与删除 |
-| 消息 | `message.inbound` | 入站消息（含消息文本内容） |
-| 交互授权 | `permission.response` / `question.response` / `elicitation.response` | 用户响应工具授权/提问/MCP 引导（含决策结果 allow/deny 及 ID） |
-| Tool | `tool.call` | Worker 工具调用（敏感工具全量记录，非敏感工具记录摘要） |
+| 消息 | `message.inbound` | 入站消息事实，不记录消息正文 |
+| 交互授权 | `permission.response` / `question.response` / `elicitation.response` | 用户响应工具授权/提问/MCP 引导（只记录关联 ID、决策结果或受限 action） |
+| Tool | `tool.call` | Worker 工具调用事实（只记录受限工具名和调用状态） |
 | Admin | `admin.*` | 所有管理操作（Bot/ApiKey/Cron/Session 等的 CRUD） |
 | 系统 | `system.audit_config_changed` / `system.audit_export` | 审计配置变更、审计数据导出 |
 
@@ -104,6 +104,11 @@ audit:
   sinks:
     - name: log
       type: log           # 输出到结构化日志（推荐用于起步阶段）
+
+lifecycle:
+  audit:
+    capture_content: false
+    facts_retention: 4320h # lifecycle-v2 新审计事实保留 180 天
 ```
 
 > 更多配置项见 [配置参考](../../reference/configuration.md)。
@@ -117,10 +122,11 @@ audit:
 | 配置项 | 类型 | 默认值 | 环境变量 | 说明 |
 |--------|------|--------|----------|------|
 | `audit.enabled` | bool | `true` | `HOTPLEX_AUDIT_ENABLED` | 是否启用审计系统 |
-| `audit.retention` | duration | `26280h`（3 年） | `HOTPLEX_AUDIT_RETENTION` | 审计记录保留时长 |
+| `audit.retention` | duration | `26280h`（3 年） | `HOTPLEX_AUDIT_RETENTION` | legacy `user_activity` 链和升级前旧记录的保留时长 |
 | `audit.full_content_retention` | duration | `2160h`（90 天） | `HOTPLEX_AUDIT_FULL_CONTENT_RETENTION` | 兼容配置字段；不影响 event store 或 turns 的留存 |
+| `lifecycle.audit.facts_retention` | duration | `4320h`（180 天） | `HOTPLEX_LIFECYCLE_AUDIT_FACTS_RETENTION` | 新写入 lifecycle-v2 `user_activity_v2` 事实的最低保留时长；到期时间随记录写入并纳入哈希，改配置只影响之后的新记录 |
 
-**事件与审计留存相互独立**：event store 与 turns 只按 `events.retention` 清理；入站消息原文由 audit 记录保留并按 `audit.retention` 独立清理。`audit.full_content_retention` 为兼容字段，不会延长 event/turn 副本或 `event_ref` 的可用时间。
+**事件与审计留存相互独立**：event store 与 turns 使用自己的内容期限；legacy 审计链按 `audit.retention` 清理，v2 新事实链在写入时按 `lifecycle.audit.facts_retention` 固定到期时间。新写入的 `message.inbound`、交互响应和 `tool.call` 不含消息正文、答案或工具输入。两条链分别验证、分别使用 checkpoint；Admin 活动查询合并显示并通过 `chain_epoch` 标明来源。`audit.full_content_retention` 为兼容字段，不会延长 event/turn 副本或 `event_ref` 的可用时间。
 
 ### 3.2 Collector 调优
 
@@ -169,6 +175,7 @@ audit:
 | 配置项 | 生效方式 | 说明 |
 |--------|----------|------|
 | `audit.retention` | **热重载** | 立即应用，下一次 GC tick 使用新值 |
+| `lifecycle.audit.facts_retention` | **需重启** | 固定之后新写入 v2 事实的到期时间；已有记录期限不变 |
 | `audit.collector.batch_size` | **热重载** | 立即应用 |
 | `audit.collector.batch_interval` | **热重载**（⚠️ 实际需重启） | 变更会被记录，但刷写器需重启才能生效 |
 | `audit.enabled` | **需重启** | 禁止热关闭，防止管理员在审计盲区操作 |
@@ -192,8 +199,8 @@ audit:
 | `auth.denied` | 无 / 无效凭证（HTTP 请求 + WS upgrade） | denied | 匿名拒绝（含 IP + UA） |
 | `session.create` | 创建新会话 | success | 会话建立 |
 | `session.delete` | 删除会话 | success | 会话清理 |
-| `message.inbound` | 入站消息 | success | 消息接收（含文本内容） |
-| `tool.call` | Worker 工具调用 | success | 工具执行记录 |
+| `message.inbound` | 入站消息 | success | 消息接收事实，不含消息正文 |
+| `tool.call` | Worker 工具调用 | success | 受限工具名和调用状态，不含工具输入 |
 | `admin.*` | Admin API 写操作 | success / failure | 管理操作（见 §4.6） |
 | `system.audit_config_changed` | 审计配置变更 | success | 配置变更 diff 追溯 |
 | `system.audit_export` | 导出审计数据 | success / failure | 导出成功或失败 |
@@ -221,26 +228,11 @@ audit:
 
 ### 4.4 消息事件
 
-`message.inbound` 在 Gateway 收到入站消息时触发，**记录消息文本内容**到 `detail_json`。所有平台（飞书、Slack、WebChat、Cron）的入站消息统一记录。
+`message.inbound` 在 Gateway 收到入站消息时触发。所有平台（飞书、Slack、WebChat、Cron）统一记录事件时间、用户、平台、Session 和结果；`detail_json` 固定为空对象 `{}`，不保存消息文本或其摘要。
 
 ### 4.5 Tool Call 事件
 
-Worker 每次执行工具调用时触发 `tool.call`。根据工具敏感性采用不同记录策略：
-
-**敏感工具**（存储完整输入 + PII 脱敏）：
-
-| 工具名 | 说明 |
-|--------|------|
-| `Bash` / `bash` | Shell 命令执行 |
-| `Write` / `write` | 文件写入 |
-| `Edit` / `edit` | 文件编辑 |
-| `MultiEdit` / `multiedit` | 多文件编辑 |
-| `WebFetch` / `webfetch` | 网页抓取 |
-| `WebSearch` / `websearch` | 网络搜索 |
-
-**非敏感工具**（仅存储 SHA-256 摘要 + 200 字符预览）：
-
-其余所有工具仅记录 `input_sha256` + 截断预览（200 字符），兼顾审计覆盖与隐私保护。
+Worker 每次执行工具调用时触发 `tool.call`。当前只记录受限标识符形式的工具名和调用状态；未知或不符合标识符规则的工具名记作 `unknown`。工具参数、标题、内容摘要和预览都不会写入审计记录。
 
 ### 4.6 Admin 操作事件
 
@@ -324,14 +316,14 @@ Row 3:
 
 ### 5.3 保留与 GC
 
-审计记录默认保留 **3 年**（`audit.retention: 26280h`）。GC 过程在单个数据库事务中原子执行：
+legacy 审计记录默认保留 **3 年**（`audit.retention: 26280h`）；生命周期 v2 新事实默认保留 **180 天**（`lifecycle.audit.facts_retention: 4320h`）。legacy 链依据当前配置和记录时间计算清理边界；v2 链在写入时保存并哈希保护每条记录的 `expires_at`，GC 只删除已到期的连续前缀。哈希链只能安全地剪除前缀，因此某条未到期记录会暂时挡住后续已到期记录的删除。修改 v2 配置只改变之后写入记录的期限，不会缩短或延长已存在记录。两条链分别运行 GC，不能通过缩短 legacy 保留期来代替 v2 清理。每条链的 GC 都在单个数据库事务中原子执行：
 
-1. 计算 cutoff 时间点（`now - retention`）
-2. 在写事务中找到 cutoff 前最后一条记录的 ID
-3. **先在事务内写入 Checkpoint（锚定待删前缀），再删除**——顺序即 `trg_ua_no_delete` 触发器契约；若表被清空则追加一条 `LastSelfHash=""` 的修正 Checkpoint，使下一条记录成为新创世
+1. legacy 链根据 `audit.retention` 计算 cutoff；v2 链选择 `expires_at` 已到期的记录边界
+2. 在写事务中找到该边界之前最后一条记录的 ID
+3. **先在事务内写入对应链的 Checkpoint（锚定待删前缀），再删除**——顺序符合该链的删除触发器契约；若表被清空则追加一条 `LastSelfHash=""` 的修正 Checkpoint，使下一条记录成为新创世
 4. 提交事务
 
-> **SQLite** 通过 `writeMu` 串行化，**PostgreSQL** 通过 `pg_advisory_xact_lock(819207)` 串行化，确保 GC 与写入不会产生竞态（C1/C2 race 已由单事务收口）。
+> **SQLite** 通过 `writeMu` 串行化；**PostgreSQL** 的 legacy 与 v2 链分别使用 `pg_advisory_xact_lock(819207)` 和 `pg_advisory_xact_lock(819208)`，确保各链 GC 与写入不会产生竞态（C1/C2 race 已由单事务收口）。
 
 ### 5.4 后台 Verifier
 
@@ -387,27 +379,18 @@ Spill 文件使用二进制格式（4-byte BE length + JSON payload），崩溃�
 
 ### 6.2 写入时凭证遮罩
 
-Tool Call 的敏感工具输入在写入审计表前，自动进行凭证遮罩：
-
-| 模式 | 遮罩规则 | 示例 |
-|------|----------|------|
-| API Key 前缀 | `hpk_*` / `sk-*` / `AKIA*` | `sk-abc123...` → `sk-a***************` |
-| GitHub Token | `ghp_*` / `gho_*` / `ghs_*` | `ghp_xxxx...` → `ghp_x*********************` |
-| Slack Token | `xox[baprs]-*` | `xoxb-12345-...` → `xoxb-1****************************` |
-| Bearer Token | `Bearer` 后的值 | `Bearer abc123` → `Bearer [REDACTED]` |
-| 私钥块 | `-----BEGIN ... PRIVATE KEY-----` | 整个块替换为 `[REDACTED]` |
-| URL 凭证 | `https://user:pass@host` | 密码部分替换 |
-| 赋值模式 | `password=...` / `token: ...` | 值部分替换 |
+当前 `tool.call` 不写入工具输入，因此新记录没有工具参数需要遮罩。升级前已经存在的旧审计行不会被重写；它们可能包含旧版记录的内容，并按 `audit.retention` 到期清理。
 
 ### 6.3 内容存储策略
 
-| 事件类型 | detail_json 内容 | drill-down |
-|----------|-----------------|------------|
-| `message.inbound` | `content` 保留消息原文，按 `audit.retention` 独立留存 | `event_ref` 若存在仅关联 events/turns，并只在 `events.retention` 窗口内可用 |
-| 其他标准事件 | 摘要 + SHA-256 | `event_ref` 若存在仅作短期运行事实关联 |
-| 敏感行为 | 完整上下文直接存储 | 无需 drill-down |
+| 事件类型 | 当前新写入的 detail 内容 | drill-down |
+|----------|--------------------------|------------|
+| `message.inbound` | `{}`，不含正文、摘要或预览 | `event_ref` 若存在仅关联 events/turns，并只在 `events.retention` 窗口内可用 |
+| 交互响应 | 关联 ID、allow/deny 结果或受限 elicitation action | 不保存回答正文或原因 |
+| `tool.call` | 受限工具名与调用状态 | 不保存工具参数、摘要或预览 |
+| 其他标准事件 | 按各事件的字段白名单记录 | `event_ref` 若存在仅作短期运行事实关联 |
 
-**敏感行为**（直接存储完整上下文）包括：认证失败、敏感工具调用、权限拒绝、Worker 崩溃/超时。
+此前写入 legacy 链的旧审计行不会因升级自动脱敏或删除其中的内容；它们仍受 `audit.retention` 管理。新事实进入无正文的 v2 链。`audit.full_content_retention` 只是兼容字段，不提供独立正文清理。
 
 ### 6.4 CSV 导出安全
 
@@ -853,7 +836,7 @@ groups:
 - [ ] **审计系统**：确认 `audit.enabled: true`（默认开启），生产环境**禁止关闭**
 - [ ] **Hash Chain 告警**：配置 `AuditChainBroken` 告警规则，确保链断裂在 5 分钟内通知
 - [ ] **Spill 监控**：配置 `AuditSpillRateHigh` 告警，高并发场景适当调大 `channel_cap`
-- [ ] **保留期**：根据合规要求分别调整 `audit.retention`（默认 3 年）与 `events.retention`（默认 30 天）；`audit.full_content_retention`（默认 90 天）仅为兼容字段
+- [ ] **保留期**：根据合规要求分别调整 `audit.retention`（legacy 链默认 3 年）、`lifecycle.audit.facts_retention`（新链默认 180 天）与 `events.retention`（默认 30 天）；`audit.full_content_retention`（默认 90 天）仅为兼容字段
 - [ ] **身份链接**：为跨平台用户创建 Identity Link，确保跨渠道审计查询完整
 - [ ] **Sink 投递**：生产环境配置 Webhook Sink 接入 SIEM，不要使用 noop 默认值
 - [ ] **导出归档**：定期导出审计数据（JSON/CSV）并归档，满足合规审查要求

@@ -59,6 +59,14 @@ func (m *mockAPISM) Get(_ context.Context, id string) (*session.SessionInfo, err
 	return args.Get(0).(*session.SessionInfo), args.Error(1)
 }
 
+func (m *mockAPISM) GetPurgeStatus(ctx context.Context, sessionID, userID string) (*session.PurgeStatus, error) {
+	args := m.Called(ctx, sessionID, userID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*session.PurgeStatus), args.Error(1)
+}
+
 func (m *mockAPISM) GetWorker(id string) worker.Worker {
 	args := m.Called(id)
 	if args.Get(0) == nil {
@@ -206,6 +214,18 @@ func (m *mockTurnsStore) LatestSeq(ctx context.Context, sessionID string) (int64
 	return args.Get(0).(int64), args.Error(1)
 }
 
+type mockAPIEventStore struct {
+	mock.Mock
+}
+
+func (m *mockAPIEventStore) QueryBySession(ctx context.Context, sessionID string, cursor int64, dir eventstore.CursorDirection, limit int) (*eventstore.EventPage, error) {
+	args := m.Called(ctx, sessionID, cursor, dir, limit)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*eventstore.EventPage), args.Error(1)
+}
+
 // ─── Test helpers ───────────────────────────────────────────────────────────────
 
 func newTestAuth(t *testing.T) *security.Authenticator {
@@ -268,8 +288,10 @@ func setupMux(api *GatewayAPI) *http.ServeMux {
 	mux.HandleFunc("POST /api/sessions", api.CreateSession)
 	mux.HandleFunc("GET /api/sessions/{id}", api.GetSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", api.DeleteSession)
+	mux.HandleFunc("GET /api/sessions/{id}/cleanup", api.GetSessionCleanupStatus)
 	mux.HandleFunc("POST /api/sessions/{id}/cd", api.SwitchWorkDir)
 	mux.HandleFunc("GET /api/sessions/{id}/history", api.GetHistory)
+	mux.HandleFunc("GET /api/sessions/{id}/events", api.GetEvents)
 	mux.HandleFunc("GET /api/workers", api.ListWorkers)
 	return mux
 }
@@ -380,7 +402,7 @@ func TestCreateSession_IdempotentActiveSession(t *testing.T) {
 	bridge.AssertNotCalled(t, "StartSession", mock.Anything)
 }
 
-func TestCreateSession_DeletedSessionRecreated(t *testing.T) {
+func TestCreateSession_DeletedSessionCannotBeReused(t *testing.T) {
 	t.Parallel()
 	sm := new(mockAPISM)
 	bridge := new(mockAPIBridge)
@@ -388,15 +410,13 @@ func TestCreateSession_DeletedSessionRecreated(t *testing.T) {
 
 	deleted := &session.SessionInfo{ID: "deleted-id", State: events.StateDeleted}
 	sm.On("Get", mock.Anything).Return(deleted, nil)
-	sm.On("DeletePhysical", mock.Anything, mock.Anything).Return(nil)
-	bridge.On("StartSession", mock.Anything, mock.Anything).Return(nil)
 
 	w := httptest.NewRecorder()
 	api.CreateSession(w, authedReq("POST", "/api/sessions?workspace_id=ws-test&client_session_id=test-csid&title=test", nil))
 
-	require.Equal(t, http.StatusOK, w.Code)
-	sm.AssertCalled(t, "DeletePhysical", mock.Anything, mock.Anything)
-	bridge.AssertExpectations(t)
+	require.Equal(t, http.StatusGone, w.Code)
+	sm.AssertNotCalled(t, "DeletePhysical", mock.Anything, mock.Anything)
+	bridge.AssertNotCalled(t, "StartSession", mock.Anything, mock.Anything)
 }
 
 func TestCreateSession_BridgeError(t *testing.T) {
@@ -537,42 +557,39 @@ func TestCreateSession_WorkDirFromWorkspace(t *testing.T) {
 
 // ─── DeleteSession tests ────────────────────────────────────────────────────────
 
-func TestDeleteSession_GracefulTermination(t *testing.T) {
+func TestDeleteSession_UsesLifecycleDelete(t *testing.T) {
 	t.Parallel()
 	sm := new(mockAPISM)
 	bridge := new(mockAPIBridge)
 	api := newTestAPI(t, sm, bridge)
 
 	sm.On("Get", "sess-1").Return(&session.SessionInfo{ID: "sess-1", UserID: "anonymous"}, nil)
-	sm.On("Transition", mock.Anything, "sess-1", events.StateTerminated).Return(nil)
-	sm.On("DeletePhysical", mock.Anything, "sess-1").Return(nil)
+	sm.On("Delete", mock.Anything, "sess-1").Return(nil)
 
 	mux := setupMux(api)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, authedReq("DELETE", "/api/sessions/sess-1", nil))
 
 	require.Equal(t, http.StatusNoContent, w.Code)
-	sm.AssertCalled(t, "Transition", mock.Anything, "sess-1", events.StateTerminated)
-	sm.AssertCalled(t, "DeletePhysical", mock.Anything, "sess-1")
+	sm.AssertCalled(t, "Delete", mock.Anything, "sess-1")
+	sm.AssertNotCalled(t, "DeletePhysical", mock.Anything, "sess-1")
 }
 
-func TestDeleteSession_TransitionFailsStillDeletes(t *testing.T) {
+func TestDeleteSession_DeleteFailureReturnsError(t *testing.T) {
 	t.Parallel()
 	sm := new(mockAPISM)
 	bridge := new(mockAPIBridge)
 	api := newTestAPI(t, sm, bridge)
 
 	sm.On("Get", "sess-2").Return(&session.SessionInfo{ID: "sess-2", UserID: "anonymous"}, nil)
-	sm.On("Transition", mock.Anything, "sess-2", events.StateTerminated).Return(errTestBridge)
-	sm.On("DeletePhysical", mock.Anything, "sess-2").Return(nil)
+	sm.On("Delete", mock.Anything, "sess-2").Return(errTestBridge)
 
 	mux := setupMux(api)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, authedReq("DELETE", "/api/sessions/sess-2", nil))
 
-	// Transition failure is tolerated; delete still proceeds
-	require.Equal(t, http.StatusNoContent, w.Code)
-	sm.AssertCalled(t, "DeletePhysical", mock.Anything, "sess-2")
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	sm.AssertCalled(t, "Delete", mock.Anything, "sess-2")
 }
 
 func TestDeleteSession_MissingID(t *testing.T) {
@@ -587,6 +604,46 @@ func TestDeleteSession_MissingID(t *testing.T) {
 
 	// No {id} match → 404 from mux (no path value)
 	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestGetSessionCleanupStatusUsesOwnershipSnapshot(t *testing.T) {
+	t.Parallel()
+	sm := new(mockAPISM)
+	bridge := new(mockAPIBridge)
+	status := &session.PurgeStatus{
+		JobID: "purge-1", SessionID: "sess-deleted",
+		Status: session.PurgeJobInProgress, WorkspaceID: "ws-test",
+		Items: []session.PurgeItemStatus{{
+			Kind: session.PurgeItemConversationContent, Status: session.PurgeItemPending,
+		}},
+	}
+	sm.On("GetPurgeStatus", mock.Anything, "sess-deleted", "anonymous").Return(status, nil).Once()
+	api := newTestAPIWithWorkspace(t, sm, bridge, ownedWorkspaceMock("anonymous", "/tmp/project"))
+	w := httptest.NewRecorder()
+	setupMux(api).ServeHTTP(w, authedReq("GET", "/api/sessions/sess-deleted/cleanup", nil))
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	require.Equal(t, "purge-1", body["job_id"])
+	require.Equal(t, "in_progress", body["status"])
+	require.NotContains(t, body, "workspace_id",
+		"the persisted authorization snapshot is not part of the public response")
+	sm.AssertExpectations(t)
+}
+
+func TestGetSessionCleanupStatusHidesOtherOwners(t *testing.T) {
+	t.Parallel()
+	sm := new(mockAPISM)
+	bridge := new(mockAPIBridge)
+	sm.On("GetPurgeStatus", mock.Anything, "sess-private", "anonymous").
+		Return(nil, session.ErrPurgeNotFound).Once()
+	api := newTestAPI(t, sm, bridge)
+	w := httptest.NewRecorder()
+	setupMux(api).ServeHTTP(w, authedReq("GET", "/api/sessions/sess-private/cleanup", nil))
+
+	require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+	sm.AssertExpectations(t)
 }
 
 // ─── ListSessions tests ─────────────────────────────────────────────────────────
@@ -776,6 +833,53 @@ func TestGetHistory_Success(t *testing.T) {
 	require.False(t, resp.HasMore)
 }
 
+func TestGetHistory_DeletedSessionIsHidden(t *testing.T) {
+	t.Parallel()
+	sm := new(mockAPISM)
+	bridge := new(mockAPIBridge)
+	ts := new(mockTurnsStore)
+	api := newTestAPIWithTurns(t, sm, bridge, ts)
+
+	sm.On("Get", "sess-deleted").Return(&session.SessionInfo{
+		ID: "sess-deleted", UserID: "anonymous", State: events.StateDeleted,
+	}, nil)
+
+	mux := setupMux(api)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, authedReq("GET", "/api/sessions/sess-deleted/history", nil))
+
+	require.Equal(t, http.StatusNotFound, w.Code)
+	ts.AssertNotCalled(t, "QueryLatestTurns", mock.Anything, mock.Anything, mock.Anything)
+}
+
+func TestGetHistory_ExpiredSessionStillUsesPerRecordExpiry(t *testing.T) {
+	t.Parallel()
+	sm := new(mockAPISM)
+	bridge := new(mockAPIBridge)
+	ts := new(mockTurnsStore)
+	api := newTestAPIWithTurns(t, sm, bridge, ts)
+
+	expiredAt := time.Now().Add(-time.Second)
+	sm.On("Get", "sess-1").Return(&session.SessionInfo{
+		ID: "sess-1", UserID: "anonymous", HistoryExpiresAt: &expiredAt,
+	}, nil)
+	ts.On("QueryLatestTurns", mock.Anything, "sess-1", 51).Return(nil, eventstore.ErrNotFound)
+
+	mux := setupMux(api)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, authedReq("GET", "/api/sessions/sess-1/history", nil))
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp struct {
+		Records []any `json:"records"`
+		HasMore bool  `json:"has_more"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Empty(t, resp.Records)
+	require.False(t, resp.HasMore)
+	ts.AssertExpectations(t)
+}
+
 func TestGetHistory_ReturnsClientMessageID(t *testing.T) {
 	t.Parallel()
 	sm := new(mockAPISM)
@@ -862,6 +966,36 @@ func TestGetHistory_NoRecords(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	require.Empty(t, resp.Records)
 	require.False(t, resp.HasMore)
+}
+
+func TestGetEvents_ExpiredSessionStillUsesPerRecordExpiry(t *testing.T) {
+	t.Parallel()
+	sm := new(mockAPISM)
+	bridge := new(mockAPIBridge)
+	api := newTestAPI(t, sm, bridge)
+	eventReader := new(mockAPIEventStore)
+	api.eventStore = eventReader
+
+	expiredAt := time.Now().Add(-time.Second)
+	sm.On("Get", "sess-1").Return(&session.SessionInfo{
+		ID: "sess-1", UserID: "anonymous", HistoryExpiresAt: &expiredAt,
+	}, nil)
+	eventReader.On("QueryBySession", mock.Anything, "sess-1", int64(0), eventstore.CursorLatest, 200).
+		Return(nil, eventstore.ErrNotFound)
+
+	mux := setupMux(api)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, authedReq("GET", "/api/sessions/sess-1/events", nil))
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp struct {
+		Events   []any `json:"events"`
+		HasOlder bool  `json:"has_older"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Empty(t, resp.Events)
+	require.False(t, resp.HasOlder)
+	eventReader.AssertExpectations(t)
 }
 
 func TestGetHistory_Unauthorized(t *testing.T) {

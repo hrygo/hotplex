@@ -28,6 +28,7 @@ type Config struct {
 	Events      EventsConfig    `mapstructure:"events"`
 	Audit       AuditConfig     `mapstructure:"audit"`
 	Execution   ExecutionConfig `mapstructure:"execution"`
+	Lifecycle   LifecycleConfig `mapstructure:"lifecycle"`
 	Inherits    string          `mapstructure:"inherits"` // path to parent config file; "" = no inheritance
 
 	// ResolvedAPIKeyUsers is the runtime map of expanded API key value → userID.
@@ -57,6 +58,9 @@ type ExecutionQueueConfig struct {
 	// MaxPayloadBytes caps one queued input's content, including a native
 	// command invocation's serialized arguments.
 	MaxPayloadBytes int `mapstructure:"max_payload_bytes"`
+	// InteractiveTTL is the lifetime of an accepted interactive input that
+	// cannot be dispatched immediately.
+	InteractiveTTL time.Duration `mapstructure:"interactive_ttl"`
 	// TTL is how long an undispatched input stays dispatchable.
 	TTL time.Duration `mapstructure:"ttl"`
 	// SweepInterval is how often expired inputs are settled. Zero disables the
@@ -65,6 +69,70 @@ type ExecutionQueueConfig struct {
 	// SweepBatch bounds one sweep so a large backlog cannot hold the write
 	// lock long enough to stall live input.
 	SweepBatch int `mapstructure:"sweep_batch"`
+}
+
+// LifecycleConfig defines retention defaults for newly accepted lifecycle data.
+// Existing rows keep the policy revision and deadlines assigned when written.
+type LifecycleConfig struct {
+	Policy        string                       `mapstructure:"policy"`
+	Conversation  LifecycleConversationConfig  `mapstructure:"conversation"`
+	Content       LifecycleContentConfig       `mapstructure:"content"`
+	EffectPayload LifecycleEffectPayloadConfig `mapstructure:"effect_payload"`
+	Facts         LifecycleFactsConfig         `mapstructure:"facts"`
+	Audit         LifecycleAuditConfig         `mapstructure:"audit"`
+	Media         LifecycleMediaConfig         `mapstructure:"media"`
+	Trace         LifecycleTraceConfig         `mapstructure:"trace"`
+	GC            LifecycleGCConfig            `mapstructure:"gc"`
+}
+
+const (
+	LifecyclePolicyLegacy = "legacy"
+	LifecyclePolicyV2     = "v2"
+)
+
+// LifecycleConversationConfig defines archive and conversation expiry clocks.
+type LifecycleConversationConfig struct {
+	ArchiveAfter            time.Duration `mapstructure:"archive_after"`
+	RetentionAfterLastInput time.Duration `mapstructure:"retention_after_last_input"`
+}
+
+// LifecycleContentConfig defines per-message body retention.
+type LifecycleContentConfig struct {
+	Retention time.Duration `mapstructure:"retention"`
+}
+
+// LifecycleEffectPayloadConfig defines retention for delivery payload copies.
+type LifecycleEffectPayloadConfig struct {
+	RetentionAfterSettlement time.Duration `mapstructure:"retention_after_settlement"`
+}
+
+// LifecycleFactsConfig defines retention for execution and delivery facts.
+type LifecycleFactsConfig struct {
+	RetentionAfterSettlement time.Duration `mapstructure:"retention_after_settlement"`
+}
+
+// LifecycleAuditConfig defines audit capture behavior and independent retention.
+type LifecycleAuditConfig struct {
+	CaptureContent   bool          `mapstructure:"capture_content"`
+	FactsRetention   time.Duration `mapstructure:"facts_retention"`
+	ContentRetention time.Duration `mapstructure:"content_retention"`
+}
+
+// LifecycleMediaConfig defines retention for cached media copies.
+type LifecycleMediaConfig struct {
+	Retention time.Duration `mapstructure:"retention"`
+}
+
+// LifecycleTraceConfig defines retention for diagnostic traces.
+type LifecycleTraceConfig struct {
+	Retention time.Duration `mapstructure:"retention"`
+}
+
+// LifecycleGCConfig controls bounded lifecycle cleanup work.
+type LifecycleGCConfig struct {
+	BatchSize int           `mapstructure:"batch_size"`
+	Interval  time.Duration `mapstructure:"interval"`
+	MaxLag    time.Duration `mapstructure:"max_lag"`
 }
 
 // MessagingConfig holds messaging platform adapter settings.
@@ -781,9 +849,9 @@ type SecurityConfig struct {
 	CookieSameSite string `mapstructure:"cookie_same_site"`
 }
 
-// SessionConfig holds session lifecycle settings.
+// SessionConfig holds legacy session lifecycle settings.
 type SessionConfig struct {
-	RetentionPeriod   time.Duration `mapstructure:"retention_period"`    // max session lifetime (default 7d)
+	RetentionPeriod   time.Duration `mapstructure:"retention_period"`    // legacy session expiry (default 7d)
 	GCScanInterval    time.Duration `mapstructure:"gc_scan_interval"`    // GC scan interval (default 1m)
 	MaxConcurrent     int           `mapstructure:"max_concurrent"`      // max concurrent sessions
 	TermRetention     time.Duration `mapstructure:"term_retention"`      // DB retention for terminated sessions (default 7d)
@@ -833,7 +901,7 @@ type CronConfig struct {
 
 // EventsConfig holds event and turn retention settings.
 type EventsConfig struct {
-	Retention time.Duration `mapstructure:"retention"` // TTL for events + turns, default 720h (30 days)
+	Retention time.Duration `mapstructure:"retention"` // Fallback TTL for legacy event/turn rows without per-record expiry, default 720h (30 days)
 }
 
 // AuditConfig holds user behavior audit system settings.
@@ -845,10 +913,10 @@ type AuditConfig struct {
 	Sinks                []AuditSinkConfig    `mapstructure:"sinks"`
 }
 
-// EffectiveEventsRetention computes the events/turns TTL to use at startup.
-// Audit keeps its plaintext independently, so full_content_retention never
-// extends this short-lived operational copy. A zero events.retention falls back
-// to the package default (720h).
+// EffectiveEventsRetention computes the fallback TTL for legacy event/turn
+// rows that predate persisted per-record expiry. New rows use
+// lifecycle.content.retention. Audit keeps its plaintext independently, so
+// full_content_retention does not change either event/turn deadline.
 func EffectiveEventsRetention(cfg *Config) time.Duration {
 	if cfg == nil {
 		return 720 * time.Hour
@@ -858,6 +926,22 @@ func EffectiveEventsRetention(cfg *Config) time.Duration {
 		ev = 720 * time.Hour // 30 days, matches Default()
 	}
 	return ev
+}
+
+// EffectiveTurnTimeout returns the absolute turn limit. Lifecycle v2 preserves
+// the historical zero-value configuration as the confirmed 30 minute default;
+// legacy policy retains zero as an explicit disabled value.
+func EffectiveTurnTimeout(cfg *Config) time.Duration {
+	if cfg == nil {
+		return 30 * time.Minute
+	}
+	if cfg.Worker.TurnTimeout > 0 {
+		return cfg.Worker.TurnTimeout
+	}
+	if cfg.Lifecycle.Policy == LifecyclePolicyV2 {
+		return 30 * time.Minute
+	}
+	return cfg.Worker.TurnTimeout
 }
 
 // AuditCollectorConfig holds audit event collector tuning parameters.

@@ -77,9 +77,46 @@ const (
 	CursorBefore
 )
 
-var ErrNotFound = errors.New("eventstore: no events found")
+var (
+	ErrNotFound       = errors.New("eventstore: no events found")
+	ErrSessionDeleted = errors.New("eventstore: session has been deleted")
+)
 
 const defaultTimeout = 5 * time.Second
+const defaultLegacyContentRetention = 720 * time.Hour
+
+// RetentionPolicy separates immutable deadlines assigned to newly written
+// content from the fallback window used for rows written before those
+// deadlines were persisted.
+type RetentionPolicy struct {
+	Content time.Duration
+	Legacy  time.Duration
+}
+
+func (p RetentionPolicy) normalized() RetentionPolicy {
+	if p.Content < 0 {
+		p.Content = 0
+	}
+	if p.Legacy <= 0 {
+		p.Legacy = defaultLegacyContentRetention
+	}
+	return p
+}
+
+func (p RetentionPolicy) expiry(createdAt, existingExpiry int64) int64 {
+	if existingExpiry > 0 {
+		return existingExpiry
+	}
+	if p.Content <= 0 || createdAt <= 0 {
+		return 0
+	}
+	return createdAt + p.Content.Milliseconds()
+}
+
+func (p RetentionPolicy) readWindow(now time.Time) (nowMS, legacyCutoffMS int64) {
+	p = p.normalized()
+	return now.UnixMilli(), now.Add(-p.Legacy).UnixMilli()
+}
 
 // withDefaultTimeout wraps ctx with a 5s timeout if it has no deadline.
 func withDefaultTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -160,6 +197,7 @@ type StoredEvent struct {
 	Direction string          `json:"direction"`
 	Source    string          `json:"source"`
 	CreatedAt int64           `json:"created_at"`
+	ExpiresAt int64           `json:"-"`
 }
 
 // EventPage is a page of events with pagination metadata.
@@ -191,8 +229,9 @@ type EventStore interface {
 	// DeleteBySession removes all events for a session.
 	DeleteBySession(ctx context.Context, sessionID string) error
 
-	// DeleteExpired removes events older than the cutoff.
-	DeleteExpired(ctx context.Context, cutoff time.Time) (int64, error)
+	// DeleteExpired removes expired per-record events and legacy rows older
+	// than the supplied fallback cutoff.
+	DeleteExpired(ctx context.Context, legacyCutoff time.Time) (int64, error)
 
 	// Close flushes pending writes and closes the database (if owned).
 	Close() error
@@ -232,7 +271,7 @@ type TurnQuerier interface {
 	QueryTurnStats(ctx context.Context, sessionID string) (*TurnStats, error)
 	LatestGeneration(ctx context.Context, sessionID string) (int64, error)
 	LatestTurnNum(ctx context.Context, sessionID string, generation int64) (int, error)
-	DeleteExpiredTurns(ctx context.Context, cutoff time.Time) (int64, error)
+	DeleteExpiredTurns(ctx context.Context, legacyCutoff time.Time) (int64, error)
 	// LatestSeq returns the maximum event seq persisted for a session, or 0 if
 	// none. Used to hydrate the in-memory SeqGen on resume/reconnect so new
 	// events do not collide with the prior seq range (issue #879).
@@ -241,9 +280,10 @@ type TurnQuerier interface {
 
 // SQLiteStore implements EventStore using a shared SQLite database connection.
 type SQLiteStore struct {
-	db      *sql.DB
-	ownsDB  bool // true only when opened independently (tests); false when sharing session store DB.
-	writeMu *sqlutil.WriteMu
+	db        *sql.DB
+	ownsDB    bool // true only when opened independently (tests); false when sharing session store DB.
+	writeMu   *sqlutil.WriteMu
+	retention RetentionPolicy
 }
 
 var _ EventStore = (*SQLiteStore)(nil)
@@ -251,7 +291,13 @@ var _ EventStore = (*SQLiteStore)(nil)
 // NewSQLiteStore creates an event store using a shared *sql.DB.
 // The schema is managed by the session store goose migrations (002_events_table.sql).
 func NewSQLiteStore(db *sql.DB, writeMu *sqlutil.WriteMu) *SQLiteStore {
-	return &SQLiteStore{db: db, ownsDB: false, writeMu: writeMu}
+	return NewSQLiteStoreWithRetention(db, writeMu, RetentionPolicy{})
+}
+
+// NewSQLiteStoreWithRetention creates a store with explicit content retention.
+// Existing rows retain their zero per-record deadline and use the legacy window.
+func NewSQLiteStoreWithRetention(db *sql.DB, writeMu *sqlutil.WriteMu, retention RetentionPolicy) *SQLiteStore {
+	return &SQLiteStore{db: db, ownsDB: false, writeMu: writeMu, retention: retention.normalized()}
 }
 
 // NewIndependentStore opens its own DB for testing.
@@ -263,20 +309,22 @@ func NewIndependentStore(dbPath string) (*SQLiteStore, error) {
 	// Apply same pragmas as production for test fidelity.
 	_, _ = db.Exec("PRAGMA journal_mode=WAL")
 	_, _ = db.Exec("PRAGMA busy_timeout=5000")
-	return &SQLiteStore{db: db, ownsDB: true}, nil
+	return &SQLiteStore{db: db, ownsDB: true, retention: RetentionPolicy{}.normalized()}, nil
 }
 
 func (s *SQLiteStore) Append(ctx context.Context, event *StoredEvent) error {
-	ctx, cancel := withDefaultTimeout(ctx)
-	defer cancel()
-	return s.writeMu.WithLock(func() error {
-		_, err := s.db.ExecContext(ctx, queries["insert"],
-			event.SessionID, event.Seq, event.Type, event.Data, event.Direction, event.Source, event.CreatedAt)
-		if err != nil {
-			return fmt.Errorf("eventstore: append: %w", err)
-		}
-		return nil
-	})
+	tx, err := s.BeginTx(ctx)
+	if err != nil {
+		return err
+	}
+	if err := tx.Append(ctx, event); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("eventstore: append: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLiteStore) BeginTx(ctx context.Context) (EventTx, error) {
@@ -295,14 +343,15 @@ func (s *SQLiteStore) BeginTx(ctx context.Context) (EventTx, error) {
 	// The cancel must NOT run here: this context drives the returned
 	// transaction, so cancelling it on return would abort the transaction
 	// before the caller's first statement. It is released with the tx instead.
-	return &sqliteTx{tx: tx, writeMu: s.writeMu, cancel: cancel}, nil
+	return &sqliteTx{tx: tx, writeMu: s.writeMu, cancel: cancel, retention: s.retention}, nil
 }
 
 type sqliteTx struct {
-	tx       *sql.Tx
-	writeMu  *sqlutil.WriteMu
-	released bool
-	cancel   context.CancelFunc
+	tx        *sql.Tx
+	writeMu   *sqlutil.WriteMu
+	released  bool
+	cancel    context.CancelFunc
+	retention RetentionPolicy
 }
 
 func (t *sqliteTx) release() {
@@ -334,15 +383,31 @@ func (t *sqliteTx) QueryRowContext(ctx context.Context, query string, args ...an
 }
 
 func (t *sqliteTx) Append(ctx context.Context, event *StoredEvent) error {
-	_, err := t.tx.ExecContext(ctx, queries["insert"],
-		event.SessionID, event.Seq, event.Type, event.Data, event.Direction, event.Source, event.CreatedAt)
+	if err := ensureSessionWritable(ctx, t.tx, event.SessionID, rebindEventSQL, false); err != nil {
+		return err
+	}
+	expiresAt, err := contentExpiryForSession(
+		ctx, t.tx, queries["lifecycle.get_content_policy"], t.retention,
+		event.SessionID, event.CreatedAt, event.ExpiresAt,
+	)
+	if err != nil {
+		return fmt.Errorf("eventstore: resolve content expiry: %w", err)
+	}
+	_, err = t.tx.ExecContext(ctx, queries["insert"],
+		event.SessionID, event.Seq, event.Type, event.Data, event.Direction, event.Source, event.CreatedAt, expiresAt)
 	if err != nil {
 		return fmt.Errorf("eventstore: tx append: %w", err)
+	}
+	if err := updateSessionContentDeadline(ctx, t.tx, queries["lifecycle.update_session_content_deadline"], event.SessionID, expiresAt); err != nil {
+		return fmt.Errorf("eventstore: tx update session content deadline: %w", err)
 	}
 	return nil
 }
 
 func (t *sqliteTx) AppendTurn(ctx context.Context, turn *TurnWriteRequest) error {
+	if err := ensureSessionWritable(ctx, t.tx, turn.SessionID, rebindEventSQL, false); err != nil {
+		return err
+	}
 	var successVal any
 	if turn.Success != nil {
 		if *turn.Success {
@@ -351,13 +416,23 @@ func (t *sqliteTx) AppendTurn(ctx context.Context, turn *TurnWriteRequest) error
 			successVal = 0
 		}
 	}
-	_, err := t.tx.ExecContext(ctx, queries["turns.insert"],
+	expiresAt, err := contentExpiryForSession(
+		ctx, t.tx, queries["lifecycle.get_content_policy"], t.retention,
+		turn.SessionID, turn.CreatedAt, turn.ExpiresAt,
+	)
+	if err != nil {
+		return fmt.Errorf("eventstore: resolve turn content expiry: %w", err)
+	}
+	_, err = t.tx.ExecContext(ctx, queries["turns.insert"],
 		turn.SessionID, nullableClientMessageID(turn.ClientMessageID), turn.Generation, turn.TurnNum, turn.Seq, turn.Role, turn.Content,
 		turn.Platform, turn.UserID, turn.Model, successVal, turn.Source, turn.ToolsJSON, turn.ToolCount,
 		turn.TokensInput, turn.TokensCacheWrite, turn.TokensCacheRead, turn.TokensOut,
-		turn.DurationMs, turn.CostUSD, turn.CreatedAt)
+		turn.DurationMs, turn.CostUSD, turn.CreatedAt, expiresAt)
 	if err != nil {
 		return fmt.Errorf("eventstore: tx append turn: %w", err)
+	}
+	if err := updateSessionContentDeadline(ctx, t.tx, queries["lifecycle.update_session_content_deadline"], turn.SessionID, expiresAt); err != nil {
+		return fmt.Errorf("eventstore: tx update session content deadline: %w", err)
 	}
 	return nil
 }
@@ -377,7 +452,8 @@ func (t *sqliteTx) Rollback() error {
 func (s *SQLiteStore) QueryBySession(ctx context.Context, sessionID string, cursor int64, dir CursorDirection, limit int) (*EventPage, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	return queryBySession(ctx, s.db, queries, sessionID, cursor, dir, limit)
+	nowMS, legacyCutoffMS := s.retention.readWindow(time.Now())
+	return queryBySession(ctx, s.db, queries, sessionID, cursor, dir, limit, nowMS, legacyCutoffMS)
 }
 
 func (s *SQLiteStore) DeleteBySession(ctx context.Context, sessionID string) error {
@@ -392,12 +468,31 @@ func (s *SQLiteStore) DeleteBySession(ctx context.Context, sessionID string) err
 	})
 }
 
-func (s *SQLiteStore) DeleteExpired(ctx context.Context, cutoff time.Time) (int64, error) {
+// DeleteConversationBySession atomically removes both event payloads and
+// materialized turns so a partial purge cannot leave a readable copy behind.
+func (s *SQLiteStore) DeleteConversationBySession(ctx context.Context, sessionID string) error {
+	tx, err := s.BeginTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, query := range []string{queries["delete_by_session"], queries["turns.delete_by_session"]} {
+		if _, err := tx.ExecContext(ctx, query, sessionID); err != nil {
+			return fmt.Errorf("eventstore: delete conversation: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("eventstore: commit conversation deletion: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) DeleteExpired(ctx context.Context, legacyCutoff time.Time) (int64, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
 	var rowsAffected int64
 	err := s.writeMu.WithLock(func() error {
-		res, err := s.db.ExecContext(ctx, queries["delete_expired"], cutoff.UnixMilli())
+		res, err := s.db.ExecContext(ctx, queries["delete_expired"], time.Now().UnixMilli(), legacyCutoff.UnixMilli())
 		if err != nil {
 			return fmt.Errorf("eventstore: delete expired: %w", err)
 		}
@@ -419,7 +514,8 @@ func (s *SQLiteStore) Close() error {
 func (s *SQLiteStore) QueryTurns(ctx context.Context, sessionID string, limit, offset int) ([]*TurnRecord, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	rows, err := s.db.QueryContext(ctx, queries["turns.query_with_gen"], sessionID, sessionID, limit, offset)
+	nowMS, legacyCutoffMS := s.retention.readWindow(time.Now())
+	rows, err := s.db.QueryContext(ctx, queries["turns.query_with_gen"], sessionID, sessionID, nowMS, legacyCutoffMS, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("eventstore: query turns: %w", err)
 	}
@@ -432,7 +528,8 @@ func (s *SQLiteStore) QueryTurns(ctx context.Context, sessionID string, limit, o
 func (s *SQLiteStore) QueryTurnsBefore(ctx context.Context, sessionID string, beforeID int64, limit int) ([]*TurnRecord, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	rows, err := s.db.QueryContext(ctx, queries["turns.query_before"], sessionID, beforeID, limit)
+	nowMS, legacyCutoffMS := s.retention.readWindow(time.Now())
+	rows, err := s.db.QueryContext(ctx, queries["turns.query_before"], sessionID, beforeID, nowMS, legacyCutoffMS, limit)
 	if err != nil {
 		return nil, fmt.Errorf("eventstore: query turns before: %w", err)
 	}
@@ -455,7 +552,8 @@ func (s *SQLiteStore) QueryTurnsBefore(ctx context.Context, sessionID string, be
 func (s *SQLiteStore) QueryLatestTurns(ctx context.Context, sessionID string, limit int) ([]*TurnRecord, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	rows, err := s.db.QueryContext(ctx, queries["turns.query_latest"], sessionID, sessionID, limit)
+	nowMS, legacyCutoffMS := s.retention.readWindow(time.Now())
+	rows, err := s.db.QueryContext(ctx, queries["turns.query_latest"], sessionID, sessionID, nowMS, legacyCutoffMS, limit)
 	if err != nil {
 		return nil, fmt.Errorf("eventstore: query latest turns: %w", err)
 	}
@@ -474,7 +572,8 @@ func (s *SQLiteStore) QueryLatestTurns(ctx context.Context, sessionID string, li
 func (s *SQLiteStore) QueryTurnStats(ctx context.Context, sessionID string) (*TurnStats, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
-	rows, err := s.db.QueryContext(ctx, queries["turns.stats_with_gen"], sessionID, sessionID)
+	nowMS, legacyCutoffMS := s.retention.readWindow(time.Now())
+	rows, err := s.db.QueryContext(ctx, queries["turns.stats_with_gen"], sessionID, sessionID, nowMS, legacyCutoffMS)
 	if err != nil {
 		return nil, fmt.Errorf("eventstore: query turn stats: %w", err)
 	}
@@ -521,13 +620,14 @@ func (s *SQLiteStore) LatestSeq(ctx context.Context, sessionID string) (int64, e
 	return seq, nil
 }
 
-// DeleteExpiredTurns removes turns older than the cutoff by created_at.
-func (s *SQLiteStore) DeleteExpiredTurns(ctx context.Context, cutoff time.Time) (int64, error) {
+// DeleteExpiredTurns removes expired per-record turns and legacy rows older
+// than the supplied fallback cutoff.
+func (s *SQLiteStore) DeleteExpiredTurns(ctx context.Context, legacyCutoff time.Time) (int64, error) {
 	ctx, cancel := withDefaultTimeout(ctx)
 	defer cancel()
 	var rowsAffected int64
 	err := s.writeMu.WithLock(func() error {
-		res, err := s.db.ExecContext(ctx, queries["turns.delete_expired"], cutoff.UnixMilli())
+		res, err := s.db.ExecContext(ctx, queries["turns.delete_expired"], time.Now().UnixMilli(), legacyCutoff.UnixMilli())
 		if err != nil {
 			return fmt.Errorf("eventstore: delete expired turns: %w", err)
 		}
@@ -541,7 +641,7 @@ func scanEvents(rows *sql.Rows) ([]*StoredEvent, error) {
 	var events []*StoredEvent
 	for rows.Next() {
 		var e StoredEvent
-		if err := rows.Scan(&e.ID, &e.SessionID, &e.Seq, &e.Type, &e.Data, &e.Direction, &e.Source, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.SessionID, &e.Seq, &e.Type, &e.Data, &e.Direction, &e.Source, &e.CreatedAt, &e.ExpiresAt); err != nil {
 			return nil, fmt.Errorf("eventstore: scan: %w", err)
 		}
 		events = append(events, &e)

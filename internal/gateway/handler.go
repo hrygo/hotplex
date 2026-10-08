@@ -150,20 +150,14 @@ func (h *Handler) SetAuditCollector(ac *audit.Collector) {
 	h.auditCollector = ac
 }
 
-// emitAudit enqueues a non-blocking message.inbound audit event. No-op when collector is nil.
-func (h *Handler) emitAudit(outcome, userID, platform, sessionID, content string) {
+// emitAudit enqueues a non-blocking, bodyless message.inbound audit event.
+// The final value is intentionally discarded so callers cannot persist text.
+func (h *Handler) emitAudit(outcome, userID, platform, sessionID, _ string) {
 	if h.auditCollector == nil {
 		return
 	}
 	if userID == "" {
 		userID = audit.AnonymousUserID
-	}
-	detailJSON := "{}"
-	if content != "" {
-		detail := map[string]any{"content": content}
-		if bytes, err := json.Marshal(detail); err == nil {
-			detailJSON = string(bytes)
-		}
 	}
 	_ = h.auditCollector.Enqueue(context.Background(), &audit.UserActivity{
 		Ts:         time.Now().UnixMilli(),
@@ -173,13 +167,19 @@ func (h *Handler) emitAudit(outcome, userID, platform, sessionID, content string
 		SessionID:  sessionID,
 		Action:     audit.ActionMessageInbound,
 		Outcome:    outcome,
-		DetailJSON: detailJSON,
+		DetailJSON: "{}",
 	})
 }
 
-// emitInteractionAudit enqueues a non-blocking interaction response audit event
-// (permission.response / question.response / elicitation.response).
-func (h *Handler) emitInteractionAudit(userID, platform, sessionID string, eventType events.Kind, data any, content string) {
+// emitInteractionAudit enqueues a non-blocking, bodyless interaction response
+// audit event (permission.response / question.response / elicitation.response).
+// Free-form response content is intentionally discarded.
+func (h *Handler) emitInteractionAudit(
+	userID, platform, sessionID string,
+	eventType events.Kind,
+	data any,
+	_ string,
+) {
 	if h.auditCollector == nil {
 		return
 	}
@@ -198,38 +198,15 @@ func (h *Handler) emitInteractionAudit(userID, platform, sessionID string, event
 		action = audit.ActionPermissionRequest
 		resourceType = "permission"
 		var reqID string
-		var toolName string
-		var description string
-		var args []string
 
 		if prd, ok := data.(events.PermissionRequestData); ok {
 			reqID = prd.ID
-			toolName = prd.ToolName
-			description = prd.Description
-			args = prd.Args
 		} else if prdPtr, ok := data.(*events.PermissionRequestData); ok && prdPtr != nil {
 			reqID = prdPtr.ID
-			toolName = prdPtr.ToolName
-			description = prdPtr.Description
-			args = prdPtr.Args
 		} else if m, ok := data.(map[string]any); ok {
 			reqID, _ = m["id"].(string)
 			if reqID == "" {
 				reqID, _ = m["request_id"].(string)
-			}
-			toolName, _ = m["tool_name"].(string)
-			if toolName == "" {
-				toolName, _ = m["tool"].(string)
-			}
-			description, _ = m["description"].(string)
-			if rawArgs, ok := m["args"].([]string); ok {
-				args = rawArgs
-			} else if rawArgsAny, ok := m["args"].([]any); ok {
-				for _, a := range rawArgsAny {
-					if s, ok := a.(string); ok {
-						args = append(args, s)
-					}
-				}
 			}
 		}
 
@@ -237,28 +214,17 @@ func (h *Handler) emitInteractionAudit(userID, platform, sessionID string, event
 		if reqID != "" {
 			detailMap["id"] = reqID
 		}
-		if toolName != "" {
-			detailMap["tool_name"] = toolName
-		}
-		if description != "" {
-			detailMap["description"] = description
-		}
-		if len(args) > 0 {
-			detailMap["args"] = args
-		}
 		outcome = audit.OutcomeSuccess
 
 	case events.PermissionResponse:
 		action = audit.ActionPermissionResponse
 		resourceType = "permission"
 		var allowed = true
-		var reason string
 		var reqID string
 
 		if prd, ok := data.(events.PermissionResponseData); ok {
 			reqID = prd.ID
 			allowed = prd.Allowed
-			reason = prd.Reason
 		} else if m, ok := data.(map[string]any); ok {
 			reqID, _ = m["id"].(string)
 			if reqID == "" {
@@ -267,7 +233,6 @@ func (h *Handler) emitInteractionAudit(userID, platform, sessionID string, event
 			if a, ok := m["allowed"].(bool); ok {
 				allowed = a
 			}
-			reason, _ = m["reason"].(string)
 		}
 
 		resourceID = reqID
@@ -275,12 +240,6 @@ func (h *Handler) emitInteractionAudit(userID, platform, sessionID string, event
 			detailMap["id"] = reqID
 		}
 		detailMap["allowed"] = allowed
-		if reason != "" {
-			detailMap["reason"] = reason
-		}
-		if content != "" {
-			detailMap["content"] = content
-		}
 		if allowed {
 			outcome = audit.OutcomeSuccess
 		} else {
@@ -291,25 +250,16 @@ func (h *Handler) emitInteractionAudit(userID, platform, sessionID string, event
 		action = audit.ActionQuestionResponse
 		resourceType = "question"
 		var reqID string
-		var answers any
 
 		if qrd, ok := data.(events.QuestionResponseData); ok {
 			reqID = qrd.ID
-			answers = qrd.Answers
 		} else if m, ok := data.(map[string]any); ok {
 			reqID, _ = m["id"].(string)
-			answers = m["answers"]
 		}
 
 		resourceID = reqID
 		if reqID != "" {
 			detailMap["id"] = reqID
-		}
-		if answers != nil {
-			detailMap["answers"] = answers
-		}
-		if content != "" {
-			detailMap["content"] = content
 		}
 		outcome = audit.OutcomeSuccess
 
@@ -318,16 +268,13 @@ func (h *Handler) emitInteractionAudit(userID, platform, sessionID string, event
 		resourceType = "elicitation"
 		var reqID string
 		var act string
-		var elicitContent any
 
 		if erd, ok := data.(events.ElicitationResponseData); ok {
 			reqID = erd.ID
 			act = erd.Action
-			elicitContent = erd.Content
 		} else if m, ok := data.(map[string]any); ok {
 			reqID, _ = m["id"].(string)
 			act, _ = m["action"].(string)
-			elicitContent = m["content"]
 		}
 
 		resourceID = reqID
@@ -335,12 +282,10 @@ func (h *Handler) emitInteractionAudit(userID, platform, sessionID string, event
 			detailMap["id"] = reqID
 		}
 		if act != "" {
-			detailMap["action"] = act
-		}
-		if elicitContent != nil {
-			detailMap["content"] = elicitContent
-		} else if content != "" {
-			detailMap["content"] = content
+			switch act {
+			case "accept", "decline", "cancel":
+				detailMap["action"] = act
+			}
 		}
 		if act == "decline" || act == "cancel" {
 			outcome = audit.OutcomeDenied
@@ -1093,6 +1038,9 @@ func (h *Handler) handleSupplementOnBusy(ctx context.Context, env *events.Envelo
 		case qerr != nil && errors.Is(qerr, execution.ErrPayloadConflict):
 			return h.sendErrorf(ctx, env, events.ErrCodeInvalidMessage,
 				"client message id %q was already used with different input", clientID)
+		case qerr != nil && errors.Is(qerr, execution.ErrSessionExpired):
+			return h.sendErrorf(ctx, env, events.ErrCodeSessionExpired,
+				"session expired; create a new session to continue")
 		}
 		// Full, oversized or otherwise unusable: fall through to the volatile
 		// buffer, which is still better than refusing the input outright.
@@ -1323,9 +1271,15 @@ func (h *Handler) deliverToWorkerWithBusyHandling(ctx context.Context, env *even
 		h.cancelRetryIfNeeded(env.SessionID)
 		return h.sendErrorf(ctx, env, events.ErrCodeSessionNotFound, "session not found")
 	}
+	if si.State == events.StateDeleted || si.DeletedAt != nil {
+		return h.sendErrorf(ctx, env, events.ErrCodeSessionExpired, "session expired; create a new session to continue")
+	}
 
 	execRecord, duplicate, err := h.acceptInputExecutionWithRetry(ctx, env)
 	if err != nil {
+		if errors.Is(err, execution.ErrSessionExpired) {
+			return h.sendErrorf(ctx, env, events.ErrCodeSessionExpired, "session expired; create a new session to continue")
+		}
 		if errors.Is(err, execution.ErrPayloadConflict) {
 			observability.ExecutionConflict().Add(ctx, 1)
 			return h.sendErrorf(ctx, env, events.ErrCodeInvalidMessage,
@@ -1404,6 +1358,19 @@ func (h *Handler) deliverToWorkerWithBusyHandling(ctx context.Context, env *even
 		h.sendInputAck(ctx, env, execRecord, false)
 		if h.bridge != nil && status == execution.StatusFailed {
 			h.bridge.finishTurnTTFT(env.SessionID, string(status))
+		}
+	}
+	if recorder, ok := h.sm.(SessionInputLifecycleRecorder); ok {
+		acceptedAt := inputReceivedAt
+		if execRecord != nil && execRecord.CreatedAt > 0 {
+			acceptedAt = time.UnixMilli(execRecord.CreatedAt)
+		}
+		if err := recorder.RecordInputAccepted(ctx, env.SessionID, acceptedAt); err != nil {
+			h.log.Error("gateway: persist session input lifecycle failed",
+				"err", err, "session_id", env.SessionID)
+			finishOutcome(execution.StatusFailed, events.ErrCodeInternalError)
+			h.emitAudit(audit.OutcomeFailure, env.OwnerID, si.Platform, env.SessionID, content)
+			return h.sendErrorf(ctx, env, events.ErrCodeInternalError, "session lifecycle update failed")
 		}
 	}
 	// Fence recovery may have replaced the Worker and transitioned a TERMINATED
@@ -1515,7 +1482,7 @@ func (h *Handler) deliverToWorkerWithBusyHandling(ctx context.Context, env *even
 		if mrErr := h.executionStore.MarkRunning(ctx, execRecord.ExecutionID, h.ownerInstanceID, workerRunID); mrErr != nil {
 			h.log.Warn("gateway: mark execution running failed", "err", mrErr,
 				"session_id", env.SessionID, observability.KeyExecutionID, execRecord.ExecutionID)
-			h.finishRuntimeWithoutDispatch(ctx, execRecord, persistedRunID, events.ErrCodeInternalError)
+			h.finishRuntimeWithoutDispatch(ctx, execRecord, persistedRunID)
 			finishOutcome(execution.StatusFailed, events.ErrCodeInternalError)
 			return h.sendErrorf(ctx, env, events.ErrCodeInternalError, "execution dispatch registration failed")
 		}
@@ -1532,17 +1499,44 @@ func (h *Handler) deliverToWorkerWithBusyHandling(ctx context.Context, env *even
 	}
 	if h.bridge != nil && workerRunBound {
 		if err := h.bridge.beginWorkerRunTurn(ctx, env.SessionID, workerRunID); err != nil {
-			h.finishRuntimeWithoutDispatch(ctx, execRecord, workerRunID, events.ErrCodeInternalError)
+			h.finishRuntimeWithoutDispatch(ctx, execRecord, workerRunID)
 			finishOutcome(execution.StatusFailed, events.ErrCodeInternalError)
 			return h.sendErrorf(ctx, env, events.ErrCodeInternalError, "worker turn admission failed")
 		}
 	}
 
-	// Stamp the turn start immediately before delivery so the Done-bound timer
-	// measures only this turn's processing, excluding inter-turn idle
-	// (Turn-Integrity spec RC-4 / Fix D).
+	// Stamp and arm the absolute turn deadline immediately before delivery.
+	// Worker output must not extend this deadline; only a new accepted input
+	// starts a new turn clock.
+	var turnStartedAt, turnDeadlineAt int64
+	var turnPolicyRevision string
 	if h.bridge != nil {
-		h.bridge.RecordTurnStart(env.SessionID)
+		turnStartedAt, turnDeadlineAt, turnPolicyRevision, err =
+			h.bridge.RecordTurnStartForRun(env.SessionID, workerRunID)
+		if err != nil {
+			h.finishRuntimeWithoutDispatch(ctx, execRecord, workerRunID)
+			finishOutcome(execution.StatusFailed, events.ErrCodeInternalError)
+			return h.sendErrorf(ctx, env, events.ErrCodeInternalError, "worker turn deadline setup failed")
+		}
+	} else {
+		turnStartedAt = time.Now().UnixMilli()
+	}
+	if execRecord != nil && h.executionStore != nil && turnDeadlineAt > 0 {
+		if err := h.executionStore.SetTurnDeadline(
+			ctx,
+			execRecord.ExecutionID,
+			h.ownerInstanceID,
+			turnStartedAt,
+			turnDeadlineAt,
+			turnPolicyRevision,
+		); err != nil {
+			if h.bridge != nil {
+				h.bridge.ClearTurnStartForRun(env.SessionID, workerRunID)
+			}
+			h.finishRuntimeWithoutDispatch(ctx, execRecord, workerRunID)
+			finishOutcome(execution.StatusFailed, events.ErrCodeInternalError)
+			return h.sendErrorf(ctx, env, events.ErrCodeInternalError, "worker turn deadline persistence failed")
+		}
 	}
 
 	// A new primary turn begins: clear the previous turn's stop claim so this
@@ -1613,7 +1607,7 @@ func (h *Handler) deliverToWorkerWithBusyHandling(ctx context.Context, env *even
 			cancel()
 			if catalogErr != nil {
 				if h.bridge != nil {
-					h.bridge.ClearTurnStart(env.SessionID)
+					h.bridge.ClearTurnStartForRun(env.SessionID, workerRunID)
 				}
 				finishOutcome(execution.StatusFailed, events.ErrCodeInternalError)
 				h.emitAudit(audit.OutcomeFailure, env.OwnerID, si.Platform, env.SessionID, content)
@@ -1640,7 +1634,7 @@ func (h *Handler) deliverToWorkerWithBusyHandling(ctx context.Context, env *even
 			}
 			if !advertised {
 				if h.bridge != nil {
-					h.bridge.ClearTurnStart(env.SessionID)
+					h.bridge.ClearTurnStartForRun(env.SessionID, workerRunID)
 				}
 				finishOutcome(execution.StatusFailed, events.ErrCodeNotSupported)
 				h.emitAudit(audit.OutcomeFailure, env.OwnerID, si.Platform, env.SessionID, content)
@@ -1651,7 +1645,7 @@ func (h *Handler) deliverToWorkerWithBusyHandling(ctx context.Context, env *even
 		invoker, ok := worker.AsNativeInvoker(w)
 		if !ok {
 			if h.bridge != nil {
-				h.bridge.ClearTurnStart(env.SessionID)
+				h.bridge.ClearTurnStartForRun(env.SessionID, workerRunID)
 			}
 			finishOutcome(execution.StatusFailed, events.ErrCodeNotSupported)
 			h.emitAudit(audit.OutcomeFailure, env.OwnerID, si.Platform, env.SessionID, content)
@@ -1711,7 +1705,7 @@ func (h *Handler) deliverToWorkerWithBusyHandling(ctx context.Context, env *even
 		// Input never reached the worker: clear the turn start so a later Done
 		// (or crash-cleanup) cannot bill idle time to a turn that never ran.
 		if h.bridge != nil {
-			h.bridge.ClearTurnStart(env.SessionID)
+			h.bridge.ClearTurnStartForRun(env.SessionID, workerRunID)
 		}
 		code := classifyWorkerError(inputErr)
 		finishOutcome(execution.StatusFailed, code)
@@ -1893,12 +1887,13 @@ func (h *Handler) finishInputExecution(ctx context.Context, record *execution.Re
 	return nil
 }
 
-func (h *Handler) finishRuntimeWithoutDispatch(ctx context.Context, record *execution.Record, workerRunID string, code events.ErrorCode) {
+func (h *Handler) finishRuntimeWithoutDispatch(ctx context.Context, record *execution.Record, workerRunID string) {
 	if h.executionStore == nil || record == nil || workerRunID == "" {
 		return
 	}
 	err := h.executionStore.FinishRuntime(
-		context.WithoutCancel(ctx), record.ExecutionID, workerRunID, execution.RuntimeFailed, string(code),
+		context.WithoutCancel(ctx), record.ExecutionID, workerRunID, execution.RuntimeFailed,
+		string(events.ErrCodeInternalError),
 	)
 	if err == nil || h.repairer == nil {
 		return
@@ -1908,7 +1903,7 @@ func (h *Handler) finishRuntimeWithoutDispatch(ctx context.Context, record *exec
 		WorkerRunID: workerRunID,
 		Kind:        execution.RepairRuntime,
 		Status:      string(execution.RuntimeFailed),
-		ErrorCode:   string(code),
+		ErrorCode:   string(events.ErrCodeInternalError),
 	})
 }
 
@@ -2059,6 +2054,13 @@ func (h *Handler) requireActiveOwner(ctx context.Context, env *events.Envelope) 
 type SessionReader interface {
 	Get(ctx context.Context, id string) (*session.SessionInfo, error)
 	GetWorker(id string) worker.Worker
+}
+
+// SessionInputLifecycleRecorder persists retention deadlines for a newly
+// accepted input. It remains optional for adapters and test doubles that do
+// not own lifecycle persistence.
+type SessionInputLifecycleRecorder interface {
+	RecordInputAccepted(ctx context.Context, id string, acceptedAt time.Time) error
 }
 
 // SessionLifecycle provides session creation and deletion.

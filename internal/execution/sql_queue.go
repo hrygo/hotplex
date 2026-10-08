@@ -83,6 +83,23 @@ func (s *SQLStore) AcceptQueued(
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()
 
+	// Preserve idempotency for an already accepted input even if its session
+	// has since been retired. This read has no write side effect.
+	existing, err := s.getByClientMessage(ctx, request.SessionID, request.ClientMessageID)
+	if err == nil {
+		if existing.PayloadHash != request.PayloadHash {
+			return existing, nil, true, ErrPayloadConflict
+		}
+		entry, entryErr := s.queueEntryByExecution(ctx, s.db, existing.ExecutionID)
+		if entryErr != nil && !errors.Is(entryErr, ErrNotFound) {
+			return nil, nil, true, entryErr
+		}
+		return existing, entry, true, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, nil, false, err
+	}
+
 	var (
 		stored    *Record
 		entry     *QueueEntry
@@ -92,7 +109,7 @@ func (s *SQLStore) AcceptQueued(
 		// state instead of being guessed.
 		uniqueRace bool
 	)
-	err := s.withWriteLock(func() error {
+	err = s.withWriteLock(func() error {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("execution: begin queue accept: %w", err)
@@ -102,9 +119,19 @@ func (s *SQLStore) AcceptQueued(
 			return e
 		}
 
-		// Input idempotency is checked first, inside the transaction, so a
-		// retry of the same message never consumes queue capacity or an
-		// ordinal.
+		// The global budget row is written first and unconditionally: that write
+		// is the cross-instance lock for the global limit. A lock-free COUNT
+		// would let two gateways both see room and both insert.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE execution_queue_budget SET used = used WHERE budget_id = 1`); err != nil {
+			return fail(fmt.Errorf("execution: lock queue budget: %w", err))
+		}
+		if err := s.lockAcceptableSession(ctx, tx, request.SessionID); err != nil {
+			return fail(err)
+		}
+
+		// Recheck input idempotency inside the transaction before capacity or
+		// ordinal writes. A duplicate never consumes queue capacity or a slot.
 		existing, err := s.getByClientMessageFrom(ctx, tx, request.SessionID, request.ClientMessageID)
 		if err == nil {
 			if existing.PayloadHash != request.PayloadHash {
@@ -130,14 +157,6 @@ func (s *SQLStore) AcceptQueued(
 		if !errors.Is(err, ErrNotFound) {
 			return fail(err)
 		}
-
-		// The global budget row is written first and unconditionally: that write
-		// is the cross-instance lock for the global limit. A lock-free COUNT
-		// would let two gateways both see room and both insert.
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE execution_queue_budget SET used = used WHERE budget_id = 1`); err != nil {
-			return fail(fmt.Errorf("execution: lock queue budget: %w", err))
-		}
 		var depth int64
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM execution_queue`).Scan(&depth); err != nil {
@@ -149,8 +168,9 @@ func (s *SQLStore) AcceptQueued(
 
 		// Then the per-session ordinal allocator. Locking it is what serialises
 		// concurrent enqueues for one session, so the depth check below cannot
-		// be overtaken by a sibling transaction. The order (budget, then
-		// session) is fixed so two enqueues can never take them in reverse.
+		// be overtaken by a sibling transaction. The order (budget, session
+		// lifecycle row, then session counter) is fixed so enqueues never take
+		// those locks in reverse.
 		if _, err := tx.ExecContext(ctx, s.rebind(`
 			INSERT INTO execution_queue_counters (session_id, next_seq)
 			VALUES (?, 1)

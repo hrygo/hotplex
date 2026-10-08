@@ -52,6 +52,7 @@ CREATE TABLE effects (
     evidence_ref      TEXT NOT NULL DEFAULT '',
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
+    settled_at        INTEGER,
     UNIQUE(occurrence_id, delivery_ordinal, target_revision)
 );
 CREATE TABLE effect_attempts (

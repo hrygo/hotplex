@@ -1,14 +1,14 @@
 # Observability Package
 
 ## OVERVIEW
-Unified OpenTelemetry bootstrap for the gateway: Prometheus metrics endpoint plus OTLP trace/metric export, all behind one `Init()` call with a noop fallback. Owns the full instrument registry (39 metrics across 9 domains) and the `RegisterGaugeCallbacks` indirection that lets other packages register gauges without racing package `init()`.
+Unified OpenTelemetry bootstrap for the gateway: Prometheus metrics endpoint plus OTLP trace/metric export, all behind one `Init()` call with a noop fallback. Owns the instrument registry and the `RegisterGaugeCallbacks` indirection that lets other packages register gauges without racing package `init()`.
 
 ## STRUCTURE
 ```
 observability/
   config.go          # Config struct, DefaultConfig(), IsOTELSDKDisabled()
   observability.go   # Init() (sync.Once), Meter()/Tracer(), resource + exporters, gauge registrar
-  instruments.go     # 39 lazy instrument accessors, each guarded by its own sync.Once
+  instruments.go     # lazy instrument accessors, each guarded by its own sync.Once
 ```
 
 ## WHERE TO LOOK
@@ -37,7 +37,7 @@ observability/
 - Problem: packages like `session` and `pool` own gauge state but their `init()` runs before `observability.Init()`. Calling `Meter().RegisterCallback(...)` from their init hit the noop meter and silently dropped the callback.
 - Fix: those packages call `RegisterGaugeCallbacks(fn)` at init time. `Init()` invokes every registered `fn` with the live meter at the end of setup via `runGaugeCallbacks`. Callbacks are skipped under noop (the `globalMeter != noopMeter` guard).
 
-**Per-metric sync.Once (39 occurrences)**
+**Per-metric sync.Once**
 - Every instrument accessor (`SessionCreated()`, `GatewayMessages()`, ...) holds its own `sync.Once`. First call lazily creates the instrument through `Meter()` and caches it. Repeat calls are free.
 - Creation failures are logged via `warnInstrument` (metric name + err) rather than panicked, so a single misconfigured meter cannot take the gateway down.
 
@@ -45,8 +45,9 @@ observability/
 - Root spans sampled at `cfg.SampleRate` (default 10%). Child spans respect parent decisions via `ParentBased`.
 - Metric reader enforces `CardinalityLimit` (default 5000) to bound series explosion from high-cardinality labels.
 
-**Instrument inventory (39 metrics, 9 domains)**
+**Core instrument inventory**
 - Session: `hotplex.session.created`, `.terminated`, `.deleted`, `.start.attempts`, `.start.errors`, `.start.duration`
+- Lifecycle GC: `hotplex.lifecycle.gc.failures`, `.retirement.lag`, `.backlog`, `.oldest_lag`
 - Worker: `hotplex.worker.starts`, `.execution.duration`, `.crashes`, `.memory.bytes`, `.creation.duration`
 - Gateway: `hotplex.gateway.connections`, `.messages`, `.events`, `.deltas.dropped`, `.platform.dropped`, `.no_subscribers.dropped`, `.delta.coalesced`, `.delta.flush`, `.errors`, `.init.handshake.duration`
 - Pool: `hotplex.pool.acquire`, `.release.errors`

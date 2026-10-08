@@ -26,6 +26,7 @@ type CollectorConfig struct {
 	BatchInterval     time.Duration
 	SinkTimeout       time.Duration
 	SpillBlockTimeout time.Duration
+	FactsRetention    time.Duration
 }
 
 func (c *CollectorConfig) defaults() {
@@ -44,6 +45,9 @@ func (c *CollectorConfig) defaults() {
 	if c.SpillBlockTimeout <= 0 {
 		c.SpillBlockTimeout = 5 * time.Second
 	}
+	if c.FactsRetention <= 0 {
+		c.FactsRetention = 180 * 24 * time.Hour
+	}
 }
 
 // Collector is the zero-loss audit event writer. It batches events into
@@ -60,6 +64,7 @@ type Collector struct {
 	sinks []AlertSink
 	log   *slog.Logger
 	cfg   CollectorConfig
+	epoch string
 
 	captureC  chan *UserActivity
 	closeC    chan struct{}
@@ -108,6 +113,10 @@ func NewCollector(store Store, spill *SpillFile, sinks []AlertSink, log *slog.Lo
 	if log == nil {
 		log = slog.Default()
 	}
+	epoch := legacyChainProfile.epoch
+	if profile, ok := store.(interface{ ChainEpoch() string }); ok {
+		epoch = profile.ChainEpoch()
+	}
 	if sinks == nil {
 		sinks = []AlertSink{}
 	}
@@ -124,6 +133,7 @@ func NewCollector(store Store, spill *SpillFile, sinks []AlertSink, log *slog.Lo
 		sinks:       sinks,
 		log:         log,
 		cfg:         cfg,
+		epoch:       epoch,
 		captureC:    make(chan *UserActivity, cfg.ChannelCap),
 		closeC:      make(chan struct{}),
 		sinkWorkers: workers,
@@ -169,6 +179,14 @@ func (c *Collector) Start(ctx context.Context) {
 func (c *Collector) Enqueue(ctx context.Context, ua *UserActivity) error {
 	if ua == nil {
 		return fmt.Errorf("audit: nil UserActivity")
+	}
+	if c.epoch == lifecycleChainProfile.epoch {
+		now := time.Now()
+		if ua.Ts <= 0 {
+			ua.Ts = now.UnixMilli()
+		}
+		ua.ChainEpoch = c.epoch
+		ua.ExpiresAt = time.UnixMilli(ua.Ts).Add(c.cfg.FactsRetention).UnixMilli()
 	}
 	select {
 	case <-c.closeC:

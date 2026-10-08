@@ -164,9 +164,49 @@ security:
 # ─────────────────────────────────────────────────────────────────────────────
 
 session:
-  retention_period: 168h    # Data retention for events and logs
+  retention_period: 168h    # Legacy session expiry; new lifecycle policy uses lifecycle.conversation.*
   gc_scan_interval: 1m
   max_concurrent: 1000
+
+events:
+  retention: 720h            # Fallback TTL for legacy event/turn rows without per-record expiry.
+
+execution:
+  queue:
+    enabled: false
+    per_session: 20
+    global: 1000
+    max_payload_bytes: 65536
+    interactive_ttl: 15m
+    ttl: 24h
+    sweep_interval: 1m
+    sweep_batch: 100
+
+# Retention defaults for newly written lifecycle records. Existing records keep
+# their assigned policy and deadlines until an explicit preview/apply migration.
+lifecycle:
+  policy: v2
+  conversation:
+    archive_after: 168h                     # No valid user input; still viewable and resumable.
+    retention_after_last_input: 4320h        # 180 days from the last valid user input.
+  content:
+    retention: 4320h                         # Each message expires from its own creation time.
+  effect_payload:
+    retention_after_settlement: 168h         # Keep retry/delivery bodies briefly after settlement.
+  facts:
+    retention_after_settlement: 2160h        # 90 days; retain status and dedupe evidence separately.
+  audit:
+    capture_content: false                   # Reserved; true is rejected until separate payload storage exists.
+    facts_retention: 4320h
+    content_retention: 4320h                 # Reserved with capture_content; facts remain bodyless.
+  media:
+    retention: 24h
+  trace:
+    retention: 48h
+  gc:
+    batch_size: 100
+    interval: 1m
+    max_lag: 1h
 
 pool:
   min_size: 0
@@ -182,7 +222,7 @@ worker:
   max_lifetime: 24h
   idle_timeout: 60m
   execution_timeout: 30m
-  turn_timeout: 0  # per-turn kill timer; 0=disabled (execution_timeout catches zombies)
+  turn_timeout: 30m # Absolute maximum duration for one accepted turn.
   default_work_dir: ~/.hotplex/workspace
   pid_dir: ~/.hotplex/.pids
   # Default permission mode tier (read-only, workspace, auto-edit, bypass)

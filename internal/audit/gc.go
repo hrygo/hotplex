@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/hrygo/hotplex/internal/observability"
 )
 
 // GCConfig holds GC tunables.
@@ -101,7 +103,14 @@ func (g *GC) Tick(ctx context.Context) (int64, error) {
 	g.mu.Lock()
 	retention := g.cfg.Retention
 	g.mu.Unlock()
-	cutoff := time.Now().Add(-retention)
+	cutoff := time.Now()
+	usesPersistedExpiry := false
+	if expiryStore, ok := g.store.(interface{ UsesPersistedExpiry() bool }); ok {
+		usesPersistedExpiry = expiryStore.UsesPersistedExpiry()
+	}
+	if !usesPersistedExpiry {
+		cutoff = cutoff.Add(-retention)
+	}
 
 	tx, err := g.store.BeginTx(ctx)
 	if err != nil {
@@ -132,5 +141,10 @@ func (g *GC) Tick(ctx context.Context) (int64, error) {
 		"checkpoint_next_id", cp.NextID,
 		"last_self_hash", cp.LastSelfHash,
 	)
+	kind := observability.LifecycleGCProcessedAuditFactLegacy
+	if usesPersistedExpiry {
+		kind = observability.LifecycleGCProcessedAuditFactV2
+	}
+	observability.RecordLifecycleGCProcessed(ctx, kind, deleted)
 	return deleted, nil
 }

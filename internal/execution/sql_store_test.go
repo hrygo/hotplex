@@ -79,6 +79,110 @@ func TestSQLStore_AcceptIsIdempotentAndRejectsPayloadConflict(t *testing.T) {
 	require.True(t, duplicate)
 }
 
+func TestSQLStore_AcceptRejectsNewInputAfterSessionRetirement(t *testing.T) {
+	t.Parallel()
+	store, sessionStore := newTestSQLStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	_, err := sessionStore.DB().ExecContext(ctx,
+		`UPDATE sessions SET state = ?, deleted_at = ? WHERE id = ?`,
+		string(events.StateDeleted), now, "session-1")
+	require.NoError(t, err)
+
+	_, _, err = store.Accept(ctx, testAcceptReq("session-1", "message-after-delete", "hash"))
+	require.ErrorIs(t, err, ErrSessionExpired)
+}
+
+func TestSQLStore_AcceptKeepsExistingDuplicateIdempotentAfterSessionRetirement(t *testing.T) {
+	t.Parallel()
+	store, sessionStore := newTestSQLStore(t)
+	ctx := context.Background()
+	request := testAcceptReq("session-1", "message-before-delete", "hash")
+	first, duplicate, err := store.Accept(ctx, request)
+	require.NoError(t, err)
+	require.False(t, duplicate)
+
+	_, err = sessionStore.DB().ExecContext(ctx,
+		`UPDATE sessions SET state = ?, deleted_at = ? WHERE id = ?`,
+		string(events.StateDeleted), time.Now(), "session-1")
+	require.NoError(t, err)
+
+	retry, duplicate, err := store.Accept(ctx, request)
+	require.NoError(t, err)
+	require.True(t, duplicate)
+	require.Equal(t, first.ExecutionID, retry.ExecutionID)
+}
+
+func TestSQLStore_AcceptAndLifecycleRetirementAreSerialized(t *testing.T) {
+	t.Parallel()
+	store, sessionStore := newTestSQLStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	expired := now.Add(-time.Hour)
+	_, err := sessionStore.DB().ExecContext(ctx,
+		`UPDATE sessions SET state = ?, lifecycle_policy = ?, lifecycle_policy_revision = ?,
+		 conversation_expires_at = ?, history_expires_at = ? WHERE id = ?`,
+		string(events.StateTerminated), config.LifecyclePolicyV2, "revision-1",
+		expired, expired, "session-1")
+	require.NoError(t, err)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var accepted *Record
+	var acceptErr error
+	var retired *session.SessionInfo
+	var retireErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		accepted, _, acceptErr = store.Accept(ctx, testAcceptReq("session-1", "race-message", "hash"))
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		retired, retireErr = sessionStore.RetireExpiredLifecycleSession(ctx, "session-1", now)
+	}()
+	close(start)
+	wg.Wait()
+
+	require.NoError(t, retireErr)
+	if acceptErr == nil {
+		require.NotNil(t, accepted)
+		require.Nil(t, retired, "an accepted input must prevent concurrent retirement")
+		return
+	}
+	require.ErrorIs(t, acceptErr, ErrSessionExpired)
+	require.NotNil(t, retired, "if retirement wins, input acceptance must be rejected")
+}
+
+func TestSQLStore_TurnDeadlineFieldsRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newTestSQLStore(t)
+	ctx := t.Context()
+	record, _, err := store.Accept(ctx, testAcceptReq("session-1", "turn-deadline", "hash"))
+	require.NoError(t, err)
+	require.Nil(t, record.TurnStartedAt)
+	require.Nil(t, record.TurnDeadlineAt)
+	require.Empty(t, record.TurnPolicyRevision)
+
+	startedAt := time.Now().UnixMilli()
+	deadlineAt := startedAt + int64(30*time.Minute/time.Millisecond)
+	_, err = store.db.ExecContext(ctx,
+		`UPDATE execution_inputs
+		 SET turn_started_at = ?, turn_deadline_at = ?, turn_policy_revision = ?
+		 WHERE execution_id = ?`,
+		startedAt, deadlineAt, "policy-rev-1", record.ExecutionID)
+	require.NoError(t, err)
+
+	got, err := store.ByID(ctx, record.ExecutionID)
+	require.NoError(t, err)
+	require.Equal(t, &startedAt, got.TurnStartedAt)
+	require.Equal(t, &deadlineAt, got.TurnDeadlineAt)
+	require.Equal(t, "policy-rev-1", got.TurnPolicyRevision)
+}
+
 func TestSQLStore_ConcurrentAcceptCreatesOneExecution(t *testing.T) {
 	t.Parallel()
 	store, _ := newTestSQLStore(t)
@@ -147,6 +251,34 @@ func TestSQLStore_SetStatusIsIdempotentAndTerminal(t *testing.T) {
 	require.NotNil(t, stored.DeliveredAt)
 	require.Equal(t, first.UpdatedAt, stored.UpdatedAt)
 	require.Equal(t, first.DeliveredAt, stored.DeliveredAt)
+}
+
+func TestSQLStore_SetTurnDeadlineIsImmutable(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newTestSQLStore(t)
+	ctx := context.Background()
+	record, _, err := store.Accept(ctx, testAcceptReq("session-1", "turn-deadline", "hash"))
+	require.NoError(t, err)
+	require.NoError(t, store.MarkRunning(ctx, record.ExecutionID, testOwner, testRun))
+
+	startedAt := time.Now().UnixMilli()
+	deadlineAt := startedAt + (30 * time.Minute).Milliseconds()
+	revision := "worker.turn_timeout=30m0s"
+	require.NoError(t, store.SetTurnDeadline(ctx, record.ExecutionID, testOwner, startedAt, deadlineAt, revision))
+
+	stored, err := store.getByID(ctx, record.ExecutionID)
+	require.NoError(t, err)
+	require.Equal(t, startedAt, *stored.TurnStartedAt)
+	require.Equal(t, deadlineAt, *stored.TurnDeadlineAt)
+	require.Equal(t, revision, stored.TurnPolicyRevision)
+
+	require.NoError(t, store.SetTurnDeadline(ctx, record.ExecutionID, testOwner, startedAt, deadlineAt, revision),
+		"repeating the persisted snapshot must be idempotent")
+	require.ErrorIs(t, store.SetTurnDeadline(ctx, record.ExecutionID, testOwner, startedAt, deadlineAt+1, revision),
+		ErrTurnDeadlineConflict, "a later configuration must not extend an existing execution")
+	require.ErrorIs(t, store.SetTurnDeadline(ctx, record.ExecutionID, "other-owner", startedAt, deadlineAt, revision),
+		ErrOwnerMismatch)
 }
 
 func TestSQLStore_ConvergeDeliveryFailedConverges(t *testing.T) {

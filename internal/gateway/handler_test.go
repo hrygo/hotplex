@@ -135,10 +135,9 @@ func (tx *captureAuditTx) Rollback() error {
 	return nil
 }
 
-// TestHandler_ReceivedEventLogExcludesBodyAndAuditRetainsContent catches a
-// regression that creates an unmanaged plaintext log copy while preserving
-// the governed audit copy.
-func TestHandler_ReceivedEventLogExcludesBodyAndAuditRetainsContent(t *testing.T) {
+// TestHandler_ReceivedEventLogAndAuditExcludeBody ensures neither operational
+// logs nor audit facts create a second plaintext copy of chat content.
+func TestHandler_ReceivedEventLogAndAuditExcludeBody(t *testing.T) {
 	t.Parallel()
 
 	var logs bytes.Buffer
@@ -176,9 +175,10 @@ func TestHandler_ReceivedEventLogExcludesBodyAndAuditRetainsContent(t *testing.T
 
 	activities, err := store.Query(context.Background(), audit.Query{})
 	require.NoError(t, err)
-	var detail map[string]string
+	var detail map[string]any
 	require.NoError(t, json.Unmarshal([]byte(activities[0].DetailJSON), &detail))
-	require.Equal(t, secret, detail["content"])
+	require.NotContains(t, activities[0].DetailJSON, secret)
+	require.NotContains(t, detail, "content")
 }
 
 // mockHandlerSM is a mock session manager for handler tests.
@@ -1338,9 +1338,11 @@ func newBridgeWithCollector(t *testing.T) (*Bridge, *eventstore.SQLiteStore) {
 		direction TEXT NOT NULL DEFAULT 'outbound',
 		source TEXT NOT NULL DEFAULT 'normal'
 			CHECK(source IN ('normal', 'crash', 'timeout', 'fresh_start')),
-		created_at INTEGER NOT NULL
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL DEFAULT 0
 	)`)
 	require.NoError(t, err)
+	createEventStoreSessionBarrierSchema(t, db)
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS turns (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		session_id TEXT NOT NULL,
@@ -1363,7 +1365,8 @@ func newBridgeWithCollector(t *testing.T) (*Bridge, *eventstore.SQLiteStore) {
 		tokens_out INTEGER NOT NULL DEFAULT 0,
 		duration_ms INTEGER NOT NULL DEFAULT 0,
 		cost_usd REAL NOT NULL DEFAULT 0.0,
-		created_at INTEGER NOT NULL
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL DEFAULT 0
 	)`)
 	require.NoError(t, err)
 
