@@ -243,18 +243,18 @@ func (s *MigrationService) Apply(
 	if err != nil {
 		return nil, fmt.Errorf("lifecycle: begin migration apply: %w", err)
 	}
-	rollback := func(cause error) (*MigrationApplyResult, error) {
+	rollback := func(cause error) error {
 		_ = tx.Rollback()
-		return nil, cause
+		return cause
 	}
 
 	current, err := s.readSnapshot(ctx, tx, policy)
 	if err != nil {
-		return rollback(err)
+		return nil, rollback(err)
 	}
 	if current.digest != plan.digest {
 		delete(s.plans, planID)
-		return rollback(ErrStalePreview)
+		return nil, rollback(ErrStalePreview)
 	}
 
 	result, err := applySnapshot(ctx, tx, s.dialect, policy, plan.rows)
@@ -262,11 +262,11 @@ func (s *MigrationService) Apply(
 		if errors.Is(err, ErrStalePreview) {
 			delete(s.plans, planID)
 		}
-		return rollback(err)
+		return nil, rollback(err)
 	}
 	if normalizeMigrationPolicy(s.policy()) != policy {
 		delete(s.plans, planID)
-		return rollback(ErrStalePreview)
+		return nil, rollback(ErrStalePreview)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("lifecycle: commit migration apply: %w", err)
