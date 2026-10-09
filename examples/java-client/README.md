@@ -22,26 +22,30 @@
 
 ## Installation
 
+Build this reference SDK from source with `mvn clean install` before using the
+coordinates below. This installs `1.52.0-SNAPSHOT` in your local Maven repository;
+the Gateway release does not publish SDK packages to Maven Central.
+
 ### Maven
 
 ```xml
 <dependency>
     <groupId>dev.hotplex</groupId>
     <artifactId>hotplex-client</artifactId>
-    <version>1.8.0</version>
+    <version>1.52.0-SNAPSHOT</version>
 </dependency>
 ```
 
 ### Gradle (Groovy)
 
 ```groovy
-implementation 'dev.hotplex:hotplex-client:1.8.0'
+implementation 'dev.hotplex:hotplex-client:1.52.0-SNAPSHOT'
 ```
 
 ### Gradle (Kotlin)
 
 ```kotlin
-implementation("dev.hotplex:hotplex-client:1.8.0")
+implementation("dev.hotplex:hotplex-client:1.52.0-SNAPSHOT")
 ```
 
 ---

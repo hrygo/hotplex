@@ -11,7 +11,7 @@
             "name": "Apache 2.0",
             "url": "https://github.com/hrygo/hotplex/blob/main/LICENSE"
         },
-        "version": "1.51.0"
+        "version": "1.52.0"
     },
     "host": "localhost:8888",
     "basePath": "/",

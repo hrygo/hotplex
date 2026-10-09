@@ -1,6 +1,6 @@
 {
   "name": "hotplex-client",
-  "version": "1.51.0",
+  "version": "1.52.0",
   "description": "TypeScript client SDK for HotPlex Gateway (AEP v1)",
   "type": "module",
   "main": "./dist/index.js",
