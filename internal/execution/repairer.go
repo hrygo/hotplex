@@ -77,11 +77,12 @@ type Repairer struct {
 	timedOut  int64
 	dropped   int64
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
-	start  sync.Once
-	stop   sync.Once
-	closed atomic.Bool
+	stopCh       chan struct{}
+	shutdownDone chan struct{}
+	wg           sync.WaitGroup
+	start        sync.Once
+	stop         sync.Once
+	closed       atomic.Bool
 
 	hookMu      sync.RWMutex
 	successHook func(RepairIntent)
@@ -95,17 +96,23 @@ func NewRepairer(store Store, cfg RepairConfig, log *slog.Logger) *Repairer {
 		cfg.QueueCapacity = 2
 	}
 	return &Repairer{
-		store:     store,
-		cfg:       cfg,
-		log:       log.With("component", "repairer"),
-		intents:   make(map[string]*RepairIntent),
-		abandoned: make(map[string]struct{}),
-		stopCh:    make(chan struct{}),
+		store:        store,
+		cfg:          cfg,
+		log:          log.With("component", "repairer"),
+		intents:      make(map[string]*RepairIntent),
+		abandoned:    make(map[string]struct{}),
+		stopCh:       make(chan struct{}),
+		shutdownDone: make(chan struct{}),
 	}
 }
 
 func (r *Repairer) Start(ctx context.Context) {
 	r.start.Do(func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.closed.Load() {
+			return
+		}
 		r.wg.Add(1)
 		go r.loop(ctx)
 	})
@@ -316,36 +323,47 @@ func (r *Repairer) processIntent(ctx context.Context, intent *RepairIntent) erro
 }
 
 func (r *Repairer) Shutdown(ctx context.Context) {
+	shutdownCtx, cancel := context.WithTimeout(ctx, r.cfg.ShutdownTimeout)
+	defer cancel()
 	r.stop.Do(func() {
-		close(r.stopCh)
-
-		done := make(chan struct{})
-		go func() {
-			r.wg.Wait()
-			close(done)
-		}()
-
-		timer := time.NewTimer(r.cfg.ShutdownTimeout)
-		defer timer.Stop()
-		select {
-		case <-done:
-			// The loop owns mutable intent state until it exits. Draining
-			// earlier would process the same intent concurrently.
-			r.drain(ctx)
-		case <-ctx.Done():
-			r.log.Warn("repairer shutdown cancelled",
-				"backlog", r.Backlog(), "err", ctx.Err())
-		case <-timer.C:
-			r.log.Warn("repairer shutdown timed out",
-				"backlog", r.Backlog(), "timeout", r.cfg.ShutdownTimeout)
-		}
+		// Serialize Start's WaitGroup registration with shutdown. Closing before
+		// waiting also prevents a late Start from adding another processing loop.
+		r.mu.Lock()
 		r.closed.Store(true)
+		close(r.stopCh)
+		r.mu.Unlock()
+
+		// Once starts one owner, but never holds its lock during callbacks.
+		go r.finishShutdown(shutdownCtx)
 	})
+	select {
+	case <-r.shutdownDone:
+	case <-shutdownCtx.Done():
+	}
+}
+
+func (r *Repairer) finishShutdown(ctx context.Context) {
+	defer close(r.shutdownDone)
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+
+	// Intent retry fields belong to the processing loop. Drain only after
+	// that loop releases ownership; timeout never starts a second processor.
+	select {
+	case <-done:
+		r.drain(ctx)
+	case <-ctx.Done():
+	}
+	if ctx.Err() != nil && r.Backlog() > 0 {
+		r.log.Warn("repairer shutdown timed out",
+			"backlog", r.Backlog(), "timeout", r.cfg.ShutdownTimeout)
+	}
 }
 
 func (r *Repairer) drain(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, r.cfg.ShutdownTimeout)
-	defer cancel()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for ctx.Err() == nil {
