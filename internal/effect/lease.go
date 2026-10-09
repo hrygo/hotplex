@@ -421,7 +421,7 @@ const applyCompletionSQL = `UPDATE effects SET
 		owner_instance_id = '',
 		lease_until = NULL,
 		settled_at = CASE WHEN ? IN ('delivered', 'failed', 'reconciled_succeeded',
-			'reconciled_failed', 'fenced') THEN ? ELSE NULL END,
+			'reconciled_failed', 'fenced') THEN CAST(? AS BIGINT) ELSE NULL END,
 		next_attempt_at = ?,
 		updated_at = ?
 	WHERE effect_id = ?

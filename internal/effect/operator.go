@@ -108,7 +108,7 @@ const operatorUpdateSQL = `UPDATE effects SET
 		owner_instance_id = '',
 		lease_until = NULL,
 		next_attempt_at = NULL,
-		settled_at = CASE WHEN ? = 'planned' THEN NULL ELSE ? END,
+		settled_at = CASE WHEN ? = 'planned' THEN NULL ELSE CAST(? AS BIGINT) END,
 		updated_at = ?
 	WHERE effect_id = ?
 	  AND status = ?`
