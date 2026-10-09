@@ -318,33 +318,46 @@ func (r *Repairer) processIntent(ctx context.Context, intent *RepairIntent) erro
 func (r *Repairer) Shutdown(ctx context.Context) {
 	r.stop.Do(func() {
 		close(r.stopCh)
+
+		done := make(chan struct{})
+		go func() {
+			r.wg.Wait()
+			close(done)
+		}()
+
+		timer := time.NewTimer(r.cfg.ShutdownTimeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+			// The loop owns mutable intent state until it exits. Draining
+			// earlier would process the same intent concurrently.
+			r.drain(ctx)
+		case <-ctx.Done():
+			r.log.Warn("repairer shutdown cancelled",
+				"backlog", r.Backlog(), "err", ctx.Err())
+		case <-timer.C:
+			r.log.Warn("repairer shutdown timed out",
+				"backlog", r.Backlog(), "timeout", r.cfg.ShutdownTimeout)
+		}
+		r.closed.Store(true)
 	})
-
-	done := make(chan struct{})
-	go func() {
-		r.wg.Wait()
-		close(done)
-	}()
-
-	r.drain(ctx)
-
-	select {
-	case <-done:
-	case <-time.After(r.cfg.ShutdownTimeout):
-		r.log.Warn("repairer shutdown timed out",
-			"backlog", r.Backlog(), "timeout", r.cfg.ShutdownTimeout)
-	}
-	r.closed.Store(true)
 }
 
 func (r *Repairer) drain(ctx context.Context) {
-	deadline := time.Now().Add(r.cfg.ShutdownTimeout)
-	for time.Now().Before(deadline) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.ShutdownTimeout)
+	defer cancel()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
 		r.processDue(ctx)
 		if r.Backlog() == 0 {
 			return
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
