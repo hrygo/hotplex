@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://github.com/hrygo/hotplex/actions/workflows/ci.yml"><img src="https://github.com/hrygo/hotplex/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/Version-v1.51.0-10B981?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-v1.52.0-10B981?style=flat-square" alt="Version">
   <a href="https://github.com/hrygo/hotplex/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-3B82F6?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go" alt="Go">
   <img src="https://img.shields.io/badge/Protocol-AEP%20v1-7C3AED?style=flat-square" alt="AEP v1">
@@ -135,13 +135,13 @@ HotPlex 把“用户在哪里对话”和“哪个 Agent 执行任务”分离�
 
 Worker 可以按 Bot 或平台指定，其余场景继承部署级共享默认值。
 
-## ✨ 最新版本：v1.51.0
+## ✨ 最新版本：v1.52.0
 
-- **输入生命周期可证明。** 输入先持久化受理再投递 Worker，由 owner 租约与 active gate 保证同一轮次只有一次有效执行；租约过期置为 `unknown` 并围栏，`unknown` 永不自动重投。
-- **权威运行时计划。** 每次会话启动都记录带指纹的 launch plan，事后可回答"实际生效的是哪份配置"，而不是靠复现推测。
-- **交付与 Agent 完成分离。** 执行记录与投递效果各自持久化：Agent 的 `done` 不等于用户已收到结果，投递回执独立可查。
-- **执行台。** Admin 控制台基于同一份运行时存储提供执行列表、时间线与队列操作。
-- **真实链路验证。** 本版本在真实 PostgreSQL 与真实 Claude Code Worker 上完成端到端运行，并据此修复了终态事件丢失与多回合不可观测两个缺陷。
+- **历史会话保留更久。** 运行资源、会话历史与消息正文分别计时。新会话默认 7 天标记归档、历史和正文保留 180 天，期限均可配置。
+- **存量迁移保护。** 已有会话保留原策略；管理员可先预览再分批延长期限。重复输入和配置调整不会缩短已记录的留存窗口。
+- **交付结果可见。** 效果对账与围栏状态、操作员决策和排队输入终态进入执行时间线，并同步四种 SDK。
+- **关闭与清理更可靠。** 修复 Repairer 关闭竞态、PostgreSQL 清理与队列查询、终态事件顺序，以及固定 Origin 白名单下原生 SDK 连接。
+- **明确的云端交付流程。** 指定 Issue 后依次完成实施、验证与草稿 PR，保留可恢复检查点并强制执行 Git hooks。
 
 完整版本历史见[更新记录](CHANGELOG.md)。
 

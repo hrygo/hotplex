@@ -4,7 +4,7 @@ HotPlex Python Client
 A Python client library for interacting with HotPlex Gateway via AEP v1 protocol.
 """
 
-__version__ = "1.51.0"
+__version__ = "1.52.0"
 __author__ = "HotPlex Team"
 
 # 导出公共 API
