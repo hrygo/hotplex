@@ -12,6 +12,7 @@ func TestCompactSettledFactsPreservesIdempotencyAndProtectsUnresolvedRows(t *tes
 	t.Parallel()
 
 	store, sessionStore := newTestSQLStore(t)
+	store.SetRetentionPolicy(30*24*time.Hour, "test-policy")
 	ctx := context.Background()
 	oldFinishedAt := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
 
@@ -77,7 +78,7 @@ func TestCompactSettledFactsPreservesIdempotencyAndProtectsUnresolvedRows(t *tes
 		lateConvergence.ExecutionID)
 	require.NoError(t, err)
 
-	compacted, err := store.CompactSettledFacts(ctx, oldFinishedAt, 1)
+	compacted, err := store.CompactSettledFacts(ctx, oldFinishedAt.Add(30*24*time.Hour), 1)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, compacted, "the batch size bounds work")
 

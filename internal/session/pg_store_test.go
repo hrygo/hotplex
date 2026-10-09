@@ -209,8 +209,9 @@ func TestPGStore_DeleteTerminated(t *testing.T) {
 		WithArgs("sess-old").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(deleteQuery)).
 		WithArgs("sess-old", string(events.StateTerminated), cronCutoff, defaultCutoff).WillReturnRows(rows)
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO session_cleanup_tasks (id, session_id, worker_type, worker_session_id, attempts, next_attempt_at, lease_until, lease_token, last_error, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL, $7, $8, $9) ON CONFLICT(session_id) DO NOTHING`)).
-		WithArgs(sqlmock.AnyArg(), "sess-old", worker.TypeOpenCodeSrv, "ocs-old", 0, sqlmock.AnyArg(), "", sqlmock.AnyArg(), sqlmock.AnyArg()).
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO session_cleanup_tasks (id, session_id, worker_type, worker_session_id, attempts, next_attempt_at, lease_until, lease_token, last_error, created_at, updated_at) SELECT $1, $2, $3, $4, $5, $6, NULL, NULL, $7, $8, $9 WHERE NOT EXISTS ( SELECT 1 FROM session_purge_items WHERE session_id = $10 AND kind = $11 AND status IN ($12, $13) ) ON CONFLICT(session_id) DO NOTHING`)).
+		WithArgs(sqlmock.AnyArg(), "sess-old", worker.TypeOpenCodeSrv, "ocs-old", 0, sqlmock.AnyArg(), "", sqlmock.AnyArg(), sqlmock.AnyArg(),
+			"sess-old", PurgeItemWorkerSession, string(PurgeItemComplete), string(PurgeItemUnsupported)).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 

@@ -935,8 +935,19 @@ func (h *Handler) handleSupplementOnBusy(ctx context.Context, env *events.Envelo
 		// re-answering with a synthetic supplement ID would tell the client
 		// something weaker than what we actually know.
 		if h.executionStore != nil {
-			if record, err := h.queuedRecordFor(ctx, env.SessionID, clientID); err == nil && record != nil {
-				h.ackQueuedInput(ctx, env, record, true)
+			record, queued, qerr := h.EnqueueBusyInput(ctx, env, content, invocation)
+			if record == nil && qerr == nil {
+				// Disabling new queue acceptance does not revoke an existing
+				// durable queue promise.
+				record, qerr = h.queuedRecordFor(ctx, env.SessionID, clientID)
+				queued = record != nil
+			}
+			if qerr == nil && record != nil {
+				if queued {
+					h.ackQueuedInput(ctx, env, record, true)
+				} else {
+					h.sendInputAck(ctx, env, record, true)
+				}
 				return nil
 			}
 		}
@@ -1035,12 +1046,20 @@ func (h *Handler) handleSupplementOnBusy(ctx context.Context, env *events.Envelo
 			h.ackQueuedInput(ctx, env, record, false)
 			h.notifySupplement(ctx, env.SessionID, "queued")
 			return nil
+		case qerr == nil && record != nil:
+			// A durable duplicate can already be dispatched or settled.
+			// Return that result instead of creating another queue promise.
+			h.sendInputAck(ctx, env, record, true)
+			return nil
 		case qerr != nil && errors.Is(qerr, execution.ErrPayloadConflict):
 			return h.sendErrorf(ctx, env, events.ErrCodeInvalidMessage,
 				"client message id %q was already used with different input", clientID)
 		case qerr != nil && errors.Is(qerr, execution.ErrSessionExpired):
 			return h.sendErrorf(ctx, env, events.ErrCodeSessionExpired,
 				"session expired; create a new session to continue")
+		case qerr != nil && errors.Is(qerr, ErrInputLifecycleUpdate):
+			return h.sendErrorf(ctx, env, events.ErrCodeInternalError,
+				"failed to record accepted input lifecycle")
 		}
 		// Full, oversized or otherwise unusable: fall through to the volatile
 		// buffer, which is still better than refusing the input outright.

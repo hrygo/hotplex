@@ -1681,11 +1681,27 @@ func (m *Manager) RecordInputAccepted(ctx context.Context, id string, acceptedAt
 
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	if ms.info.LifecyclePolicy != config.LifecyclePolicyV2 ||
-		ms.info.LifecyclePolicyRevision == "" ||
-		ms.info.LifecyclePolicyRevision != candidate.revision {
+	// A confirmed migration can update the durable policy while a legacy
+	// session remains cached. Read only its lifecycle projection here; the
+	// active Worker and runtime state remain owned by this manager.
+	persisted, err := m.store.Get(ctx, id)
+	if err != nil {
+		return fmt.Errorf("session: refresh input lifecycle: %w", err)
+	}
+	if ms.deleting || persisted.DeletedAt != nil || persisted.State == events.StateDeleted {
+		return ErrSessionNotFound
+	}
+	if persisted.LifecyclePolicy != config.LifecyclePolicyV2 ||
+		persisted.LifecyclePolicyRevision == "" {
 		return nil
 	}
+	ms.info.LifecyclePolicy = persisted.LifecyclePolicy
+	ms.info.LifecyclePolicyRevision = persisted.LifecyclePolicyRevision
+	ms.info.LastInputAt = persisted.LastInputAt
+	ms.info.ArchiveAt = persisted.ArchiveAt
+	ms.info.ConversationExpiresAt = persisted.ConversationExpiresAt
+	ms.info.LastContentExpiresAt = persisted.LastContentExpiresAt
+	ms.info.HistoryExpiresAt = persisted.HistoryExpiresAt
 
 	lastInputAt := latestLifecycleTime(ms.info.LastInputAt, acceptedAt)
 	archiveAt := latestLifecycleTime(ms.info.ArchiveAt, *candidate.archiveAt)
@@ -1700,7 +1716,7 @@ func (m *Manager) RecordInputAccepted(ctx context.Context, id string, acceptedAt
 	if err := store.AdvanceLifecycleDeadlines(
 		ctx,
 		id,
-		candidate.revision,
+		persisted.LifecyclePolicyRevision,
 		lastInputAt,
 		archiveAt,
 		conversationExpiresAt,

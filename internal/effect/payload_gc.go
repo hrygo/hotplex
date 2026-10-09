@@ -17,8 +17,8 @@ type PayloadGCStore interface {
 
 // Payload bodies are blanked in place rather than deleting identity rows.
 // Keeping the unique occurrence/execution row prevents a late duplicate trigger
-// from recreating expired content. settledBefore is the latest settlement time
-// still eligible for deletion (now minus the configured post-settlement TTL).
+// from recreating expired content. The supplied clock is now; each effect
+// carries its original post-settlement retention window.
 const deleteExpiredPayloadsSQL = `UPDATE effect_payloads
 	SET content = '', content_bytes = 0
 	WHERE content_bytes > 0
@@ -34,12 +34,13 @@ const deleteExpiredPayloadsSQL = `UPDATE effect_payloads
 			WHERE e.payload_id = p.payload_id
 			  AND (e.status IN ('planned', 'started', 'unknown')
 			       OR e.settled_at IS NULL
+			       OR e.payload_retention_ms IS NULL
 			       OR e.lease_until IS NOT NULL
 			       OR e.next_attempt_at IS NOT NULL)
 		  )
 		  AND NOT EXISTS (
 			SELECT 1 FROM effects e
-			WHERE e.payload_id = p.payload_id AND e.settled_at > ?
+			WHERE e.payload_id = p.payload_id AND e.settled_at + e.payload_retention_ms > ?
 		  )
 		ORDER BY p.created_at, p.payload_id
 		LIMIT ?

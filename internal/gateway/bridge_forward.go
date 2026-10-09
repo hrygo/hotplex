@@ -253,8 +253,6 @@ func (b *Bridge) forwardEvents(fb forwarderBinding, sessionID string, opts forwa
 		acc := b.getOrInitAccum(sessionID, fc.workDir, fc.startTime)
 		acc.clearTurnStart()
 		b.finishTurnTTFT(sessionID, "timeout")
-		fc.turnText.Reset()
-		fc.hasRealText = false
 		flog.Warn("bridge: turn timeout exceeded, terminating worker",
 			"session_id", sessionID, "worker_type", workerType, "turn_timeout", b.turnTimeout)
 		if err := w.Terminate(context.Background()); err != nil {

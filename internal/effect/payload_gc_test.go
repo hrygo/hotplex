@@ -57,12 +57,13 @@ func TestDeleteExpiredPayloadsWaitsForEveryDeliveryToSettle(t *testing.T) {
 
 	// Expiry starts at the latest settlement among all effects that share the
 	// payload. Before that deadline, the snapshot is still recoverable.
-	n, err = store.DeleteExpiredPayloads(ctx, secondSettledAt.Add(-time.Nanosecond), 10)
+	deadline := secondSettledAt.Add(7 * 24 * time.Hour)
+	n, err = store.DeleteExpiredPayloads(ctx, deadline.Add(-time.Millisecond), 10)
 	require.NoError(t, err)
 	require.Zero(t, n)
 
 	// At the deadline, remove the body while retaining the idempotency row.
-	n, err = store.DeleteExpiredPayloads(ctx, secondSettledAt, 10)
+	n, err = store.DeleteExpiredPayloads(ctx, deadline, 10)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, n)
 	_, err = store.GetPayload(ctx, first.PayloadID)

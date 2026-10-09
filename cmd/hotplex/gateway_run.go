@@ -1349,6 +1349,7 @@ func initOrphanCleanup(ctx context.Context, cfg *config.Config, log *slog.Logger
 }
 
 type gatewayStores struct {
+	lifecycle   config.LifecycleConfig
 	session     session.Store
 	execution   execution.Store
 	event       eventStoreProvider
@@ -1402,9 +1403,13 @@ func initSQLiteStores(ctx context.Context, cfg *config.Config, log *slog.Logger)
 		_ = sessionStore.Close()
 		return nil, fmt.Errorf("execution store init: %w", err)
 	}
+	if cfg.Lifecycle.Policy == config.LifecyclePolicyV2 {
+		executionStore.SetRetentionPolicy(cfg.Lifecycle.Facts.RetentionAfterSettlement, config.LifecyclePolicyRevision(cfg.Lifecycle))
+	}
 	dbResolver := security.NewDBResolver(sessionStore.DB(), dbutil.DialectSQLite)
 
 	return &gatewayStores{
+		lifecycle:   cfg.Lifecycle,
 		session:     sessionStore,
 		execution:   executionStore,
 		wsStore:     sessionStore,
@@ -1440,6 +1445,9 @@ func initPGStores(ctx context.Context, cfg *config.Config, log *slog.Logger) (*g
 		_ = db.Close()
 		return nil, fmt.Errorf("pg: execution store: %w", err)
 	}
+	if cfg.Lifecycle.Policy == config.LifecyclePolicyV2 {
+		executionStore.SetRetentionPolicy(cfg.Lifecycle.Facts.RetentionAfterSettlement, config.LifecyclePolicyRevision(cfg.Lifecycle))
+	}
 	cronStore := cron.NewPGStore(db, log)
 	chatAccessStore := messaging.NewChatAccessPGStore(db, log)
 	dbResolver := security.NewDBResolver(db.DB, dbutil.DialectPostgres)
@@ -1453,6 +1461,7 @@ func initPGStores(ctx context.Context, cfg *config.Config, log *slog.Logger) (*g
 	}
 
 	return &gatewayStores{
+		lifecycle:   cfg.Lifecycle,
 		session:     sessionStore,
 		execution:   executionStore,
 		wsStore:     wsStore,
@@ -1540,8 +1549,7 @@ func runEffectPayloadGC(
 	}
 
 	runOnce := func() {
-		cutoff := time.Now().Add(-retention)
-		n, err := store.DeleteExpiredPayloads(ctx, cutoff, batchSize)
+		n, err := store.DeleteExpiredPayloads(ctx, time.Now(), batchSize)
 		if err != nil {
 			log.Warn("effect payload gc: cleanup failed", "err", err)
 			return
@@ -1586,8 +1594,7 @@ func runEffectAttemptGC(
 	}
 
 	runOnce := func() {
-		cutoff := time.Now().Add(-retention)
-		n, err := store.DeleteSettledAttempts(ctx, cutoff, batchSize)
+		n, err := store.DeleteSettledAttempts(ctx, time.Now(), batchSize)
 		if err != nil {
 			log.Warn("effect attempt gc: cleanup failed", "err", err)
 			return
@@ -1631,8 +1638,7 @@ func runExecutionFactGC(
 	}
 
 	runOnce := func() {
-		cutoff := time.Now().Add(-retention)
-		n, err := store.CompactSettledFacts(ctx, cutoff, batchSize)
+		n, err := store.CompactSettledFacts(ctx, time.Now(), batchSize)
 		if err != nil {
 			log.Warn("execution fact gc: compaction failed", "err", err)
 			return

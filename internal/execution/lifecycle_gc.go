@@ -28,7 +28,8 @@ const compactSettledFactsSQL = `UPDATE execution_inputs
 		WHERE e.status IN ('delivered', 'failed')
 		  AND e.runtime_status IN ('completed', 'failed')
 		  AND e.finished_at IS NOT NULL
-		  AND e.finished_at <= ?
+		  AND e.facts_retention_ms IS NOT NULL
+		  AND e.finished_at + e.facts_retention_ms <= ?
 		  AND e.fence_reason = ''
 		  AND NOT (e.status = 'failed' AND e.runtime_status = 'completed')
 		  AND NOT EXISTS (

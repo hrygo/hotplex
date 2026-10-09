@@ -92,6 +92,7 @@ func setupRoutes(
 			func() lifecycle.RetentionPolicy {
 				current := deps.ConfigStore.Load()
 				return lifecycle.RetentionPolicy{
+					PolicyRevision:         config.LifecyclePolicyRevision(current.Lifecycle),
 					ArchiveAfter:           current.Lifecycle.Conversation.ArchiveAfter,
 					ConversationRetention:  current.Lifecycle.Conversation.RetentionAfterLastInput,
 					ContentRetention:       current.Lifecycle.Content.Retention,

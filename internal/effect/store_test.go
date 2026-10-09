@@ -19,7 +19,9 @@ func newStore(t *testing.T) (*effect.SQLiteStore, *sql.DB) {
 	t.Helper()
 	db, _ := newLedgerDB(t)
 	writeMu := sqlutil.NewWriteMu(string(dbutil.DialectSQLite))
-	return effect.NewSQLiteStore(db, slog.New(slog.NewTextHandler(os.Stderr, nil)), writeMu), db
+	store := effect.NewSQLiteStore(db, slog.New(slog.NewTextHandler(os.Stderr, nil)), writeMu)
+	store.SetRetentionPolicy(7*24*time.Hour, 30*24*time.Hour, "test-policy")
+	return store, db
 }
 
 func TestStorePlanOnce_ConvergesOnTheSameEffect(t *testing.T) {

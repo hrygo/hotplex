@@ -24,7 +24,12 @@ import (
 const (
 	queueReasonNotDispatchable = "QUEUE_NOT_DISPATCHABLE"
 	queueReasonContentLost     = "QUEUE_CONTENT_UNAVAILABLE"
+	queueReasonLifecycleFailed = "INPUT_LIFECYCLE_UPDATE_FAILED"
 )
+
+// ErrInputLifecycleUpdate prevents a failed durable acceptance from being
+// downgraded to a volatile buffer receipt.
+var ErrInputLifecycleUpdate = errors.New("gateway: accepted input lifecycle update failed")
 
 // preacceptedKey carries an execution record that the queue has ALREADY
 // durably claimed into the ordinary delivery path.
@@ -103,7 +108,8 @@ func queuePayloadFor(content string, invocation *worker.NativeCommandInvocation)
 
 // EnqueueBusyInput durably accepts an input that arrived while its session was
 // busy. It reports whether the input is now durably queued; a false return
-// with a nil error means the caller should fall back to the volatile buffer.
+// with a nil error and no record means the caller can use the volatile buffer.
+// A nonqueued record is the durable result of an earlier submission.
 func (h *Handler) EnqueueBusyInput(
 	ctx context.Context,
 	env *events.Envelope,
@@ -122,7 +128,7 @@ func (h *Handler) EnqueueBusyInput(
 		mode = "native_command"
 	}
 
-	record, _, duplicate, err := h.executionStore.AcceptQueued(ctx, execution.QueuedRequest{
+	record, entry, duplicate, err := h.executionStore.AcceptQueued(ctx, execution.QueuedRequest{
 		SessionID:       env.SessionID,
 		ClientMessageID: clientMessageID(env),
 		PayloadHash:     payloadHash,
@@ -139,7 +145,28 @@ func (h *Handler) EnqueueBusyInput(
 		}
 		return nil, false, err
 	}
+	if duplicate {
+		if record.ErrorCode == queueReasonLifecycleFailed {
+			return record, false, ErrInputLifecycleUpdate
+		}
+		if entry == nil || !record.IsQueued() {
+			return record, false, nil
+		}
+	}
 	if !duplicate {
+		if recorder, ok := h.sm.(SessionInputLifecycleRecorder); ok {
+			acceptedAt := time.Now()
+			if record.CreatedAt > 0 {
+				acceptedAt = time.UnixMilli(record.CreatedAt)
+			}
+			if err := recorder.RecordInputAccepted(ctx, env.SessionID, acceptedAt); err != nil {
+				// Acceptance already committed. Settle it before returning an
+				// error, even if the request's context has just been cancelled.
+				_, cancelErr := h.executionStore.CancelQueued(context.WithoutCancel(ctx),
+					record.ExecutionID, queueReasonLifecycleFailed)
+				return record, false, fmt.Errorf("%w: %w", ErrInputLifecycleUpdate, errors.Join(err, cancelErr))
+			}
+		}
 		observability.ExecutionQueueAccepted().Add(ctx, 1, label("input_mode", mode))
 		observability.ExecutionQueueDepth().Add(ctx, 1)
 		h.log.Info("gateway: input durably queued",

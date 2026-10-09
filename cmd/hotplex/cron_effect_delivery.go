@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
+	"github.com/hrygo/hotplex/internal/config"
 	"github.com/hrygo/hotplex/internal/cron"
 	"github.com/hrygo/hotplex/internal/effect"
 	"github.com/hrygo/hotplex/internal/gateway"
@@ -139,11 +141,17 @@ func resolveDeliveryTarget(
 // effectStoreFor returns the effect ledger for the active dialect, sharing the
 // gateway's connection and write mutex.
 func effectStoreFor(log *slog.Logger, stores *gatewayStores) effect.Store {
+	var store effect.Store
 	if stores.dialect == "postgres" && stores.db != nil {
-		return effect.NewPGStore(stores.db, log)
+		store = effect.NewPGStore(stores.db, log)
+	} else if stores.sqlDB != nil {
+		store = effect.NewSQLiteStore(stores.sqlDB, log, stores.writeMu)
 	}
-	if stores.sqlDB != nil {
-		return effect.NewSQLiteStore(stores.sqlDB, log, stores.writeMu)
+	if configurable, ok := store.(interface {
+		SetRetentionPolicy(time.Duration, time.Duration, string)
+	}); ok && stores.lifecycle.Policy == config.LifecyclePolicyV2 {
+		configurable.SetRetentionPolicy(stores.lifecycle.EffectPayload.RetentionAfterSettlement,
+			stores.lifecycle.Facts.RetentionAfterSettlement, config.LifecyclePolicyRevision(stores.lifecycle))
 	}
-	return nil
+	return store
 }
