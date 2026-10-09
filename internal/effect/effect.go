@@ -127,6 +127,10 @@ type Effect struct {
 
 	CreatedAtMs int64
 	UpdatedAtMs int64
+	// SettledAtMs is set when the effect reaches a terminal, non-retryable
+	// outcome. Unresolved and legacy rows keep it nil, which protects their
+	// recovery payload from time-based cleanup.
+	SettledAtMs *int64
 }
 
 // BusinessKey is the stable identity of an effect.
@@ -219,12 +223,23 @@ func (t dbTx) QueryRowContext(ctx context.Context, query string, args ...any) Ro
 
 // Planner commits payload snapshots and planned effects atomically.
 type Planner struct {
-	dialect dbutil.Dialect
+	dialect            dbutil.Dialect
+	payloadRetentionMS int64
+	factsRetentionMS   int64
+	retentionRevision  string
 }
 
 // NewPlanner creates a Planner for the given SQL dialect.
 func NewPlanner(dialect dbutil.Dialect) *Planner {
 	return &Planner{dialect: dialect}
+}
+
+// SetRetentionPolicy configures snapshots for subsequent plans. Call it before
+// sharing the planner with goroutines. Nonpositive windows protect the rows.
+func (p *Planner) SetRetentionPolicy(payload, facts time.Duration, revision string) {
+	p.payloadRetentionMS = max(0, payload.Milliseconds())
+	p.factsRetentionMS = max(0, facts.Milliseconds())
+	p.retentionRevision = revision
 }
 
 const insertPayloadSQL = `INSERT INTO effect_payloads
@@ -240,12 +255,9 @@ const insertEffectSQL = `INSERT INTO effects
 	 status, error_code, reason,
 	 owner_instance_id, lease_until, lease_version,
 	 provider_ref, evidence_ref,
-	 created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	 created_at, updated_at, payload_retention_ms, facts_retention_ms, retention_policy_revision)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(CAST(? AS BIGINT), 0), NULLIF(CAST(? AS BIGINT), 0), ?)
 	ON CONFLICT(occurrence_id, delivery_ordinal, target_revision) DO NOTHING`
-
-const selectPayloadSHASQL = `SELECT content_sha256 FROM effect_payloads
-	WHERE occurrence_id = ? AND execution_id = ?`
 
 // PlanWithPayload writes the content snapshot and the planned effect in the
 // CALLER's transaction. The caller commits.
@@ -300,6 +312,38 @@ func (p *Planner) PlanWithPayload(ctx context.Context, tx Tx, plan Plan, now tim
 	if err != nil {
 		return nil, false, fmt.Errorf("effect: insert payload: %w", err)
 	}
+	payloadInserted, err := rowsAffected(payloadRes)
+	if err != nil {
+		return nil, false, err
+	}
+	if payloadInserted == 0 {
+		var recordedPayloadID, recordedSHA string
+		var contentBytes int64
+		row := tx.QueryRowContext(ctx, p.dialect.Rebind(
+			`SELECT payload_id, content_sha256, content_bytes FROM effect_payloads
+			 WHERE occurrence_id = ? AND execution_id = ?`),
+			plan.OccurrenceID, plan.ExecutionID)
+		switch err := row.Scan(&recordedPayloadID, &recordedSHA, &contentBytes); {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil, false, fmt.Errorf("%w: payload %s/%s is absent",
+				ErrPayloadEffectMismatch, plan.OccurrenceID, plan.ExecutionID)
+		case err != nil:
+			return nil, false, fmt.Errorf("effect: verify existing payload: %w", err)
+		case contentBytes == 0:
+			// The payload identity row remains after its body expires. Reusing
+			// that row prevents a duplicate trigger from recreating old content.
+			return nil, false, ErrPayloadNotFound
+		case recordedSHA != contentSHA:
+			return nil, false, fmt.Errorf(
+				"%w: ledger holds a different payload for execution %s",
+				ErrPayloadEffectMismatch, plan.ExecutionID)
+		default:
+			// Multiple target revisions may share one execution snapshot. The
+			// new effect must reference the already committed payload row.
+			payload.PayloadID = recordedPayloadID
+			e.PayloadID = recordedPayloadID
+		}
+	}
 
 	effectRes, err := tx.ExecContext(ctx, p.dialect.Rebind(insertEffectSQL),
 		e.EffectID, e.OccurrenceID, e.DeliveryOrdinal, e.TargetRevision, e.Attempt,
@@ -309,41 +353,15 @@ func (p *Planner) PlanWithPayload(ctx context.Context, tx Tx, plan Plan, now tim
 		e.Status, e.ErrorCode, e.Reason,
 		e.OwnerInstanceID, e.LeaseUntilMs, e.LeaseVersion,
 		e.ProviderRef, e.EvidenceRef,
-		e.CreatedAtMs, e.UpdatedAtMs)
+		e.CreatedAtMs, e.UpdatedAtMs, p.payloadRetentionMS, p.factsRetentionMS, p.retentionRevision)
 	if err != nil {
 		return nil, false, fmt.Errorf("effect: insert effect: %w", err)
-	}
-
-	payloadInserted, err := rowsAffected(payloadRes)
-	if err != nil {
-		return nil, false, err
 	}
 	effectInserted, err := rowsAffected(effectRes)
 	if err != nil {
 		return nil, false, err
 	}
 
-	// An effect can never be committed without its payload — both writes are in
-	// this one transaction. The remaining hazard is the opposite one: the
-	// payload may already exist from an earlier commit for the same execution
-	// while this plan carries different content. The ledger's copy wins, so
-	// verify it rather than assume.
-	if payloadInserted == 0 {
-		var recordedSHA string
-		row := tx.QueryRowContext(ctx, p.dialect.Rebind(selectPayloadSHASQL),
-			plan.OccurrenceID, plan.ExecutionID)
-		switch err := row.Scan(&recordedSHA); {
-		case errors.Is(err, sql.ErrNoRows):
-			return nil, false, fmt.Errorf("%w: payload %s/%s is absent",
-				ErrPayloadEffectMismatch, plan.OccurrenceID, plan.ExecutionID)
-		case err != nil:
-			return nil, false, fmt.Errorf("effect: verify existing payload: %w", err)
-		case recordedSHA != contentSHA:
-			return nil, false, fmt.Errorf(
-				"%w: ledger holds a different payload for execution %s",
-				ErrPayloadEffectMismatch, plan.ExecutionID)
-		}
-	}
 	return e, effectInserted > 0, nil
 }
 

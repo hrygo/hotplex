@@ -108,6 +108,7 @@ const operatorUpdateSQL = `UPDATE effects SET
 		owner_instance_id = '',
 		lease_until = NULL,
 		next_attempt_at = NULL,
+		settled_at = CASE WHEN ? = 'planned' THEN NULL ELSE CAST(? AS BIGINT) END,
 		updated_at = ?
 	WHERE effect_id = ?
 	  AND status = ?`
@@ -131,7 +132,7 @@ func (s *SQLiteStore) ApplyOperatorAction(ctx context.Context, req OperatorActio
 
 	res, err := s.db.ExecContext(ctx, dbutil.DialectSQLite.Rebind(operatorUpdateSQL),
 		target, errorCode, operatorReasonPrefix+req.Reason, req.EvidenceRef,
-		req.Now.UnixMilli(), req.EffectID, req.ExpectedStatus)
+		target, req.Now.UnixMilli(), req.Now.UnixMilli(), req.EffectID, req.ExpectedStatus)
 	if err != nil {
 		return nil, fmt.Errorf("effect: operator action: %w", err)
 	}
@@ -162,7 +163,7 @@ func (s *PGStore) ApplyOperatorAction(ctx context.Context, req OperatorActionReq
 
 	res, err := s.db.ExecContext(ctx, s.db.Dialect().Rebind(operatorUpdateSQL),
 		target, errorCode, operatorReasonPrefix+req.Reason, req.EvidenceRef,
-		req.Now.UnixMilli(), req.EffectID, req.ExpectedStatus)
+		target, req.Now.UnixMilli(), req.Now.UnixMilli(), req.EffectID, req.ExpectedStatus)
 	if err != nil {
 		return nil, fmt.Errorf("effect: operator action: %w", err)
 	}

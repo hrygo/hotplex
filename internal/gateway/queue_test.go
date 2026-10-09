@@ -156,6 +156,26 @@ func TestEnqueueBusyInput_ACKsQueuedDurably(t *testing.T) {
 	require.Equal(t, "later please", payload.Content)
 }
 
+func TestEnqueueBusyInput_UsesInteractiveTTL(t *testing.T) {
+	t.Parallel()
+
+	h, _, _, store, _ := newQueueHandler(t, "s-exec")
+	cfg := config.Default()
+	cfg.Execution.Queue.Enabled = true
+	cfg.Execution.Queue.InteractiveTTL = 15 * time.Minute
+	cfg.Execution.Queue.TTL = 24 * time.Hour
+	h.configProvider = func() *config.Config { return cfg }
+
+	record, queued, err := h.EnqueueBusyInput(context.Background(),
+		queuedInputEnv("s-exec", "m1", "later please"), "later please", nil)
+	require.NoError(t, err)
+	require.True(t, queued)
+
+	entry, err := store.QueueByExecution(context.Background(), record.ExecutionID)
+	require.NoError(t, err)
+	require.Equal(t, int64((15*time.Minute)/time.Millisecond), entry.ExpiresAt-entry.EnqueuedAt)
+}
+
 // TestEnqueueBusyInput_DuplicateIsOneQueueEntry proves a retried submission
 // does not double the queue, and that a different payload under the same
 // client message id is refused rather than quietly queued as a second input.

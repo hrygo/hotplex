@@ -584,10 +584,11 @@ export default function AdminActivityPage() {
               ))}
             </div>
             {rows.map((row) => {
-              const selected = drawerRow?.id === row.id;
+              const rowEpoch = row.chain_epoch ?? 'legacy';
+              const selected = drawerRow?.id === row.id && (drawerRow.chain_epoch ?? 'legacy') === rowEpoch;
               return (
                 <button
-                  key={row.id}
+                  key={`${rowEpoch}:${row.id}`}
                   type="button"
                   onClick={() => setDrawerRow(row)}
                   className={`w-full text-left grid grid-cols-[140px_1.4fr_100px_1.5fr_100px_2.5fr] items-center gap-3 px-4 py-2 border-t border-[var(--border-subtle)] transition-all duration-200 hover:translate-x-0.5 odd:bg-[var(--bg-surface)]/10 even:bg-[var(--bg-surface)]/40 hover:bg-[var(--bg-hover)]/30 ${
@@ -841,6 +842,12 @@ export default function AdminActivityPage() {
                     </DrawerSection>
 
                     <DrawerSection title={t('activity.drawer.hash_chain')} hint={t('activity.drawer.hash_hint')}>
+                      <div className="mb-3 flex items-center gap-2 text-xs">
+                        <span className="text-[var(--text-faint)]">{t('activity.drawer.chain_epoch')}</span>
+                        <span className="rounded border border-[var(--border-subtle)] px-2 py-0.5 font-mono text-[var(--text-secondary)]">
+                          {drawerRow.chain_epoch ?? 'legacy'}
+                        </span>
+                      </div>
                       <div className="flex flex-col gap-4 relative pl-3 before:absolute before:left-[17px] before:top-2 before:bottom-2 before:w-[2px] before:bg-[color-mix(in_srgb,var(--border-subtle)_70%,transparent)]">
                         <div className="flex items-start gap-3 relative">
                           <div className="w-2.5 h-2.5 rounded-full border-2 border-[var(--border-subtle)] bg-[var(--bg-surface)] mt-1.5 z-10 shrink-0" />

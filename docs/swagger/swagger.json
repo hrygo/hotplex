@@ -3136,7 +3136,7 @@
                         "ApiKeyAuth": []
                     }
                 ],
-                "description": "Gracefully terminates the worker and physically deletes the session. Ownership check applies.",
+                "description": "Marks the session deleted, immediately hides it from history, and schedules cleanup. Ownership check applies.",
                 "tags": [
                     "Gateway API"
                 ],
@@ -3250,6 +3250,64 @@
                     },
                     "500": {
                         "description": "Internal error",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/sessions/{id}/cleanup": {
+            "get": {
+                "security": [
+                    {
+                        "ApiKeyAuth": []
+                    }
+                ],
+                "description": "Returns bounded progress for a deleted session without exposing conversation content or provider error text.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Gateway API"
+                ],
+                "summary": "Get session cleanup status",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Session ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.GatewaySessionCleanupStatusResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Ownership required",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Cleanup status not found",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Cleanup status unavailable",
                         "schema": {
                             "$ref": "#/definitions/admin.ErrorResponse"
                         }
@@ -4331,6 +4389,63 @@
                 "session_id": {
                     "type": "string",
                     "example": "550e8400-e29b-41d4-a716-446655440000"
+                }
+            }
+        },
+        "admin.GatewaySessionCleanupStatusItem": {
+            "type": "object",
+            "properties": {
+                "attempts": {
+                    "type": "integer",
+                    "example": 2
+                },
+                "completed_at": {
+                    "type": "string"
+                },
+                "error_code": {
+                    "type": "string",
+                    "example": "cleanup_failed"
+                },
+                "kind": {
+                    "type": "string",
+                    "example": "conversation_content"
+                },
+                "next_attempt_at": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string",
+                    "example": "retrying"
+                }
+            }
+        },
+        "admin.GatewaySessionCleanupStatusResponse": {
+            "type": "object",
+            "properties": {
+                "completed_at": {
+                    "type": "string"
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/admin.GatewaySessionCleanupStatusItem"
+                    }
+                },
+                "job_id": {
+                    "type": "string"
+                },
+                "requested_at": {
+                    "type": "string"
+                },
+                "session_id": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string",
+                    "example": "in_progress"
+                },
+                "updated_at": {
+                    "type": "string"
                 }
             }
         },

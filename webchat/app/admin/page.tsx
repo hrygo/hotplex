@@ -568,7 +568,7 @@ export default function DashboardPage() {
               <div className="space-y-2 flex-1">
                 {recentActivities.length > 0 ? (
                   recentActivities.map((act) => (
-                    <div key={act.id} className="p-2.5 rounded-[var(--radius-sm)] bg-[var(--bg-hover)] border border-[var(--border-subtle)] flex items-center justify-between text-xs">
+                    <div key={`${act.chain_epoch ?? 'legacy'}:${act.id}`} className="p-2.5 rounded-[var(--radius-sm)] bg-[var(--bg-hover)] border border-[var(--border-subtle)] flex items-center justify-between text-xs">
                       <div className="min-w-0 pr-2">
                         <div className="flex items-center gap-2">
                           <span className="font-mono font-bold text-[var(--text-primary)] truncate">{act.action}</span>

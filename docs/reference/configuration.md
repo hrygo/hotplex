@@ -218,11 +218,38 @@ Session 生命周期管理配置。
 
 | 字段 | 类型 | 默认值 | 环境变量 | 说明 |
 |------|------|--------|----------|------|
-| `retention_period` | duration | `168h` (7天) | `HOTPLEX_SESSION_RETENTION_PERIOD` | 事件和日志的数据保留期。过期数据由 GC 扫描清理 |
-| `term_retention` | duration | `168h` (7天) | `HOTPLEX_SESSION_TERM_RETENTION` | 普通 TERMINATED session 数据库记录保留期。过期后物理删除 |
-| `cron_term_retention` | duration | `24h` | `HOTPLEX_SESSION_CRON_TERM_RETENTION` | Cron 类 TERMINATED session 数据库记录保留期。过期后物理删除 |
+| `retention_period` | duration | `168h` (7天) | `HOTPLEX_SESSION_RETENTION_PERIOD` | 兼容的 Session 运行到期时长；到期后释放/终止运行资源。它不是聊天正文保留期 |
+| `term_retention` | duration | `168h` (7天) | `HOTPLEX_SESSION_TERM_RETENTION` | Legacy `TERMINATED` session 根记录保留时长；v2 会话不使用此项提前删除 |
+| `cron_term_retention` | duration | `24h` | `HOTPLEX_SESSION_CRON_TERM_RETENTION` | Legacy Cron `TERMINATED` session 根记录保留时长；v2 会话不使用此项提前删除 |
 | `gc_scan_interval` | duration | `1m` | — | GC 扫描间隔。定期扫描过期 Session 并清理 |
 | `max_concurrent` | int | `1000` | `HOTPLEX_SESSION_MAX_CONCURRENT` | 最大并发 Session 数。达到上限后新请求被拒绝 |
+
+#### lifecycle — 会话与数据期限
+
+这些期限与 Worker 运行资源分开计算。新会话默认使用 `v2` 策略；升级前已存在的记录保留原策略，存量期限不会因改配置被静默缩短。
+
+投递正文及执行/投递明细在创建记录时保存保留窗口和策略版本，过期时间按该记录的结算时刻加保存的窗口计算。重启后缩短配置只影响后续新记录；重复输入、重放及旧记录结算不会重写其窗口。没有窗口快照或结算时钟的旧记录继续受保护，需另行评审存量迁移。已迁移为 v2 的会话在首次持久接受新输入（包含排队输入）时续期，重复请求不会延长期限。
+
+| 字段 | 类型 | 默认值 | 环境变量 | 说明 |
+|------|------|--------|----------|------|
+| `policy` | string | `v2` | `HOTPLEX_LIFECYCLE_POLICY` | 新建会话采用的生命周期策略 |
+| `conversation.archive_after` | duration | `168h` (7天) | `HOTPLEX_LIFECYCLE_CONVERSATION_ARCHIVE_AFTER` | 自最近有效输入起的归档标记时间；标记后仍可查看和续聊 |
+| `conversation.retention_after_last_input` | duration | `4320h` (180天) | `HOTPLEX_LIFECYCLE_CONVERSATION_RETENTION_AFTER_LAST_INPUT` | 每次有效用户输入后向后推进的会话期限。读取历史或编辑标题不会续期 |
+| `content.retention` | duration | `4320h` (180天) | `HOTPLEX_LIFECYCLE_CONTENT_RETENTION` | 新写入的每条事件/轮次正文从自身创建时间起计算的期限；既有正文的期限不会被重新计算 |
+| `effect_payload.retention_after_settlement` | duration | `168h` (7天) | `HOTPLEX_LIFECYCLE_EFFECT_PAYLOAD_RETENTION_AFTER_SETTLEMENT` | v2 下，所有关联投递都已结算后清除 delivery payload 正文；`unknown` 或未结算记录会继续保留 |
+| `facts.retention_after_settlement` | duration | `2160h` (90天) | `HOTPLEX_LIFECYCLE_FACTS_RETENTION_AFTER_SETTLEMENT` | v2 清理已结算投递的详细 attempt，并压缩已结算 execution 的诊断明细；保留输入 ID、payload hash、worker run ID、最终状态及 `effects` / `cron_occurrences` 去重根记录，避免迟到事件或重放造成重复执行；未知、活动租约及缺少结算时钟的记录受保护 |
+| `audit.capture_content` | bool | `false` | `HOTPLEX_LIFECYCLE_AUDIT_CAPTURE_CONTENT` | 当前只允许 `false`；设为 `true` 会校验失败，直到独立审计正文存储和期限清理实现 |
+| `audit.facts_retention` | duration | `4320h` (180天) | `HOTPLEX_LIFECYCLE_AUDIT_FACTS_RETENTION` | 新写入 lifecycle-v2 审计事实的最低保留期；到期时间随记录写入并纳入哈希，改配置只影响之后的新记录；不改变 legacy `user_activity` 链的 `audit.retention`。哈希链按已到期连续前缀清理，未到期记录可能暂时阻挡后续记录删除 |
+| `audit.content_retention` | duration | `4320h` (180天) | `HOTPLEX_LIFECYCLE_AUDIT_CONTENT_RETENTION` | 预留配置；正文采集目前关闭，`capture_content: true` 会校验失败 |
+| `media.retention` | duration | `24h` | `HOTPLEX_LIFECYCLE_MEDIA_RETENTION` | Slack 与飞书下载缓存的最长保留时间；后台每 6 小时扫描一次 |
+| `trace.retention` | duration | `48h` | `HOTPLEX_LIFECYCLE_TRACE_RETENTION` | v2 仅清理 `~/.hotplex/logs` 中已关闭且过期的 ACP trace 文件及轮转副本；跳过活动 writer 和其他日志 |
+| `gc.batch_size` | int | `100` | `HOTPLEX_LIFECYCLE_GC_BATCH_SIZE` | v2 delivery payload、已结算 attempt 与 ACP trace 清理每批上限；存量期限迁移复用该值，单类每批最多 500 条 |
+| `gc.interval` | duration | `1m` | `HOTPLEX_LIFECYCLE_GC_INTERVAL` | v2 delivery payload 与 ACP trace 清理扫描间隔；媒体目录仍每 6 小时扫描 |
+| `gc.max_lag` | duration | `1h` | `HOTPLEX_LIFECYCLE_GC_MAX_LAG` | 可清理或被义务阻塞的最老到期会话超过此延迟时记录一次告警日志；不强制删除。积压与延迟指标见[指标参考](metrics.md) |
+
+> v2 会话达到 `archive_after` 后仍可查看和续聊；达到会话期限后，GC 会在确认 Worker 已停止且没有未完成/状态未知的输入、执行或清理任务后，将会话退役并写入异步清理任务。正文到期会从读取结果中排除并分批清理。用户主动删除后的异步清理进度可通过 `GET /api/sessions/{id}/cleanup` 查询。升级前的 legacy 会话不会自动切换到 v2；管理员可先调用 `POST /admin/lifecycle/migration/preview` 查看汇总，再通过单独的 `apply` 请求逐批延长期限。迁移不会缩短期限、补造缺失的 `last_input_at` 或恢复已删除记录。上表标为“预留配置”的项目不会因设置参数而启动清理任务。
+
+生命周期清理 Worker 在 Gateway 启动时读取保留期限、扫描间隔和批量大小；调整这些清理参数后需重启 Gateway。每条会话、正文和 lifecycle-v2 审计事实的到期时间在写入时固定，之后修改配置不会追溯改写存量期限；如需调整会话存量期限，使用上述迁移预览与 apply。
 
 ---
 
@@ -251,7 +278,7 @@ Worker 进程生命周期和环境配置。
 | `max_lifetime` | duration | `24h` | `HOTPLEX_WORKER_MAX_LIFETIME` | Worker 最大存活时间。超时后强制终止 |
 | `idle_timeout` | duration | `60m` | `HOTPLEX_WORKER_IDLE_TIMEOUT` | Worker 空闲超时。无 I/O 时自动回收 |
 | `execution_timeout` | duration | `30m` | `HOTPLEX_WORKER_EXECUTION_TIMEOUT` | 单次执行超时。捕获僵尸进程 |
-| `turn_timeout` | duration | `0` | — | 单 Turn 超时。0 = 禁用（由 `execution_timeout` 兜底） |
+| `turn_timeout` | duration | `30m` | `HOTPLEX_WORKER_TURN_TIMEOUT` | 单轮绝对上限，从 Worker 接收该轮输入时起计算，持续输出不会延长。v2 配置中显式设为 `0` 仍按 30 分钟默认值执行；legacy 策略下 `0` 保持禁用 |
 | `default_work_dir` | string | `~/.hotplex/workspace` | `HOTPLEX_WORKER_DEFAULT_WORK_DIR` | Worker 默认工作目录 |
 | `pid_dir` | string | `~/.hotplex/.pids` | — | PID 文件存储目录 |
 | `env_blocklist` | []string | `[]` | — | 需要从 Worker 环境中屏蔽的变量前缀列表（带尾部 `_`） |
@@ -798,12 +825,12 @@ log:
 
 ### 3.16 events 和 audit — 事件与审计留存
 
-运行期 event store 与合规 audit store 是职责不同的两类数据副本：前者支持会话恢复和协议重放，后者保存可追溯的用户活动原文。两者按各自配置独立清理；延长审计原文留存**不会**延长 event store 或 turn 的留存。
+运行期 event store 与合规 audit store 是职责不同的两类数据副本：前者支持会话恢复和协议重放，后者保存可追溯的用户活动事实。生命周期 v2 将新事实写入独立、无正文的 `user_activity_v2` 哈希链，由 `lifecycle.audit.facts_retention` 控制；升级前的 `user_activity` legacy 链继续按 `audit.retention` 保留，不会被 v2 GC 提前清理。Admin 活动查询会合并两条链，并返回 `chain_epoch` 标识来源。延长任一审计链留存**不会**延长 event store 或 turn 的期限。
 
 | 字段 | 类型 | 默认值 | 环境变量 | 说明 |
 |------|------|--------|----------|------|
 | `events.retention` | duration | `720h` (30天) | `HOTPLEX_EVENTS_RETENTION` | Event store 和 turns 的运行期留存窗口。到期后由事件 GC 清理。启动时生效，修改后需重启 |
-| `audit.retention` | duration | `26280h` (3年) | `HOTPLEX_AUDIT_RETENTION` | 审计记录的基础留存窗口，由 audit GC 独立执行 |
+| `audit.retention` | duration | `26280h` (3年) | `HOTPLEX_AUDIT_RETENTION` | legacy `user_activity` 链及升级前可能包含正文的旧记录的留存窗口；与 lifecycle-v2 新链独立 |
 | `audit.full_content_retention` | duration | `2160h` (90天) | `HOTPLEX_AUDIT_FULL_CONTENT_RETENTION` | 审计原文的兼容配置字段；不再影响 event store 或 turns 留存 |
 
 > 网关 INFO 日志不会记录消息正文、prompt 或 `Envelope.Event.Data`。为支持关联排障，日志仅包含事件类型、session、seq、`data_size` 与 `data_sha256`（SHA-256 的短指纹）。
@@ -818,7 +845,8 @@ log:
 | `execution.queue.per_session` | int | `20` | `HOTPLEX_EXECUTION_QUEUE_PER_SESSION` | 单个 session 允许的未派发输入条数上限 |
 | `execution.queue.global` | int | `1000` | `HOTPLEX_EXECUTION_QUEUE_GLOBAL` | 整个实例允许的未派发输入条数上限 |
 | `execution.queue.max_payload_bytes` | int | `65536` (64 KiB) | `HOTPLEX_EXECUTION_QUEUE_MAX_PAYLOAD_BYTES` | 单条输入的正文上限；原生命令的 invocation 参数一并计入 |
-| `execution.queue.ttl` | duration | `24h` | `HOTPLEX_EXECUTION_QUEUE_TTL` | 未派发输入保持可派发状态的最长时间，超时后按 `QUEUE_EXPIRED` 结算 |
+| `execution.queue.interactive_ttl` | duration | `15m` | `HOTPLEX_EXECUTION_QUEUE_INTERACTIVE_TTL` | 忙碌 Session 接收的交互输入最长等待时间；超时后按 `QUEUE_EXPIRED` 结算 |
+| `execution.queue.ttl` | duration | `24h` | `HOTPLEX_EXECUTION_QUEUE_TTL` | 未提供交互专用期限时使用的通用队列期限；当前 Gateway 忙碌输入路径优先采用 `interactive_ttl` |
 | `execution.queue.sweep_interval` | duration | `1m` | `HOTPLEX_EXECUTION_QUEUE_SWEEP_INTERVAL` | 过期扫描间隔；设为 `0` 关闭后台扫描 |
 | `execution.queue.sweep_batch` | int | `100` | `HOTPLEX_EXECUTION_QUEUE_SWEEP_BATCH` | 单次扫描处理的最大条数，避免大积压长时间占用写锁 |
 
@@ -929,6 +957,20 @@ HOTPLEX_SECURITY_API_KEY_1, HOTPLEX_SECURITY_API_KEY_2, ...
 |------|----------|--------|
 | `HOTPLEX_SESSION_MAX_CONCURRENT` | `session.max_concurrent` | `1000` |
 | `HOTPLEX_SESSION_RETENTION_PERIOD` | `session.retention_period` | `168h` |
+| `HOTPLEX_LIFECYCLE_POLICY` | `lifecycle.policy` | `v2` |
+| `HOTPLEX_LIFECYCLE_CONVERSATION_ARCHIVE_AFTER` | `lifecycle.conversation.archive_after` | `168h` |
+| `HOTPLEX_LIFECYCLE_CONVERSATION_RETENTION_AFTER_LAST_INPUT` | `lifecycle.conversation.retention_after_last_input` | `4320h` |
+| `HOTPLEX_LIFECYCLE_CONTENT_RETENTION` | `lifecycle.content.retention` | `4320h` |
+| `HOTPLEX_LIFECYCLE_EFFECT_PAYLOAD_RETENTION_AFTER_SETTLEMENT` | `lifecycle.effect_payload.retention_after_settlement` | `168h` |
+| `HOTPLEX_LIFECYCLE_FACTS_RETENTION_AFTER_SETTLEMENT` | `lifecycle.facts.retention_after_settlement` | `2160h` |
+| `HOTPLEX_LIFECYCLE_AUDIT_CAPTURE_CONTENT` | `lifecycle.audit.capture_content` | `false` |
+| `HOTPLEX_LIFECYCLE_AUDIT_FACTS_RETENTION` | `lifecycle.audit.facts_retention` | `4320h` |
+| `HOTPLEX_LIFECYCLE_AUDIT_CONTENT_RETENTION` | `lifecycle.audit.content_retention` | `4320h` |
+| `HOTPLEX_LIFECYCLE_MEDIA_RETENTION` | `lifecycle.media.retention` | `24h` |
+| `HOTPLEX_LIFECYCLE_TRACE_RETENTION` | `lifecycle.trace.retention` | `48h` |
+| `HOTPLEX_LIFECYCLE_GC_BATCH_SIZE` | `lifecycle.gc.batch_size` | `100` |
+| `HOTPLEX_LIFECYCLE_GC_INTERVAL` | `lifecycle.gc.interval` | `1m` |
+| `HOTPLEX_LIFECYCLE_GC_MAX_LAG` | `lifecycle.gc.max_lag` | `1h` |
 | `HOTPLEX_POOL_MAX_SIZE` | `pool.max_size` | `100` |
 | `HOTPLEX_POOL_MAX_IDLE_PER_USER` | `pool.max_idle_per_user` | `5` |
 | `HOTPLEX_POOL_MAX_MEMORY_PER_USER` | `pool.max_memory_per_user` | `3221225472` |
@@ -940,6 +982,7 @@ HOTPLEX_SECURITY_API_KEY_1, HOTPLEX_SECURITY_API_KEY_2, ...
 | `HOTPLEX_WORKER_MAX_LIFETIME` | `worker.max_lifetime` | `24h` |
 | `HOTPLEX_WORKER_IDLE_TIMEOUT` | `worker.idle_timeout` | `60m` |
 | `HOTPLEX_WORKER_EXECUTION_TIMEOUT` | `worker.execution_timeout` | `30m` |
+| `HOTPLEX_WORKER_TURN_TIMEOUT` | `worker.turn_timeout` | `30m` |
 | `HOTPLEX_WORKER_DEFAULT_WORK_DIR` | `worker.default_work_dir` | `~/.hotplex/workspace` |
 | `HOTPLEX_WORKER_CLAUDE_CODE_COMMAND` | `worker.claude_code.command` | `claude` |
 | `HOTPLEX_WORKER_OPENCODE_SERVER_COMMAND` | `worker.opencode_server.command` | `opencode` |

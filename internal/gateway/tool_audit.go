@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/hrygo/hotplex/internal/audit"
 	"github.com/hrygo/hotplex/pkg/events"
@@ -29,10 +28,6 @@ var sensitiveToolNames = map[string]bool{
 	"web_fetch":   true,
 	"web_search":  true,
 }
-
-// toolInputPreviewLimit caps the non-sensitive tool input preview length
-// (UTF-8 runes). Sensitive tools store full input (after sanitization).
-const toolInputPreviewLimit = 200
 
 // sensitiveInputPatterns match secret-like substrings inside tool inputs so
 // they are masked before the input is stored in the audit trail (spec §5.9:
@@ -56,20 +51,6 @@ func maskSensitiveInput(s string) string {
 	return audit.MaskSensitiveText(s)
 }
 
-// renderToolInput converts a tool's Input map to a stable JSON string for the
-// audit detail. Returns "" when the input is empty/unrenderable.
-func renderToolInput(input map[string]any) string {
-	if len(input) == 0 {
-		return ""
-	}
-	sanitized, _ := audit.SanitizeValue(input).(map[string]any)
-	b, err := json.Marshal(sanitized)
-	if err != nil {
-		return ""
-	}
-	return string(b)
-}
-
 // sha256Hex returns the hex-encoded sha256 of s. Used for non-sensitive tool
 // input fingerprinting (spec §5.3: non-sensitive stores summary + sha256).
 func sha256Hex(s string) string {
@@ -77,26 +58,17 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// truncateRunes returns the first n UTF-8 runes of s, suffixed with "…" when
-// truncation occurs.
-func truncateRunes(s string, n int) string {
-	if utf8.RuneCountInString(s) <= n {
-		return s
-	}
-	r := []rune(s)
-	return string(r[:n]) + "…"
-}
-
-// emitToolCallAudit enqueues a tool.call audit event. Non-blocking and safe to
-// call from the forward path; no-op when auditCollector is nil. Outcome is
-// success (see note on ToolCall branch in bridge_forward.go re: failure scope).
+// emitToolCallAudit enqueues a bodyless tool.call audit event. Non-blocking and
+// safe to call from the forward path; no-op when auditCollector is nil.
+// Outcome is success (see note on ToolCall branch in bridge_forward.go re:
+// failure scope).
 // Attribution: UserID comes from fc.sessOwner (resolved earlier via
 // sm.Get → OwnerID||UserID, same identity space as message.inbound's
 // env.OwnerID). UserIDType is "platform" per spec §5.4 tool.call backtracking
 // (session_id → sessions.user_id).
 func (b *Bridge) emitToolCallAudit(fc *forwardContext, tc *events.ToolCallData) {
 	c := b.auditCollector
-	if c == nil {
+	if c == nil || tc == nil {
 		return
 	}
 	userID := fc.sessOwner
@@ -119,41 +91,35 @@ func (b *Bridge) emitToolCallAudit(fc *forwardContext, tc *events.ToolCallData) 
 	_ = c.Enqueue(context.Background(), ua)
 }
 
-// buildToolCallDetail constructs the whitelisted detail_json for a tool.call
-// audit row. Per spec §5.3:
-//   - Sensitive tools → full input (after secret masking), no sha256 needed.
-//   - Non-sensitive tools → input sha256 + truncated preview.
-//
-// Always records: name, success (true at emit time), kind (if present), title.
+// buildToolCallDetail constructs the whitelisted, bodyless detail_json for a
+// tool.call audit row. Tool names are bounded identifiers because the upstream
+// worker controls this value; free-form names could otherwise carry user text.
 func buildToolCallDetail(tc *events.ToolCallData) string {
-	rawInput := renderToolInput(tc.Input)
-	sensitive := sensitiveToolNames[strings.ToLower(tc.Name)]
+	name := "unknown"
+	if tc != nil {
+		name = safeAuditToolName(tc.Name)
+	}
 	d := map[string]any{
-		"name":    tc.Name,
+		"name":    name,
 		"success": true, // tool was invoked; failure correlation is P3
-	}
-	if tc.Kind != "" {
-		d["kind"] = tc.Kind
-	}
-	if tc.Title != "" {
-		d["title"] = audit.MaskSensitiveText(tc.Title)
-	}
-	switch {
-	case sensitive:
-		// Full input, secrets masked (spec §5.3 sensitive-behavior full store).
-		masked := maskSensitiveInput(rawInput)
-		d["input"] = masked
-		d["sensitive"] = true
-	case rawInput != "":
-		// Summary + sha256 (spec §5.3 default).
-		d["input_sha256"] = sha256Hex(rawInput)
-		d["input_preview"] = truncateRunes(rawInput, toolInputPreviewLimit)
-	default:
-		// No input payload (e.g. parameterless tool).
-		d["input_sha256"] = ""
 	}
 	b, _ := json.Marshal(d)
 	return string(b)
+}
+
+func safeAuditToolName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 64 {
+		return "unknown"
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' || r == ':' {
+			continue
+		}
+		return "unknown"
+	}
+	return name
 }
 
 // emitPermissionRequestAudit enqueues a permission.request audit event when
@@ -168,14 +134,7 @@ func (b *Bridge) emitPermissionRequestAudit(fc *forwardContext, pr *events.Permi
 		userID = audit.AnonymousUserID
 	}
 
-	detailMap := map[string]any{
-		"id":          pr.ID,
-		"tool_name":   pr.ToolName,
-		"description": pr.Description,
-	}
-	if len(pr.Args) > 0 {
-		detailMap["args"] = pr.Args
-	}
+	detailMap := map[string]any{"id": pr.ID}
 
 	detailBytes, err := json.Marshal(detailMap)
 	var detailStr string

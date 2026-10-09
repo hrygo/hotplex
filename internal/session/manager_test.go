@@ -179,6 +179,110 @@ func TestManager_Create(t *testing.T) {
 	require.Equal(t, worker.TypeClaudeCode, info.WorkerType)
 	require.Equal(t, events.StateCreated, info.State)
 	require.NotNil(t, info.ExpiresAt)
+	require.Equal(t, config.LifecyclePolicyV2, info.LifecyclePolicy)
+	require.NotEmpty(t, info.LifecyclePolicyRevision)
+	require.Nil(t, info.LastInputAt, "creating a session without input must not fabricate last_input_at")
+	require.Equal(t, info.CreatedAt.Add(7*24*time.Hour), *info.ArchiveAt)
+	require.Equal(t, info.CreatedAt.Add(180*24*time.Hour), *info.ConversationExpiresAt)
+	require.Equal(t, info.ConversationExpiresAt, info.HistoryExpiresAt)
+}
+
+func TestManager_RecordInputAccepted_AdvancesAndPersistsLifecycleDeadlines(t *testing.T) {
+	t.Parallel()
+
+	store, cfg := helperDB(t)
+	cfg.Session.GCScanInterval = time.Hour
+	m, err := NewManager(t.Context(), nil, cfg, nil, store)
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+
+	info, err := m.Create(t.Context(), "sess_input_lifecycle", "user1", worker.TypeClaudeCode, nil, "", "test-session")
+	require.NoError(t, err)
+
+	acceptedAt := info.CreatedAt.Add(24 * time.Hour)
+	require.NoError(t, m.RecordInputAccepted(t.Context(), info.ID, acceptedAt))
+
+	got, err := store.Get(t.Context(), info.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.LastInputAt)
+	require.NotNil(t, got.ArchiveAt)
+	require.NotNil(t, got.ConversationExpiresAt)
+	require.NotNil(t, got.HistoryExpiresAt)
+	require.True(t, got.LastInputAt.Equal(acceptedAt))
+	require.True(t, got.ArchiveAt.Equal(acceptedAt.Add(cfg.Lifecycle.Conversation.ArchiveAfter)))
+	require.True(t, got.ConversationExpiresAt.Equal(acceptedAt.Add(cfg.Lifecycle.Conversation.RetentionAfterLastInput)))
+	require.True(t, got.HistoryExpiresAt.Equal(acceptedAt.Add(cfg.Lifecycle.Conversation.RetentionAfterLastInput)))
+	require.Nil(t, got.LastContentExpiresAt, "session activity must not invent per-record content expiry")
+
+	// Out-of-order acceptance must not shorten any persisted lifecycle deadline.
+	require.NoError(t, m.RecordInputAccepted(t.Context(), info.ID, acceptedAt.Add(-48*time.Hour)))
+	got, err = store.Get(t.Context(), info.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.LastInputAt)
+	require.NotNil(t, got.ArchiveAt)
+	require.NotNil(t, got.ConversationExpiresAt)
+	require.NotNil(t, got.HistoryExpiresAt)
+	require.True(t, got.LastInputAt.Equal(acceptedAt))
+	require.True(t, got.ArchiveAt.Equal(acceptedAt.Add(cfg.Lifecycle.Conversation.ArchiveAfter)))
+	require.True(t, got.ConversationExpiresAt.Equal(acceptedAt.Add(cfg.Lifecycle.Conversation.RetentionAfterLastInput)))
+	require.True(t, got.HistoryExpiresAt.Equal(acceptedAt.Add(cfg.Lifecycle.Conversation.RetentionAfterLastInput)))
+}
+
+func TestManager_RecordInputAccepted_PreservesAssignedPolicyAndRenewsV2(t *testing.T) {
+	t.Parallel()
+
+	store, cfg := helperDB(t)
+	cfg.Session.GCScanInterval = time.Hour
+	m, err := NewManager(t.Context(), nil, cfg, nil, store)
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+
+	now := time.Date(2026, time.October, 8, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		id       string
+		policy   string
+		revision string
+	}{
+		{name: "legacy", id: "sess_legacy", policy: config.LifecyclePolicyLegacy},
+		{name: "different revision", id: "sess_revision", policy: config.LifecyclePolicyV2, revision: "older-policy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := &SessionInfo{
+				ID:                      tc.id,
+				UserID:                  "user1",
+				WorkerType:              worker.TypeClaudeCode,
+				State:                   events.StateCreated,
+				CreatedAt:               now,
+				UpdatedAt:               now,
+				LifecyclePolicy:         tc.policy,
+				LifecyclePolicyRevision: tc.revision,
+				LastInputAt:             ptr(now),
+				ArchiveAt:               ptr(now.Add(24 * time.Hour)),
+				ConversationExpiresAt:   ptr(now.Add(48 * time.Hour)),
+				HistoryExpiresAt:        ptr(now.Add(48 * time.Hour)),
+			}
+			require.NoError(t, store.Upsert(t.Context(), before))
+
+			require.NoError(t, m.RecordInputAccepted(t.Context(), tc.id, now.Add(72*time.Hour)))
+
+			after, err := store.Get(t.Context(), tc.id)
+			require.NoError(t, err)
+			require.Equal(t, before.LifecyclePolicyRevision, after.LifecyclePolicyRevision)
+			if tc.policy == config.LifecyclePolicyV2 {
+				acceptedAt := now.Add(72 * time.Hour)
+				require.Equal(t, ptr(acceptedAt), after.LastInputAt)
+				require.Equal(t, ptr(acceptedAt.Add(cfg.Lifecycle.Conversation.ArchiveAfter)), after.ArchiveAt)
+				require.Equal(t, ptr(acceptedAt.Add(cfg.Lifecycle.Conversation.RetentionAfterLastInput)), after.ConversationExpiresAt)
+				require.Equal(t, after.ConversationExpiresAt, after.HistoryExpiresAt)
+				return
+			}
+			require.Equal(t, before.LastInputAt, after.LastInputAt)
+			require.Equal(t, before.ArchiveAt, after.ArchiveAt)
+			require.Equal(t, before.ConversationExpiresAt, after.ConversationExpiresAt)
+			require.Equal(t, before.HistoryExpiresAt, after.HistoryExpiresAt)
+		})
+	}
 }
 
 func TestManager_Get(t *testing.T) {
@@ -692,8 +796,15 @@ func TestManager_DeleteNotInMemoryNotifiesWorkerSessionCleanup(t *testing.T) {
 		ID:              "sess_stored_cleanup",
 		WorkerType:      worker.TypeOpenCodeSrv,
 		WorkerSessionID: "ocs-stored",
-	}, nil)
-	store.On("DeletePhysical", ctx, "sess_stored_cleanup").Return(nil)
+		State:           events.StateTerminated,
+		CreatedAt:       time.Now().Add(-time.Hour),
+		UpdatedAt:       time.Now().Add(-time.Hour),
+	}, nil).Once()
+	store.On("Upsert", ctx, mock.MatchedBy(func(info *SessionInfo) bool {
+		return info.ID == "sess_stored_cleanup" &&
+			info.State == events.StateDeleted &&
+			info.DeletedAt != nil
+	})).Return(nil).Once()
 
 	m, err := NewManager(ctx, nil, cfg, nil, store)
 	require.NoError(t, err)

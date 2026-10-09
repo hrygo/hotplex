@@ -146,7 +146,15 @@ func TestListRecent_TimeWindow(t *testing.T) {
 	ctx := context.Background()
 	store, _ := newTestSQLStore(t)
 	created := acceptN(t, store, "session-1", 2)
-	pivot := created[0].CreatedAt
+	// Accept timestamps are millisecond precision; pin this test's fixture
+	// explicitly so both executions do not accidentally share a clock tick.
+	pivot := int64(1_700_000_000_000)
+	for i, record := range created {
+		_, err := store.db.ExecContext(ctx,
+			`UPDATE execution_inputs SET created_at = ?, updated_at = ? WHERE execution_id = ?`,
+			pivot+int64(i), pivot+int64(i), record.ExecutionID)
+		require.NoError(t, err)
+	}
 
 	after, err := store.ListRecent(ctx, ListFilter{SinceMs: pivot})
 	require.NoError(t, err)

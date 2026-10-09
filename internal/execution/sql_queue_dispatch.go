@@ -37,8 +37,8 @@ func (s *SQLStore) settleQueuedTx(ctx context.Context, tx *sql.Tx, executionID, 
 	if settled == 0 {
 		return false, nil // not queued (or already settled) — caller decides
 	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM execution_queue WHERE execution_id = ?`, executionID); err != nil {
+	if _, err := tx.ExecContext(ctx, s.rebind(
+		`DELETE FROM execution_queue WHERE execution_id = ?`), executionID); err != nil {
 		return false, fmt.Errorf("execution: remove settled queue row: %w", err)
 	}
 	return true, nil
@@ -135,8 +135,8 @@ func (s *SQLStore) ClaimQueued(ctx context.Context, request ClaimQueuedRequest) 
 			return tx.Commit()
 		}
 
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM execution_queue WHERE execution_id = ?`, head.ExecutionID); err != nil {
+		if _, err := tx.ExecContext(ctx, s.rebind(
+			`DELETE FROM execution_queue WHERE execution_id = ?`), head.ExecutionID); err != nil {
 			return fail(fmt.Errorf("execution: remove claimed queue row: %w", err))
 		}
 
@@ -391,8 +391,8 @@ func (s *SQLStore) QueueDepthBySession(ctx context.Context, sessionID string) (i
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()
 	var depth int64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM execution_queue WHERE session_id = ?`, sessionID).Scan(&depth); err != nil {
+	if err := s.db.QueryRowContext(ctx, s.rebind(
+		`SELECT COUNT(*) FROM execution_queue WHERE session_id = ?`), sessionID).Scan(&depth); err != nil {
 		return 0, fmt.Errorf("execution: session queue depth: %w", err)
 	}
 	return depth, nil

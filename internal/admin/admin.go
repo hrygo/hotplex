@@ -172,38 +172,39 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 }
 
 type AdminAPI struct {
-	log              *slog.Logger
-	cfg              ConfigProvider
-	sm               SessionManagerProvider
-	turnStore        TurnStatsProvider
-	hub              HubProvider
-	bridge           BridgeProvider
-	configWatcher    ConfigWatcherProvider
-	cron             CronSchedulerProvider
-	botLister        BotListerProvider
-	botConfig        BotConfigProvider
-	wsStore          session.UserWorkspaceStore // Optional: enables /admin/workspaces console (issue #807); nil when multitenancy/webchat disabled
-	logCollector     LogCollector
-	akStore          APIKeyUserStorer // nil when DB resolver not enabled
-	keyValidator     KeyValidator     // nil when not injected
-	rateLimiter      atomic.Value     // *simpleRateLimiter
-	allowedCIDRs     atomic.Value     // []string
-	allowedOriginsFn func() []string  // returns allowed CORS origins from config
-	version          func() string
-	newSessionID     func() string
-	restart          func() error
-	restartPrepare   func(context.Context) (func() error, func() error, error)
-	cookieAuth       *security.CookieAuth           // Optional: enables cookie-session fallback (issue #788 A2)
-	idp              *security.LocalAccountProvider // Optional: paired with cookieAuth
-	startedAt        time.Time
-	activityService  *ActivityService         // Optional: enables /admin/activity + /admin/users/{id}/activity (issue #833)
-	auditCollector   *audit.Collector         // Optional: emits system.audit_export meta-audit rows (issue #833)
-	skillsLocator    *skills.Locator          // Optional: enables /admin/api/skills global skill management (issue #910)
-	builtinSkills    BuiltinSkillsCatalog     // Optional: embedded read-only Agent Skills
-	runtimeExec      RuntimeExecutionProvider // Optional: enables /admin/executions fence endpoints (#877); nil → 503
-	runtimeNotifier  RuntimeEventNotifier     // Optional: emits runtime.execution.failed on abandon (#877)
-	runtimeEffects   RuntimeEffectProvider    // Optional: enables /admin/effect endpoints; nil → 503
-	runtimeQueue     RuntimeQueueProvider     // Optional: enables /admin input-queue endpoints; nil → 503
+	log                *slog.Logger
+	cfg                ConfigProvider
+	sm                 SessionManagerProvider
+	turnStore          TurnStatsProvider
+	hub                HubProvider
+	bridge             BridgeProvider
+	configWatcher      ConfigWatcherProvider
+	cron               CronSchedulerProvider
+	botLister          BotListerProvider
+	botConfig          BotConfigProvider
+	wsStore            session.UserWorkspaceStore // Optional: enables /admin/workspaces console (issue #807); nil when multitenancy/webchat disabled
+	logCollector       LogCollector
+	akStore            APIKeyUserStorer // nil when DB resolver not enabled
+	keyValidator       KeyValidator     // nil when not injected
+	rateLimiter        atomic.Value     // *simpleRateLimiter
+	allowedCIDRs       atomic.Value     // []string
+	allowedOriginsFn   func() []string  // returns allowed CORS origins from config
+	version            func() string
+	newSessionID       func() string
+	restart            func() error
+	restartPrepare     func(context.Context) (func() error, func() error, error)
+	cookieAuth         *security.CookieAuth           // Optional: enables cookie-session fallback (issue #788 A2)
+	idp                *security.LocalAccountProvider // Optional: paired with cookieAuth
+	startedAt          time.Time
+	activityService    *ActivityService           // Optional: enables /admin/activity + /admin/users/{id}/activity (issue #833)
+	auditCollector     *audit.Collector           // Optional: emits system.audit_export meta-audit rows (issue #833)
+	skillsLocator      *skills.Locator            // Optional: enables /admin/api/skills global skill management (issue #910)
+	builtinSkills      BuiltinSkillsCatalog       // Optional: embedded read-only Agent Skills
+	runtimeExec        RuntimeExecutionProvider   // Optional: enables /admin/executions fence endpoints (#877); nil → 503
+	runtimeNotifier    RuntimeEventNotifier       // Optional: emits runtime.execution.failed on abandon (#877)
+	runtimeEffects     RuntimeEffectProvider      // Optional: enables /admin/effect endpoints; nil → 503
+	runtimeQueue       RuntimeQueueProvider       // Optional: enables /admin input-queue endpoints; nil → 503
+	lifecycleMigration LifecycleMigrationProvider // Optional: explicit legacy retention migration
 	// Execution console (#868). Each view is optional and degrades its own
 	// section to "unavailable" rather than failing the whole projection.
 	consoleExecutions ExecutionReader       // Optional: execution list + detail lookup
@@ -216,28 +217,29 @@ type AdminAPI struct {
 }
 
 type Deps struct {
-	Log              *slog.Logger
-	Config           ConfigProvider
-	SessionMgr       SessionManagerProvider
-	TurnStats        TurnStatsProvider
-	Hub              HubProvider
-	Bridge           BridgeProvider
-	ConfigWatcher    ConfigWatcherProvider
-	Cron             CronSchedulerProvider
-	BotLister        BotListerProvider
-	BotConfig        BotConfigProvider
-	WorkspaceStore   session.UserWorkspaceStore // Optional: enables /admin/workspaces console (issue #807)
-	LogCollector     LogCollector
-	Version          func() string
-	NewSessionID     func() string
-	Restart          func() error
-	RestartPrepare   func(context.Context) (func() error, func() error, error)
-	AllowedOriginsFn func() []string  // Optional: returns allowed CORS origins; defaults to ["*"] when nil
-	DB               DBExecutor       // Optional: enables API key user CRUD + DB resolver
-	DBResolver       cacheInvalidator // Optional: invalidates DBResolver cache after CUD
-	WriteMu          *sqlutil.WriteMu // Optional: serializes SQLite writes; nil-safe, PG-safe
-	APIKeyStore      APIKeyUserStorer // Optional: pre-built store (e.g. PG); overrides DB-based creation
-	KeyValidator     KeyValidator     // Optional: syncs DB keys into auth layer for Phase 1 validation
+	Log                *slog.Logger
+	Config             ConfigProvider
+	SessionMgr         SessionManagerProvider
+	TurnStats          TurnStatsProvider
+	Hub                HubProvider
+	Bridge             BridgeProvider
+	ConfigWatcher      ConfigWatcherProvider
+	Cron               CronSchedulerProvider
+	BotLister          BotListerProvider
+	BotConfig          BotConfigProvider
+	WorkspaceStore     session.UserWorkspaceStore // Optional: enables /admin/workspaces console (issue #807)
+	LogCollector       LogCollector
+	Version            func() string
+	NewSessionID       func() string
+	Restart            func() error
+	RestartPrepare     func(context.Context) (func() error, func() error, error)
+	AllowedOriginsFn   func() []string  // Optional: returns allowed CORS origins; defaults to ["*"] when nil
+	DB                 DBExecutor       // Optional: enables API key user CRUD + DB resolver
+	DBResolver         cacheInvalidator // Optional: invalidates DBResolver cache after CUD
+	WriteMu            *sqlutil.WriteMu // Optional: serializes SQLite writes; nil-safe, PG-safe
+	LifecycleMigration LifecycleMigrationProvider
+	APIKeyStore        APIKeyUserStorer // Optional: pre-built store (e.g. PG); overrides DB-based creation
+	KeyValidator       KeyValidator     // Optional: syncs DB keys into auth layer for Phase 1 validation
 }
 
 func New(deps Deps) *AdminAPI {
@@ -246,19 +248,20 @@ func New(deps Deps) *AdminAPI {
 		lc = LogRing
 	}
 	a := &AdminAPI{
-		log:           deps.Log,
-		cfg:           deps.Config,
-		sm:            deps.SessionMgr,
-		turnStore:     deps.TurnStats,
-		hub:           deps.Hub,
-		bridge:        deps.Bridge,
-		configWatcher: deps.ConfigWatcher,
-		cron:          deps.Cron,
-		botLister:     deps.BotLister,
-		botConfig:     deps.BotConfig,
-		wsStore:       deps.WorkspaceStore,
-		logCollector:  lc,
-		keyValidator:  deps.KeyValidator,
+		log:                deps.Log,
+		cfg:                deps.Config,
+		sm:                 deps.SessionMgr,
+		turnStore:          deps.TurnStats,
+		hub:                deps.Hub,
+		bridge:             deps.Bridge,
+		configWatcher:      deps.ConfigWatcher,
+		cron:               deps.Cron,
+		botLister:          deps.BotLister,
+		botConfig:          deps.BotConfig,
+		wsStore:            deps.WorkspaceStore,
+		logCollector:       lc,
+		keyValidator:       deps.KeyValidator,
+		lifecycleMigration: deps.LifecycleMigration,
 		akStore: func() APIKeyUserStorer {
 			if deps.APIKeyStore != nil {
 				return deps.APIKeyStore

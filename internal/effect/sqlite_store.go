@@ -20,6 +20,11 @@ type SQLiteStore struct {
 	planner *Planner
 }
 
+// SetRetentionPolicy configures new effects before the store is shared.
+func (s *SQLiteStore) SetRetentionPolicy(payload, facts time.Duration, revision string) {
+	s.planner.SetRetentionPolicy(payload, facts, revision)
+}
+
 // NewSQLiteStore creates a SQLite-backed effect store.
 func NewSQLiteStore(db *sql.DB, log *slog.Logger, writeMu *sqlutil.WriteMu) *SQLiteStore {
 	return &SQLiteStore{

@@ -5,5 +5,6 @@ SELECT id, session_id, client_message_id, generation, turn_num, seq, role, conte
        tokens_out, duration_ms, cost_usd, created_at
 FROM turns
 WHERE session_id = ? AND id < ?
+  AND ((expires_at > 0 AND expires_at > ?) OR (expires_at = 0 AND created_at > ?))
 ORDER BY id DESC
 LIMIT ?

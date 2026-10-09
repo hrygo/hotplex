@@ -61,7 +61,6 @@ type forwardContext struct {
 	lastError      *events.ErrorData
 	pendingError   *events.Envelope
 	turnTimerFired atomic.Bool
-	turnTimer      *time.Timer
 	lifecycle      *workerRunLifecycle
 	// flog carries trace_id from the forwardEvents OTel span. Helpers must
 	// use fc.flog (not b.log) to keep log lines correlatable with the span.
@@ -235,38 +234,43 @@ func (b *Bridge) forwardEvents(fb forwarderBinding, sessionID string, opts forwa
 		}
 	}
 
-	if b.turnTimeout > 0 {
-		fc.turnTimer = time.AfterFunc(b.turnTimeout, func() {
-			releaseEvent, admitted := fc.lifecycle.beginEvent()
-			if !admitted {
-				return
-			}
-			defer releaseEvent()
-			if !fc.turnTimerFired.CompareAndSwap(false, true) {
-				return
-			}
-			if !fc.claimTerminal() {
-				return
-			}
-			flog.Warn("bridge: turn timeout exceeded, terminating worker",
-				"session_id", sessionID, "worker_type", workerType, "turn_timeout", b.turnTimeout)
-			b.sendError(sessionID, events.ErrCodeTurnTimeout, "Turn exceeded %v time limit and was terminated.", b.turnTimeout)
-			acc := b.getOrInitAccum(sessionID, fc.workDir, fc.startTime)
-			b.captureSyntheticEvent(syntheticTurnParams{
-				SessionID:  sessionID,
-				Reason:     "turn_timeout",
-				Message:    fmt.Sprintf("Turn exceeded %v time limit", b.turnTimeout),
-				Source:     eventstore.SourceTimeout,
-				Platform:   fc.sessPlatform,
-				Owner:      fc.sessOwner,
-				Model:      acc.ModelName,
-				Generation: acc.Generation.Load(),
-				TurnNum:    int(acc.TurnCount.Load()),
-			})
-			_ = w.Terminate(context.Background())
+	fc.lifecycle.setTurnTimeoutHandler(func(generation uint64) {
+		releaseEvent, admitted := fc.lifecycle.beginEvent()
+		if !admitted {
+			return
+		}
+		defer releaseEvent()
+		if !fc.lifecycle.turnTimeoutCurrent(generation) {
+			return
+		}
+		if !fc.turnTimerFired.CompareAndSwap(false, true) {
+			return
+		}
+		if !fc.claimTerminal() {
+			return
+		}
+		fc.lifecycle.stopTurnTimeout()
+		acc := b.getOrInitAccum(sessionID, fc.workDir, fc.startTime)
+		acc.clearTurnStart()
+		b.finishTurnTTFT(sessionID, "timeout")
+		flog.Warn("bridge: turn timeout exceeded, terminating worker",
+			"session_id", sessionID, "worker_type", workerType, "turn_timeout", b.turnTimeout)
+		if err := w.Terminate(context.Background()); err != nil {
+			flog.Warn("bridge: terminate worker after turn timeout", "session_id", sessionID, "err", err)
+		}
+		b.finishTurnTimeout(sessionID, fc, syntheticTurnParams{
+			SessionID:  sessionID,
+			Reason:     "turn_timeout",
+			Message:    fmt.Sprintf("Turn exceeded %v time limit", b.turnTimeout),
+			Source:     eventstore.SourceTimeout,
+			Platform:   fc.sessPlatform,
+			Owner:      fc.sessOwner,
+			Model:      acc.ModelName,
+			Generation: acc.Generation.Load(),
+			TurnNum:    int(acc.TurnCount.Load()),
 		})
-		defer fc.turnTimer.Stop()
-	}
+	})
+	defer fc.lifecycle.clearTurnTimeoutHandler()
 
 	// Event source: the frozen Conn captured at launch (Fix A). forwardEvents
 	// MUST NOT call w.Conn() here — doing so would re-read the mutable field and
@@ -497,9 +501,6 @@ func (b *Bridge) processForwardedEvent(env *events.Envelope, w worker.Worker, op
 		}
 	}
 
-	if fc.turnTimer != nil && !fc.turnTimerFired.Load() {
-		fc.turnTimer.Reset(b.turnTimeout)
-	}
 	if fc.turnTimerFired.Load() {
 		return
 	}
@@ -587,6 +588,10 @@ func (b *Bridge) processForwardedEvent(env *events.Envelope, w worker.Worker, op
 		}
 		fc.lastError = nil
 		return // continue — retry produces new events on recv
+	}
+
+	if env.Event.Type == events.Done || env.Event.Type == events.Error {
+		fc.lifecycle.stopTurnTimeout()
 	}
 
 	if env.Event.Type == events.Done && isDone && !doneData.Success && fc.pendingError != nil {
@@ -801,6 +806,51 @@ func (b *Bridge) emitRuntimeFactOnDone(sessionID string, fact *pendingRuntimeFac
 	_ = b.hub.SendToSession(context.Background(), rtEnv)
 }
 
+// finishTurnTimeout closes the durable runtime execution before publishing its
+// terminal events. A timeout is an ordinary failed execution: releasing the
+// active gate lets the queued head proceed after the Worker has been stopped.
+// The error and runtime fact are sent in sequence order; the synthetic Done is
+// persisted for history but remains hidden from the client.
+func (b *Bridge) finishTurnTimeout(sessionID string, fc *forwardContext, turn syntheticTurnParams) {
+	if b.hub == nil {
+		return
+	}
+
+	if b.collector != nil {
+		releaseSeq, ok := b.hub.BeginSeqOperation(sessionID)
+		if !ok {
+			return
+		}
+		defer releaseSeq()
+		order := b.hub.SeqOrderLock(sessionID)
+		order.Lock()
+		defer order.Unlock()
+	}
+
+	done := events.NewEnvelope(aep.NewID(), sessionID, 0, events.Done, events.DoneData{
+		Success: false,
+		Reason:  turn.Reason,
+	})
+	done.OwnerID = fc.sessOwner
+	runtimeFact := b.finishRuntimeOnDone(sessionID, fc, done)
+
+	errEnv := events.NewEnvelope(aep.NewID(), sessionID, 0, events.Error, events.ErrorData{
+		Code:    events.ErrCodeTurnTimeout,
+		Message: fmt.Sprintf("Turn exceeded %v time limit and was terminated.", b.turnTimeout),
+	})
+	errEnv.OwnerID = fc.sessOwner
+	if b.collector != nil {
+		errEnv.Seq = b.hub.NextSeqHeld(sessionID)
+	}
+	if err := b.hub.SendToSession(context.Background(), errEnv); err != nil {
+		b.flogOf(fc).Warn("bridge: send turn timeout error", "session_id", sessionID, "err", err)
+	}
+	b.captureEvent(sessionID, errEnv.Seq, errEnv.Event.Type, errEnv.Event.Data, b.flogOf(fc))
+
+	b.captureSyntheticEventHeld(turn)
+	b.emitRuntimeFactOnDone(sessionID, runtimeFact)
+}
+
 // extractTurnContent extracts message/reasoning content for turn tracking.
 func (b *Bridge) extractTurnContent(env *events.Envelope, fc *forwardContext) (deltaContent, reasoningContent string) {
 	switch env.Event.Type {
@@ -877,9 +927,6 @@ func (b *Bridge) accumulateStats(env *events.Envelope, w worker.Worker, opts for
 			b.emitToolCallAudit(fc, &tc)
 		}
 	case events.Done:
-		if fc.turnTimer != nil {
-			fc.turnTimer.Stop()
-		}
 		acc := b.getOrInitAccum(sessionID, opts.workDir, fc.startTime)
 		success := false
 		if dd, ok := asDoneData(env.Event.Data); ok {
@@ -1489,12 +1536,7 @@ func (b *Bridge) captureSyntheticEvent(p syntheticTurnParams) {
 	if b.collector == nil {
 		return
 	}
-	data, err := json.Marshal(map[string]any{
-		"success":   false,
-		"reason":    p.Reason,
-		"message":   p.Message,
-		"synthetic": true,
-	})
+	data, err := marshalSyntheticEvent(p)
 	if err != nil {
 		return
 	}
@@ -1504,23 +1546,60 @@ func (b *Bridge) captureSyntheticEvent(p syntheticTurnParams) {
 		data,
 		p.Source,
 		func(seq int64) {
-			sFalse := false
-			b.collector.CaptureTurn(&eventstore.TurnWriteRequest{
-				SessionID:  p.SessionID,
-				Generation: p.Generation,
-				TurnNum:    p.TurnNum,
-				Seq:        seq,
-				Role:       eventstore.RoleAssistant,
-				Content:    p.Message,
-				Platform:   p.Platform,
-				UserID:     p.Owner,
-				Model:      p.Model,
-				Source:     p.Source,
-				Success:    &sFalse,
-				CreatedAt:  time.Now().UnixMilli(),
-			})
+			b.captureSyntheticTurn(p, seq)
 		},
 	)
+}
+
+// captureSyntheticEventHeld is the sequence-lease variant used when a caller
+// already owns the Hub barrier and publish-order lock.
+func (b *Bridge) captureSyntheticEventHeld(p syntheticTurnParams) {
+	if b.collector == nil {
+		return
+	}
+	data, err := marshalSyntheticEvent(p)
+	if err != nil {
+		return
+	}
+	b.nextSeqAndCaptureHeld(
+		p.SessionID,
+		events.Done,
+		data,
+		p.Source,
+		func(seq int64) {
+			b.captureSyntheticTurn(p, seq)
+		},
+	)
+}
+
+func marshalSyntheticEvent(p syntheticTurnParams) ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"success":   false,
+		"reason":    p.Reason,
+		"message":   p.Message,
+		"synthetic": true,
+	})
+}
+
+func (b *Bridge) captureSyntheticTurn(p syntheticTurnParams, seq int64) {
+	if b.collector == nil {
+		return
+	}
+	sFalse := false
+	b.collector.CaptureTurn(&eventstore.TurnWriteRequest{
+		SessionID:  p.SessionID,
+		Generation: p.Generation,
+		TurnNum:    p.TurnNum,
+		Seq:        seq,
+		Role:       eventstore.RoleAssistant,
+		Content:    p.Message,
+		Platform:   p.Platform,
+		UserID:     p.Owner,
+		Model:      p.Model,
+		Source:     p.Source,
+		Success:    &sFalse,
+		CreatedAt:  time.Now().UnixMilli(),
+	})
 }
 
 // captureAssistantTurn writes an assistant turn record from the done event path.

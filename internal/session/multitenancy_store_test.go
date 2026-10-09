@@ -234,7 +234,8 @@ func TestWorkspacesStore_DeleteIfEmpty_BlockedByActiveSession(t *testing.T) {
 	// 插入一条活跃会话（state=running, workspace_id=ws-1）模拟 Count↔Delete 间的并发新建。
 	_, err := store.db.ExecContext(ctx, queries["sessions.upsert_session"],
 		"sess-1", "u-1", "u-1", "", "", "", "claude_code", "running", "webchat", "{}", "/tmp/x", "",
-		int64(1700000000), int64(1700000000), int64(1800000000), int64(1800000000), "{}", "", "ck-1", "ws-1", "sess-1")
+		int64(1700000000), int64(1700000000), int64(1800000000), int64(1800000000), "{}", "", "ck-1", "ws-1",
+		"legacy", "", nil, nil, nil, nil, nil, nil, nil, "sess-1")
 	require.NoError(t, err)
 
 	// 有活跃会话：原子删除拒绝（防 TOCTOU 后 workspace_id 悬空）。

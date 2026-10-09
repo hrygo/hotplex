@@ -71,6 +71,21 @@ func TestAcceptQueued_WritesQueuedExecutionAndDurableEntry(t *testing.T) {
 	require.Equal(t, entry, stored)
 }
 
+func TestAcceptQueued_RejectsRetiredSession(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store, sessionStore := newTestSQLStore(t)
+	expired := time.Now().Add(-time.Hour)
+	_, err := sessionStore.DB().ExecContext(ctx,
+		`UPDATE sessions SET lifecycle_policy = ?, conversation_expires_at = ? WHERE id = ?`,
+		config.LifecyclePolicyV2, expired, "session-1")
+	require.NoError(t, err)
+
+	_, _, _, err = store.AcceptQueued(ctx, queuedReq("session-1", "message-after-expiry"), QueueLimits{})
+	require.ErrorIs(t, err, ErrSessionExpired)
+}
+
 // TestAcceptQueued_DuplicateReturnsOriginalWithoutConsumingCapacity proves a
 // retried message costs nothing: no second queue row, no second ordinal, and
 // the capacity budget it would have consumed stays available.

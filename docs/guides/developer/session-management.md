@@ -14,6 +14,24 @@ Session 是 HotPlex Gateway 的核心抽象。每个 Session 代表一次用户�
 
 Session ID 使用 UUIDv5 确定性生成（`session.DeriveSessionKey`），确保相同输入参数始终映射到同一 Session。
 
+## 生命周期时钟
+
+v2 将运行资源与会话历史分开计时，默认值如下：
+
+| 内容 | 默认期限 | 起算点与行为 |
+|------|----------|-------------|
+| Worker 空闲回收 | 60 分钟 | 无 Worker I/O 时释放运行资源；会话记录和历史不因此删除 |
+| 单轮运行上限 | 30 分钟 | 从本轮输入开始计算，流式输出不会重置绝对 deadline |
+| 会话归档标记 | 7 天 | 最近一次有效输入后标记归档；仍可查看和续聊 |
+| 会话保留期限 | 180 天 | 从最近一次有效输入起算，新输入可延长会话期限 |
+| 单条聊天正文 | 180 天 | 每条事件/轮次按自身创建时间计算；后续输入不会延长旧正文 |
+
+查看历史、分页或修改标题不续期。`session.retention_period` 是兼容的运行到期配置，不等于会话历史期限。当前代码会按逐条期限过滤过期正文；用户主动删除后的异步清理进度可通过 `GET /api/sessions/{id}/cleanup` 查询。会话期限到期后的自动退役和物理清理仍在实施中。
+
+### 删除后的清理进度
+
+`DELETE /api/sessions/{id}` 会立即隐藏会话、阻止续聊并排入后台清理；接口返回 `204` 表示删除已受理，不代表所有副本已清除。所有者可以查询 `GET /api/sessions/{id}/cleanup`，直到整体 `status` 变为 `complete`。响应仅包含各清理部分的状态、重试次数和安全错误代码，不返回聊天正文或提供方原始错误。
+
 ## 5 状态机
 
 ```
@@ -28,7 +46,7 @@ CREATED → RUNNING ⟷ IDLE → TERMINATED → DELETED
 | `CREATED` | true | 已创建，未启动 Worker | 瞬态（<1s） |
 | `RUNNING` | true | Worker 正在执行 | 整个 Turn 执行期间 |
 | `IDLE` | true | 等待用户输入 | `idle_timeout` 到期前 |
-| `TERMINATED` | false | Worker 已终止，历史保留 | `retention_period` 到期前 |
+| `TERMINATED` | false | Worker 已终止，历史期限独立计算 | Legacy `term_retention` 或 v2 会话期限 |
 | `DELETED` | false | 终态，记录已删除 | 永久 |
 
 ### 合法状态转换
@@ -42,7 +60,7 @@ CREATED → RUNNING ⟷ IDLE → TERMINATED → DELETED
 | `RUNNING → TERMINATED` | `/gc`、Worker 崩溃、`max_turns` 限制 |
 | `RUNNING → DELETED` | Admin API 强制删除 |
 | `TERMINATED → RUNNING` | Resume（重启 Worker 进程，`--resume` 恢复对话） |
-| `TERMINATED → DELETED` | GC retention_period 过期 / Admin API 删除 |
+| `TERMINATED → DELETED` | Legacy 终止记录 GC / Admin API 删除 |
 | `IDLE → DELETED` | Admin API 强制删除 |
 
 ## /gc 与 /reset：何时使用
@@ -210,4 +228,4 @@ type DebugSessionSnapshot struct {
 
 > **注意**：`max_lifetime`（即 `expires_at` 到期）作用于**所有状态**的 Session（包括 `RUNNING`、`IDLE`），不限于 `IDLE → TERMINATED` 转换。它是一个全局生命周期上限，确保 Session 不会无限存活。
 
-**注意**：`TERMINATED` Session 的记录不会被自动删除。它们作为 "resume 决策标记"，告诉 Gateway 之前的 Session 存在过，Worker 的 session 文件可能仍在磁盘上。物理删除应通过 Admin API 显式执行。
+**注意**：Legacy `TERMINATED` Session 会按 `term_retention` / `cron_term_retention` 自动清理，v2 会话不会被这两项提前删除。v2 的到期自动退役尚未接线；当前仍应把它们视为可能可恢复的 Session。用户主动删除时，Worker 侧记录由对应 adapter 的异步清理任务处理，进度可通过 `/api/sessions/{id}/cleanup` 查看。

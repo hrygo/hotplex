@@ -21,9 +21,12 @@ func TestRateLimiter_Refill(t *testing.T) {
 	rl := NewRateLimiter(100, 1) // 100 req/s, burst 1
 
 	require.True(t, rl.Allow(), "initial token")
+	rl.UpdateRate(0, 1)
 	require.False(t, rl.Allow(), "no tokens")
 
-	// Wait for refill (>10ms at 100/s = 1 token per 10ms)
+	// Re-enable refill after the empty-bucket assertion so scheduler delays
+	// cannot refill the token between the two immediate checks above.
+	rl.UpdateRate(100, 1)
 	require.Eventually(t, rl.Allow, 500*time.Millisecond, 10*time.Millisecond, "refilled token")
 }
 

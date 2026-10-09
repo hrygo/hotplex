@@ -53,7 +53,7 @@ func Default() *Config {
 			MaxLifetime:      24 * time.Hour,
 			IdleTimeout:      60 * time.Minute,
 			ExecutionTimeout: 30 * time.Minute,
-			TurnTimeout:      0, // disabled by default; execution_timeout catches zombies
+			TurnTimeout:      30 * time.Minute,
 			EnvBlocklist:     nil,
 			DefaultWorkDir:   filepath.Join(HotplexHome(), "workspace"),
 			PIDDir:           filepath.Join(HotplexHome(), ".pids"),
@@ -105,6 +105,7 @@ func Default() *Config {
 				PerSession:      20,
 				Global:          1000,
 				MaxPayloadBytes: 64 << 10,
+				InteractiveTTL:  15 * time.Minute,
 				TTL:             24 * time.Hour,
 				SweepInterval:   time.Minute,
 				SweepBatch:      100,
@@ -227,6 +228,38 @@ func Default() *Config {
 			},
 			Sinks: []AuditSinkConfig{
 				{Name: "noop", Type: "noop", Config: map[string]any{}},
+			},
+		},
+		Lifecycle: LifecycleConfig{
+			Policy: "v2",
+			Conversation: LifecycleConversationConfig{
+				ArchiveAfter:            7 * 24 * time.Hour,
+				RetentionAfterLastInput: 180 * 24 * time.Hour,
+			},
+			Content: LifecycleContentConfig{
+				Retention: 180 * 24 * time.Hour,
+			},
+			EffectPayload: LifecycleEffectPayloadConfig{
+				RetentionAfterSettlement: 7 * 24 * time.Hour,
+			},
+			Facts: LifecycleFactsConfig{
+				RetentionAfterSettlement: 90 * 24 * time.Hour,
+			},
+			Audit: LifecycleAuditConfig{
+				CaptureContent:   false,
+				FactsRetention:   180 * 24 * time.Hour,
+				ContentRetention: 180 * 24 * time.Hour,
+			},
+			Media: LifecycleMediaConfig{
+				Retention: 24 * time.Hour,
+			},
+			Trace: LifecycleTraceConfig{
+				Retention: 48 * time.Hour,
+			},
+			GC: LifecycleGCConfig{
+				BatchSize: 100,
+				Interval:  time.Minute,
+				MaxLag:    time.Hour,
 			},
 		},
 	}

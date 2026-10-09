@@ -70,6 +70,7 @@ func Load(filePath string) (*Config, error) {
 	_ = v.BindEnv("worker.max_lifetime")
 	_ = v.BindEnv("worker.idle_timeout")
 	_ = v.BindEnv("worker.execution_timeout")
+	_ = v.BindEnv("worker.turn_timeout")
 	_ = v.BindEnv("worker.auto_retry.enabled")
 	_ = v.BindEnv("worker.auto_retry.max_retries")
 	_ = v.BindEnv("worker.claude_code.command")
@@ -135,9 +136,24 @@ func Load(filePath string) (*Config, error) {
 	_ = v.BindEnv("execution.queue.per_session")
 	_ = v.BindEnv("execution.queue.global")
 	_ = v.BindEnv("execution.queue.max_payload_bytes")
+	_ = v.BindEnv("execution.queue.interactive_ttl")
 	_ = v.BindEnv("execution.queue.ttl")
 	_ = v.BindEnv("execution.queue.sweep_interval")
 	_ = v.BindEnv("execution.queue.sweep_batch")
+	_ = v.BindEnv("lifecycle.policy")
+	_ = v.BindEnv("lifecycle.conversation.archive_after")
+	_ = v.BindEnv("lifecycle.conversation.retention_after_last_input")
+	_ = v.BindEnv("lifecycle.content.retention")
+	_ = v.BindEnv("lifecycle.effect_payload.retention_after_settlement")
+	_ = v.BindEnv("lifecycle.facts.retention_after_settlement")
+	_ = v.BindEnv("lifecycle.audit.capture_content")
+	_ = v.BindEnv("lifecycle.audit.facts_retention")
+	_ = v.BindEnv("lifecycle.audit.content_retention")
+	_ = v.BindEnv("lifecycle.media.retention")
+	_ = v.BindEnv("lifecycle.trace.retention")
+	_ = v.BindEnv("lifecycle.gc.batch_size")
+	_ = v.BindEnv("lifecycle.gc.interval")
+	_ = v.BindEnv("lifecycle.gc.max_lag")
 	_ = v.BindEnv("audit.enabled")
 	_ = v.BindEnv("audit.retention")
 	_ = v.BindEnv("audit.full_content_retention")
@@ -146,6 +162,9 @@ func Load(filePath string) (*Config, error) {
 	_ = v.BindEnv("audit.collector.batch_size")
 	_ = v.BindEnv("audit.collector.spill_dir")
 
+	if err := rejectExplicitlyEmptyLifecycleEnv(); err != nil {
+		return nil, err
+	}
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, fmt.Errorf("config: environment override: %w", err)
 	}
@@ -155,6 +174,33 @@ func Load(filePath string) (*Config, error) {
 	cfg.normalizePaths()
 
 	return cfg, nil
+}
+
+func rejectExplicitlyEmptyLifecycleEnv() error {
+	paths := []string{
+		"lifecycle.policy",
+		"lifecycle.conversation.archive_after",
+		"lifecycle.conversation.retention_after_last_input",
+		"lifecycle.content.retention",
+		"lifecycle.effect_payload.retention_after_settlement",
+		"lifecycle.facts.retention_after_settlement",
+		"lifecycle.audit.capture_content",
+		"lifecycle.audit.facts_retention",
+		"lifecycle.audit.content_retention",
+		"lifecycle.media.retention",
+		"lifecycle.trace.retention",
+		"lifecycle.gc.batch_size",
+		"lifecycle.gc.interval",
+		"lifecycle.gc.max_lag",
+		"execution.queue.interactive_ttl",
+	}
+	for _, path := range paths {
+		envKey := "HOTPLEX_" + strings.ToUpper(strings.ReplaceAll(path, ".", "_"))
+		if value, ok := os.LookupEnv(envKey); ok && strings.TrimSpace(value) == "" {
+			return fmt.Errorf("config: %s is explicitly empty", envKey)
+		}
+	}
+	return nil
 }
 
 // loadRecursive loads a config file and its ancestors, detecting cycles.

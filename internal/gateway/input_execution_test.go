@@ -22,25 +22,29 @@ import (
 var errFakeQueueUnsupported = errors.New("fake execution store: queue unsupported")
 
 type fakeExecutionStore struct {
-	mu            sync.Mutex
-	record        *execution.Record
-	duplicate     bool
-	acceptErr     error
-	statusErr     error
-	lastAccept    execution.AcceptRequest
-	status        execution.Status
-	errorCode     string
-	statusCalls   int
-	openRecord    *execution.Record
-	activeRecord  *execution.Record   // when set, ActiveBySession reports the gate as held
-	activeResults []*execution.Record // optional ordered ActiveBySession results; nil entry means ErrNotFound
-	activeCalls   int
-	markRunID     string
-	markErr       error
-	finishRunID   string
-	finishStatus  execution.RuntimeStatus
-	finishErr     error
-	latestErr     error
+	mu              sync.Mutex
+	record          *execution.Record
+	duplicate       bool
+	acceptErr       error
+	statusErr       error
+	lastAccept      execution.AcceptRequest
+	status          execution.Status
+	errorCode       string
+	statusCalls     int
+	openRecord      *execution.Record
+	activeRecord    *execution.Record   // when set, ActiveBySession reports the gate as held
+	activeResults   []*execution.Record // optional ordered ActiveBySession results; nil entry means ErrNotFound
+	activeCalls     int
+	markRunID       string
+	markErr         error
+	turnStartedAt   int64
+	turnDeadline    int64
+	turnRevision    string
+	turnDeadlineErr error
+	finishRunID     string
+	finishStatus    execution.RuntimeStatus
+	finishErr       error
+	latestErr       error
 }
 
 func (s *fakeExecutionStore) Accept(_ context.Context, req execution.AcceptRequest) (*execution.Record, bool, error) {
@@ -73,6 +77,14 @@ func (s *fakeExecutionStore) MarkRunning(_ context.Context, _ string, _ string, 
 	defer s.mu.Unlock()
 	s.markRunID = runID
 	return s.markErr
+}
+func (s *fakeExecutionStore) SetTurnDeadline(_ context.Context, _ string, _ string, startedAt, deadlineAt int64, policyRevision string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.turnStartedAt = startedAt
+	s.turnDeadline = deadlineAt
+	s.turnRevision = policyRevision
+	return s.turnDeadlineErr
 }
 func (s *fakeExecutionStore) FinishRuntime(_ context.Context, _ string, runID string, status execution.RuntimeStatus, _ string) error {
 	s.mu.Lock()
@@ -220,6 +232,22 @@ func newExecutionHandler(t *testing.T, store execution.Store, workerInputError e
 	return &Handler{log: testLogger(t), hub: hub, sm: sm, executionStore: store}, sm, w, conn
 }
 
+type lifecycleInputRecord struct {
+	sessionID  string
+	acceptedAt time.Time
+}
+
+type recordingLifecycleInputSM struct {
+	*mockInputSM
+	records []lifecycleInputRecord
+	err     error
+}
+
+func (m *recordingLifecycleInputSM) RecordInputAccepted(_ context.Context, sessionID string, acceptedAt time.Time) error {
+	m.records = append(m.records, lifecycleInputRecord{sessionID: sessionID, acceptedAt: acceptedAt})
+	return m.err
+}
+
 func testExecutionRecord(status execution.Status) *execution.Record {
 	return &execution.Record{
 		ExecutionID:     "exec_test",
@@ -245,6 +273,45 @@ func requireInputAcks(t *testing.T, conn *mockPlatformConn, statuses ...events.E
 		require.Equal(t, events.InputDurabilityDurable, data.Durability)
 		require.Empty(t, data.ParentExecutionID)
 	}
+}
+
+func TestInputExecution_RecordsLifecycleForAcceptedInput(t *testing.T) {
+	t.Parallel()
+	record := testExecutionRecord(execution.StatusAccepted)
+	record.CreatedAt = time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond).UnixMilli()
+	h, baseSM, _, _ := newExecutionHandler(t, &fakeExecutionStore{record: record}, nil)
+	lifecycleSM := &recordingLifecycleInputSM{mockInputSM: baseSM}
+	h.sm = lifecycleSM
+
+	env := inputEnvelope("s-exec", "hello")
+	env.ID = "evt-client-1"
+	require.NoError(t, h.handleInput(context.Background(), env))
+
+	require.Equal(t, []lifecycleInputRecord{{
+		sessionID: "s-exec", acceptedAt: time.UnixMilli(record.CreatedAt),
+	}}, lifecycleSM.records)
+}
+
+func TestInputExecution_LifecyclePersistenceFailurePreventsWorkerDispatch(t *testing.T) {
+	t.Parallel()
+	store := &fakeExecutionStore{record: testExecutionRecord(execution.StatusAccepted)}
+	h, baseSM, w, _ := newExecutionHandler(t, store, nil)
+	lifecycleSM := &recordingLifecycleInputSM{
+		mockInputSM: baseSM,
+		err:         errors.New("lifecycle store unavailable"),
+	}
+	h.sm = lifecycleSM
+
+	env := inputEnvelope("s-exec", "hello")
+	env.ID = "evt-client-1"
+	err := h.handleInput(context.Background(), env)
+
+	require.ErrorContains(t, err, "lifecycle")
+	status, code, calls := store.snapshot()
+	require.Equal(t, execution.StatusFailed, status)
+	require.Equal(t, string(events.ErrCodeInternalError), code)
+	require.Equal(t, 1, calls)
+	w.AssertNotCalled(t, "Input", mock.Anything, mock.Anything, mock.Anything)
 }
 
 func TestInputExecution_DeliveredAckAfterWorkerAccepts(t *testing.T) {
@@ -474,6 +541,8 @@ func TestInputExecution_DuplicateReplaysAckWithoutWorkerCall(t *testing.T) {
 	t.Parallel()
 	store := &fakeExecutionStore{record: testExecutionRecord(execution.StatusDelivered), duplicate: true}
 	h, sm, w, conn := newExecutionHandler(t, store, nil)
+	lifecycleSM := &recordingLifecycleInputSM{mockInputSM: sm}
+	h.sm = lifecycleSM
 	retryCancel := make(chan struct{})
 	h.bridge = &Bridge{retryCancel: map[string]chan struct{}{"s-exec": retryCancel}}
 	env := inputEnvelope("s-exec", "hello")
@@ -482,6 +551,7 @@ func TestInputExecution_DuplicateReplaysAckWithoutWorkerCall(t *testing.T) {
 	require.NoError(t, h.handleInput(context.Background(), env))
 	requireInputAcks(t, conn, events.ExecutionStatusDelivered)
 	require.True(t, conn.envelopes()[0].Event.Data.(events.InputAckData).Duplicate)
+	require.Empty(t, lifecycleSM.records, "duplicate delivery must not renew session retention")
 	_, _, calls := store.snapshot()
 	require.Zero(t, calls)
 	sm.AssertExpectations(t)

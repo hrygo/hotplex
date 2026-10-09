@@ -31,14 +31,14 @@ func openMigrationTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
-// TestMigrations_023UserActivity_AppliesAndIsImmutable covers the user-facing contract
-// of issue #833 Phase 1 migration 023 (Spec §5.1 / §5.5 / §11.2):
+// TestMigrations_AuditChainsApplyAndStayImmutable covers the user-facing contract
+// of audit migrations 023 and 044:
 //   - user_activity table exists with the expected columns
 //   - audit_chain_checkpoints table exists
 //   - the BEFORE UPDATE trigger blocks mutations with the spec-mandated message
 //   - all 3 expected indexes are present
 //   - the 3 dead v_turns* views (spec §11.2) are dropped
-func TestMigrations_023UserActivity_AppliesAndIsImmutable(t *testing.T) {
+func TestMigrations_AuditChainsApplyAndStayImmutable(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -137,6 +137,53 @@ func TestMigrations_023UserActivity_AppliesAndIsImmutable(t *testing.T) {
 	for col, found := range wantCP {
 		require.True(t, found, "audit_chain_checkpoints missing column %s", col)
 	}
+
+	// 7) Migration 044 gives lifecycle-v2 its own chain and frozen,
+	// hash-covered expiry deadline without changing the legacy table.
+	for _, table := range []string{"user_activity_v2", "audit_chain_checkpoints_v2"} {
+		var n int
+		err := db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table,
+		).Scan(&n)
+		require.NoError(t, err)
+		require.Equal(t, 1, n, "expected table %s to exist after migration 044", table)
+	}
+	v2Columns := map[string]bool{}
+	v2Rows, err := db.QueryContext(ctx, `PRAGMA table_info(user_activity_v2)`)
+	require.NoError(t, err)
+	for v2Rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		require.NoError(t, v2Rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk))
+		v2Columns[name] = true
+	}
+	require.NoError(t, v2Rows.Err())
+	require.NoError(t, v2Rows.Close())
+	require.True(t, v2Columns["expires_at"], "lifecycle-v2 audit rows must persist their expiry")
+	var expiryIndex int
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_ua_v2_expires_at' AND tbl_name='user_activity_v2'`,
+	).Scan(&expiryIndex))
+	require.Equal(t, 1, expiryIndex)
+
+	result, err := db.ExecContext(ctx, `INSERT INTO user_activity_v2
+		(ts, user_id, user_id_type, platform, action, outcome, detail_json, prev_hash, self_hash, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		1700000000000, "u_v2", "system", "api", "auth.login", "success", "{}", "", "hash-v2", 1700000000000+180*24*60*60*1000)
+	require.NoError(t, err, "insert into lifecycle-v2 audit chain")
+	v2ID, err := result.LastInsertId()
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `UPDATE user_activity_v2 SET expires_at=0 WHERE id=?`, v2ID)
+	require.Error(t, err, "lifecycle-v2 audit updates must be rejected")
+	_, err = db.ExecContext(ctx, `DELETE FROM user_activity_v2 WHERE id=?`, v2ID)
+	require.Error(t, err, "unanchored lifecycle-v2 audit deletes must be rejected")
+	_, err = db.ExecContext(ctx, `INSERT INTO audit_chain_checkpoints_v2 (pruned_at, last_self_hash, next_id) VALUES (?, ?, ?)`,
+		time.Now().UnixMilli(), "hash-v2", v2ID+1)
+	require.NoError(t, err, "checkpoint must anchor the lifecycle-v2 prefix")
+	_, err = db.ExecContext(ctx, `DELETE FROM user_activity_v2 WHERE id=?`, v2ID)
+	require.NoError(t, err, "checkpoint-anchored lifecycle-v2 cleanup must be allowed")
 }
 
 // TestMigrations_027_ExecutionOwnerLease_SchemaAndConstraints covers the durable

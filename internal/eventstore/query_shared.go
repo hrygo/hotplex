@@ -3,9 +3,13 @@ package eventstore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
+	"time"
+
+	"github.com/hrygo/hotplex/pkg/events"
 )
 
 // queryExecer abstracts the read-side query capability shared by *sql.DB
@@ -17,10 +21,56 @@ type queryExecer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+type commandExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func rebindEventSQL(query string) string { return query }
+
+func ensureSessionWritable(ctx context.Context, tx *sql.Tx, sessionID string, rebind func(string) string, lockRow bool) error {
+	stateQuery := `SELECT state FROM sessions WHERE id = ?`
+	if lockRow {
+		stateQuery += ` FOR UPDATE`
+	}
+	var state sql.NullString
+	err := tx.QueryRowContext(ctx, rebind(stateQuery), sessionID).Scan(&state)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("eventstore: check session write barrier: %w", err)
+	}
+	if state.Valid && state.String == string(events.StateDeleted) {
+		return ErrSessionDeleted
+	}
+	if state.Valid {
+		return nil
+	}
+
+	var hasPurgeJob bool
+	err = tx.QueryRowContext(ctx, rebind(`SELECT EXISTS(
+		SELECT 1 FROM session_purge_jobs WHERE session_id = ?
+	)`), sessionID).Scan(&hasPurgeJob)
+	if err != nil {
+		return fmt.Errorf("eventstore: check session purge barrier: %w", err)
+	}
+	if hasPurgeJob {
+		return ErrSessionDeleted
+	}
+	return nil
+}
+
 // queryBySession is the dialect-agnostic cursor pagination implementation
 // shared by SQLiteStore and pgStore. The caller supplies its own query map
 // (the package-level `queries` for SQLite, the rebound `s.sql` for Postgres).
-func queryBySession(ctx context.Context, qe queryExecer, q map[string]string, sessionID string, cursor int64, dir CursorDirection, limit int) (*EventPage, error) {
+func queryBySession(
+	ctx context.Context,
+	qe queryExecer,
+	q map[string]string,
+	sessionID string,
+	cursor int64,
+	dir CursorDirection,
+	limit int,
+	nowMS int64,
+	legacyCutoffMS int64,
+) (*EventPage, error) {
 	if limit <= 0 {
 		limit = 200
 	}
@@ -35,11 +85,11 @@ func queryBySession(ctx context.Context, qe queryExecer, q map[string]string, se
 	var err error
 	switch dir {
 	case CursorAfter:
-		rows, err = qe.QueryContext(ctx, q["query_after"], sessionID, cursor, fetchLimit)
+		rows, err = qe.QueryContext(ctx, q["query_after"], sessionID, cursor, nowMS, legacyCutoffMS, fetchLimit)
 	case CursorBefore:
-		rows, err = qe.QueryContext(ctx, q["query_before"], sessionID, cursor, fetchLimit)
+		rows, err = qe.QueryContext(ctx, q["query_before"], sessionID, cursor, nowMS, legacyCutoffMS, fetchLimit)
 	default: // CursorLatest
-		rows, err = qe.QueryContext(ctx, q["query_latest"], sessionID, fetchLimit)
+		rows, err = qe.QueryContext(ctx, q["query_latest"], sessionID, nowMS, legacyCutoffMS, fetchLimit)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("eventstore: query: %w", err)
@@ -75,12 +125,51 @@ func queryBySession(ctx context.Context, qe queryExecer, q map[string]string, se
 			page.HasOlder = hasMore
 		default:
 			var exists int
-			err := qe.QueryRowContext(ctx, q["has_older"], sessionID, page.OldestID).Scan(&exists)
+			err := qe.QueryRowContext(ctx, q["has_older"], sessionID, page.OldestID, nowMS, legacyCutoffMS).Scan(&exists)
 			page.HasOlder = err == nil && exists == 1
 		}
 	}
 
 	return page, nil
+}
+
+func updateSessionContentDeadline(ctx context.Context, exec commandExecer, query, sessionID string, expiresAt int64) error {
+	if expiresAt <= 0 {
+		return nil
+	}
+	deadline := time.UnixMilli(expiresAt).UTC()
+	_, err := exec.ExecContext(ctx, query, deadline, deadline, deadline, deadline, sessionID)
+	return err
+}
+
+func contentExpiryForSession(
+	ctx context.Context,
+	tx *sql.Tx,
+	policyQuery string,
+	retention RetentionPolicy,
+	sessionID string,
+	createdAt int64,
+	existingExpiry int64,
+) (int64, error) {
+	if existingExpiry > 0 {
+		return existingExpiry, nil
+	}
+	if retention.Content <= 0 || createdAt <= 0 {
+		return 0, nil
+	}
+
+	var policy string
+	err := tx.QueryRowContext(ctx, policyQuery, sessionID).Scan(&policy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if policy != "v2" {
+		return 0, nil
+	}
+	return retention.expiry(createdAt, 0), nil
 }
 
 // turnScanDest returns the scan destination slice for a turn row. It is shared

@@ -15,8 +15,16 @@ description: Global and per-user quotas, worker limits, output limits, pool mana
 ```yaml
 session:
   max_concurrent: 1000       # 状态机层最大并发 Session（默认 1000）
-  retention_period: 168h     # Session 保留期（默认 7 天）
+  retention_period: 168h     # 兼容的运行到期时长，不是聊天历史保留期
   gc_scan_interval: 10m      # GC 扫描间隔（默认 10 分钟）
+
+lifecycle:
+  policy: v2
+  conversation:
+    archive_after: 168h                         # 7 天无输入后显示归档标记
+    retention_after_last_input: 4320h           # 会话期限：180 天
+  content:
+    retention: 4320h                            # 每条正文期限：180 天
 
 pool:
   max_size: 100              # 全局最大活跃 Session（默认 100）
@@ -57,8 +65,10 @@ worker:
   max_lifetime: 24h           # 单 Worker 最长存活时间（默认 24h）
   idle_timeout: 60m           # 空闲超时（默认 60m）
   execution_timeout: 30m      # 单次执行超时（默认 30m）
-  turn_timeout: 0             # 单轮超时（默认关闭，由 execution_timeout 兜底）
+  turn_timeout: 30m           # 单轮绝对上限（持续输出不会延长）
 ```
+
+`worker.idle_timeout` 释放运行资源，`lifecycle.conversation.archive_after` 只标记冷会话，`lifecycle.conversation.retention_after_last_input` 与 `lifecycle.content.retention` 管理不同的数据期限。查看历史不会延长任何期限。`session.retention_period` 是兼容运行到期时长，不应用来设置聊天正文保留期。
 
 | 限制 | 触发条件 | 行为 |
 |------|----------|------|

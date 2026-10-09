@@ -20,6 +20,9 @@ export interface SessionInfo {
   updated_at: string;
   expires_at?: string;
   idle_expires_at?: string;
+  lifecycle_policy?: string;
+  archive_at?: string;
+  archived?: boolean;
   turn_count?: number;
   work_dir?: string;
   title?: string;

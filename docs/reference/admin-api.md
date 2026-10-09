@@ -56,8 +56,8 @@ admin:
 | `config:write` | - | - | - | 🟠 Write | - | - | `POST /admin/config/rollback` |
 | `runtime:read` | - | - | - | - | - | - | `GET /admin/executions`<br>`GET /admin/executions/{id}/timeline`<br>`GET /admin/executions/fences`<br>`GET /admin/effects`<br>`GET /admin/effects/{id}`<br>`GET /admin/sessions/{id}/runtime-plan`（需与 `session:read` 同时持有） |
 | `runtime:write` | - | - | - | - | - | - | `POST /admin/executions/{id}/fence-action`<br>`POST /admin/executions/{id}/queue-cancel`<br>`POST /admin/sessions/{id}/queue-clear`<br>`POST /admin/effects/{id}/action` |
-| `admin:read` | - | - | - | - | 🟢 Read | 🟢 Read | `GET /admin/logs`<br>`GET /admin/debug/...`<br>`GET /admin/bots`<br>`GET /admin/cron/jobs` |
-| `admin:write` | - | - | - | - | - | 🟠 Write | `POST/PATCH/DELETE /admin/cron/jobs`<br>`POST /admin/cron/jobs/{id}/run` |
+| `admin:read` | - | - | - | - | 🟢 Read | 🟢 Read | `GET /admin/logs`<br>`GET /admin/debug/...`<br>`GET /admin/bots`<br>`GET /admin/cron/jobs`<br>`POST /admin/lifecycle/migration/preview` |
+| `admin:write` | - | - | - | - | - | 🟠 Write | `POST/PATCH/DELETE /admin/cron/jobs`<br>`POST /admin/cron/jobs/{id}/run`<br>`POST /admin/lifecycle/migration/apply` |
 
 > 💡 **Scope 蕴含**：`admin:write` 蕴含 `admin:read`、`runtime:read`、`runtime:write`；`admin:read` 蕴含 `config:read`（#877）。
 
@@ -150,6 +150,30 @@ curl -H "Authorization: Bearer $TOKEN" \
 **POST /admin/sessions/{id}/terminate** — 将会话状态迁移至 `terminated`（软终止，保留记录）。DELETE 则为物理删除。
 
 > **注意**：会话创建不通过 Admin API，而是通过 Gateway API（`POST /api/sessions`）或 WebSocket `init` 握手完成。Admin API 仅提供只读查询和终止/删除操作。
+
+### 存量会话期限迁移
+
+| 方法 | 路径 | Scope | 说明 |
+|------|------|-------|------|
+| POST | `/admin/lifecycle/migration/preview` | `admin:read` | 只读汇总可迁移的 legacy 会话与正文期限 |
+| POST | `/admin/lifecycle/migration/apply` | `admin:write` | 双重确认后按批延长存量期限 |
+
+**POST /admin/lifecycle/migration/preview** — 无请求体。响应只含汇总数量、正文字节数、最早目标期限、策略版本和临时 `plan_id`；不返回会话 ID、用户身份、聊天正文、payload 或凭证。`expires_at` 是该预览计划的失效时间，计划保存在当前 Gateway 内存中，有效 30 分钟；Gateway 重启后需要重新预览。
+
+预览包含 `sessions`、`events`、`turns` 三类摘要。会话数量统计拥有可靠 `last_input_at`、未删除的 legacy 会话；事件和轮次摘要统计需要延长期限的正文。`blocked` 中的缺少活动时间、孤立正文计数不会被迁移；`unknown_execution_records` 与 `active_execution_records` 只报告未完成或运行中的执行事实，这些事实不会被迁移接口改写。
+
+**POST /admin/lifecycle/migration/apply** — 每次最多按 `batch_size` 更新各数据类型的一批，实际最大值为 500。请求必须重复提交相同计划 ID：
+
+```json
+{
+  "plan_id": "<preview.plan_id>",
+  "confirm_plan_id": "<preview.plan_id>"
+}
+```
+
+Apply 只延长期限，不会缩短已有期限。每批先推进事件和轮次正文；仅当某会话的全部现存正文都具有不短于有效 legacy/v2 正文期限的明确到期时间时，才将该会话切换到 v2。因而大历史会话可能需要多轮“预览 → 确认应用”，`apply` 响应中的 `sessions`、`events`、`turns` 是本批实际更新数。
+
+若预览后数据或策略发生变化，返回 `409 PREVIEW_STALE`；计划过期或 Gateway 重启后提交，返回 `409 PREVIEW_EXPIRED`，都需要重新预览。计划 ID 不匹配返回 `400 CONFIRMATION_REQUIRED`。该接口不会补造缺失的 `last_input_at`，也不会处理已删除会话、孤立正文或未知运行事实。
 
 ### Runtime Operations（#877 / #946）
 
@@ -370,7 +394,7 @@ Bot 列表与详情的 `agent_configs` 元数据只包含 `soul`、`agents`、`t
 
 ### 用户行为审计
 
-`/admin/activity` 系列端点查询 issue #833 的 `user_activity` 表。所有读端点需要 `admin:read`；导出默认脱敏，`include_pii=true` 需要 `admin:write`。每次导出都会写入 `system.audit_export` meta-audit。
+`/admin/activity` 系列端点合并查询 legacy `user_activity` 与 lifecycle-v2 `user_activity_v2` 两条独立哈希链。响应中的 `chain_epoch` 标记记录来源（`legacy` 或 `lifecycle-v2`）；两张表的本地 `id` 可重复，因此客户端应使用 `chain_epoch + id` 作为行键。所有读端点需要 `admin:read`；导出默认脱敏，`include_pii=true` 需要 `admin:write`。每次导出都会写入 `system.audit_export` meta-audit。
 
 | 方法 | 路径 | Scope | 说明 |
 |------|------|-------|------|
@@ -503,13 +527,20 @@ Gateway API（`/api/sessions`）监听在网关主端口（`8888`），面向客
 | GET | `/api/sessions` | API Key | 列出当前用户的会话 |
 | POST | `/api/sessions` | API Key | 创建会话 |
 | GET | `/api/sessions/{id}` | API Key | 获取单个会话 |
-| DELETE | `/api/sessions/{id}` | API Key | 删除会话 |
+| DELETE | `/api/sessions/{id}` | API Key | 删除会话并排队清理 |
+| GET | `/api/sessions/{id}/cleanup` | API Key | 查询删除后的清理进度 |
 | POST | `/api/sessions/{id}/cd` | API Key | 切换工作目录 |
 | GET | `/api/sessions/{id}/history` | API Key | 获取会话历史 |
 | GET | `/api/sessions/{id}/events` | API Key | 获取会话事件流 |
 | GET | `/api/workers` | API Key | 列出 Worker 类型及二进制安装状态 |
 
 所有 Gateway API 端点启用 CORS（`Access-Control-Allow-Origin: *`），支持 `GET`、`POST`、`DELETE`、`OPTIONS` 方法。
+
+**DELETE /api/sessions/{id}** — 成功时立即从历史列表隐藏会话并阻止后续写入，返回 `204 No Content`；正文和 Worker 侧副本由后台任务清理。客户端可轮询 `GET /api/sessions/{id}/cleanup` 确认清理是否完成。
+
+**GET /api/sessions/{id}/cleanup** — 仅会话所有者可读，返回 `200` 和清理任务快照。`status` 为 `pending`、`in_progress`、`blocked` 或 `complete`；`items[]` 按 `kind`（`session_metadata`、`conversation_content`、`worker_session`）显示各部分状态、尝试次数和下次重试时间。响应不包含聊天正文或提供方原始错误；`error_code` 是稳定错误代码。会话不属于当前用户或没有对应任务时返回 `404 NOT_FOUND`，清理状态存储不可用时返回 `503 PURGE_STATUS_UNAVAILABLE`。
+
+这两个端点报告的是 HotPlex 和关联 Worker 的清理状态，不代表外部平台消息或既有备份已删除。Slack/飞书消息遵循各平台的保留策略；恢复较早的数据库备份可能重新带回已删除会话数据，备份过期与销毁由部署方负责。
 
 **GET /api/workers** — 返回所有已注册 Worker 类型（`claude_code` / `opencode_server` / `codex_cli` / `acp`）的二进制安装状态，供客户端（如 WebChat「新建会话」弹窗）动态过滤可选引擎，避免误选未安装的 Worker。命令名取自配置（`worker.<type>.command`），缺失时回落到各类型的默认二进制（`claude` / `opencode` / `codex` / `hermes`），再经 `exec.LookPath` 探测。响应体为 JSON 数组：`[{"type":"<worker_type>","installed":<bool>,"path":"<abs_path, omitempty>"}]`。
 

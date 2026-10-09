@@ -80,6 +80,7 @@ const reconcileUpdateSQL = `UPDATE effects SET
 		owner_instance_id = '',
 		lease_until = NULL,
 		next_attempt_at = NULL,
+		settled_at = ?,
 		updated_at = ?
 	WHERE effect_id = ?
 	  AND status = ?`
@@ -115,6 +116,7 @@ const fenceUpdateSQL = `UPDATE effects SET
 		owner_instance_id = '',
 		lease_until = NULL,
 		next_attempt_at = NULL,
+		settled_at = COALESCE(settled_at, ?),
 		updated_at = ?
 	WHERE effect_id = ?
 	  AND status = ?`
@@ -130,7 +132,7 @@ func applyReconcile(ctx context.Context, exec func(context.Context, string, ...a
 	errorCode := "reconciled_" + string(req.Outcome)
 	n, err := exec(ctx, reconcileUpdateSQL,
 		string(target), errorCode, req.Reason, req.ProviderRef, req.EvidenceRef,
-		req.Now.UnixMilli(), req.EffectID, string(req.ExpectedStatus))
+		req.Now.UnixMilli(), req.Now.UnixMilli(), req.EffectID, string(req.ExpectedStatus))
 	if err != nil {
 		return fmt.Errorf("effect: reconcile: %w", err)
 	}
@@ -146,7 +148,7 @@ func applyFence(ctx context.Context, exec func(context.Context, string, ...any) 
 	}
 	n, err := exec(ctx, fenceUpdateSQL,
 		string(StatusFenced), "fenced", "fenced: "+req.Reason,
-		req.Now.UnixMilli(), req.EffectID, string(req.ExpectedStatus))
+		req.Now.UnixMilli(), req.Now.UnixMilli(), req.EffectID, string(req.ExpectedStatus))
 	if err != nil {
 		return fmt.Errorf("effect: fence: %w", err)
 	}

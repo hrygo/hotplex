@@ -52,6 +52,10 @@ CREATE TABLE effects (
     evidence_ref      TEXT NOT NULL DEFAULT '',
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
+    settled_at        INTEGER,
+    payload_retention_ms INTEGER,
+    facts_retention_ms INTEGER,
+    retention_policy_revision TEXT NOT NULL DEFAULT '',
     UNIQUE(occurrence_id, delivery_ordinal, target_revision)
 );
 CREATE TABLE effect_attempts (

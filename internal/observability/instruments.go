@@ -1,9 +1,11 @@
 package observability
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
 
@@ -30,6 +32,24 @@ var (
 
 	sessionDeleted     metric.Int64Counter
 	sessionDeletedInit sync.Once
+
+	lifecycleGCFailures     metric.Int64Counter
+	lifecycleGCFailuresInit sync.Once
+
+	lifecycleGCProcessed     metric.Int64Counter
+	lifecycleGCProcessedInit sync.Once
+
+	lifecycleGCRetirementLag     metric.Float64Histogram
+	lifecycleGCRetirementLagInit sync.Once
+
+	lifecycleGCBacklog     metric.Int64ObservableGauge
+	lifecycleGCBacklogInit sync.Once
+
+	lifecycleGCUnknownBlocked     metric.Int64ObservableGauge
+	lifecycleGCUnknownBlockedInit sync.Once
+
+	lifecycleGCOldestLag     metric.Float64ObservableGauge
+	lifecycleGCOldestLagInit sync.Once
 
 	sessionStartAttempts     metric.Int64Counter
 	sessionStartAttemptsInit sync.Once
@@ -74,13 +94,154 @@ func SessionDeleted() metric.Int64Counter {
 		var err error
 		sessionDeleted, err = Meter().Int64Counter(
 			"hotplex.session.deleted",
-			metric.WithDescription("Total sessions deleted by retention GC"),
+			metric.WithDescription("Total sessions moved to deleted state"),
 		)
 		if err != nil {
 			warnInstrument("hotplex.session.deleted", err)
 		}
 	})
 	return sessionDeleted
+}
+
+// LifecycleGCFailures counts failures in lifecycle-driven session expiry cleanup.
+// The phase attribute is bounded to the lifecycle GC's fixed operation names.
+func LifecycleGCFailures() metric.Int64Counter {
+	lifecycleGCFailuresInit.Do(func() {
+		var err error
+		lifecycleGCFailures, err = Meter().Int64Counter(
+			"hotplex.lifecycle.gc.failures",
+			metric.WithDescription("Lifecycle session GC failures by phase"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.lifecycle.gc.failures", err)
+		}
+	})
+	return lifecycleGCFailures
+}
+
+// LifecycleGCProcessedKind is a bounded category for lifecycle GC work.
+type LifecycleGCProcessedKind string
+
+const (
+	LifecycleGCProcessedSession               LifecycleGCProcessedKind = "session"
+	LifecycleGCProcessedEvent                 LifecycleGCProcessedKind = "event"
+	LifecycleGCProcessedTurn                  LifecycleGCProcessedKind = "turn"
+	LifecycleGCProcessedDeliveryPayload       LifecycleGCProcessedKind = "delivery_payload"
+	LifecycleGCProcessedDeliveryAttempt       LifecycleGCProcessedKind = "delivery_attempt"
+	LifecycleGCProcessedExecutionDetail       LifecycleGCProcessedKind = "execution_detail"
+	LifecycleGCProcessedAuditFactLegacy       LifecycleGCProcessedKind = "audit_fact_legacy"
+	LifecycleGCProcessedAuditFactV2           LifecycleGCProcessedKind = "audit_fact_v2"
+	LifecycleGCProcessedACPTraceFile          LifecycleGCProcessedKind = "acp_trace_file"
+	LifecycleGCProcessedMediaFile             LifecycleGCProcessedKind = "media_file"
+	LifecycleGCProcessedConversationPurgeItem LifecycleGCProcessedKind = "conversation_purge_item"
+	LifecycleGCProcessedOther                 LifecycleGCProcessedKind = "other"
+)
+
+// LifecycleGCProcessed counts records or files removed, redacted, or compacted
+// by lifecycle cleanup. Its kind label is a fixed, bounded category.
+func LifecycleGCProcessed() metric.Int64Counter {
+	lifecycleGCProcessedInit.Do(func() {
+		var err error
+		lifecycleGCProcessed, err = Meter().Int64Counter(
+			"hotplex.lifecycle.gc.processed",
+			metric.WithDescription("Lifecycle-managed records or files removed, redacted, or compacted by category"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.lifecycle.gc.processed", err)
+		}
+	})
+	return lifecycleGCProcessed
+}
+
+// RecordLifecycleGCProcessed records a successful lifecycle cleanup count.
+func RecordLifecycleGCProcessed(ctx context.Context, kind LifecycleGCProcessedKind, count int64) {
+	if count <= 0 {
+		return
+	}
+	switch kind {
+	case LifecycleGCProcessedSession,
+		LifecycleGCProcessedEvent,
+		LifecycleGCProcessedTurn,
+		LifecycleGCProcessedDeliveryPayload,
+		LifecycleGCProcessedDeliveryAttempt,
+		LifecycleGCProcessedExecutionDetail,
+		LifecycleGCProcessedAuditFactLegacy,
+		LifecycleGCProcessedAuditFactV2,
+		LifecycleGCProcessedACPTraceFile,
+		LifecycleGCProcessedMediaFile,
+		LifecycleGCProcessedConversationPurgeItem,
+		LifecycleGCProcessedOther:
+	default:
+		kind = LifecycleGCProcessedOther
+	}
+	LifecycleGCProcessed().Add(ctx, count, metric.WithAttributes(attribute.String("kind", string(kind))))
+}
+
+// LifecycleGCRetirementLag records how long successful v2 session retirement
+// waited past its latest required history deadline.
+func LifecycleGCRetirementLag() metric.Float64Histogram {
+	lifecycleGCRetirementLagInit.Do(func() {
+		var err error
+		lifecycleGCRetirementLag, err = Meter().Float64Histogram(
+			"hotplex.lifecycle.gc.retirement.lag",
+			metric.WithDescription("Delay between the latest required session expiry deadline and retirement"),
+			metric.WithUnit("s"),
+			metric.WithExplicitBucketBoundaries(60, 300, 900, 3600, 21600, 86400, 604800),
+		)
+		if err != nil {
+			warnInstrument("hotplex.lifecycle.gc.retirement.lag", err)
+		}
+	})
+	return lifecycleGCRetirementLag
+}
+
+// LifecycleGCBacklog reports overdue v2 sessions awaiting retirement, split
+// into eligible and obligation-blocked counts.
+func LifecycleGCBacklog() metric.Int64ObservableGauge {
+	lifecycleGCBacklogInit.Do(func() {
+		var err error
+		lifecycleGCBacklog, err = Meter().Int64ObservableGauge(
+			"hotplex.lifecycle.gc.backlog",
+			metric.WithDescription("Overdue v2 sessions awaiting retirement by eligibility"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.lifecycle.gc.backlog", err)
+		}
+	})
+	return lifecycleGCBacklog
+}
+
+// LifecycleGCUnknownBlocked reports overdue sessions held by unresolved or
+// fenced execution evidence.
+func LifecycleGCUnknownBlocked() metric.Int64ObservableGauge {
+	lifecycleGCUnknownBlockedInit.Do(func() {
+		var err error
+		lifecycleGCUnknownBlocked, err = Meter().Int64ObservableGauge(
+			"hotplex.lifecycle.gc.blocked_unknown_execution",
+			metric.WithDescription("Overdue v2 sessions held by unknown or fenced execution evidence"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.lifecycle.gc.blocked_unknown_execution", err)
+		}
+	})
+	return lifecycleGCUnknownBlocked
+}
+
+// LifecycleGCOldestLag reports the age of the oldest overdue v2 session
+// deadline, split into eligible and obligation-blocked counts.
+func LifecycleGCOldestLag() metric.Float64ObservableGauge {
+	lifecycleGCOldestLagInit.Do(func() {
+		var err error
+		lifecycleGCOldestLag, err = Meter().Float64ObservableGauge(
+			"hotplex.lifecycle.gc.oldest_lag",
+			metric.WithDescription("Age of the oldest overdue v2 session deadline"),
+			metric.WithUnit("s"),
+		)
+		if err != nil {
+			warnInstrument("hotplex.lifecycle.gc.oldest_lag", err)
+		}
+	})
+	return lifecycleGCOldestLag
 }
 
 func SessionStartAttempts() metric.Int64Counter {

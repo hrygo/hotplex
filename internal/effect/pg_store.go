@@ -17,6 +17,11 @@ type PGStore struct {
 	planner *Planner
 }
 
+// SetRetentionPolicy configures new effects before the store is shared.
+func (s *PGStore) SetRetentionPolicy(payload, facts time.Duration, revision string) {
+	s.planner.SetRetentionPolicy(payload, facts, revision)
+}
+
 // NewPGStore creates a PostgreSQL-backed effect store.
 func NewPGStore(db *dbutil.DB, log *slog.Logger) *PGStore {
 	return &PGStore{

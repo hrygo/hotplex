@@ -279,6 +279,7 @@ const claimSendSQL = `UPDATE effects SET
 		status = 'started',
 		owner_instance_id = ?,
 		lease_until = ?,
+		settled_at = NULL,
 		lease_version = lease_version + 1,
 		updated_at = ?
 	WHERE effect_id = ?
@@ -291,6 +292,7 @@ const claimRetrySQL = `UPDATE effects SET
 		lease_until = ?,
 		lease_version = lease_version + 1,
 		next_attempt_at = NULL,
+		settled_at = NULL,
 		updated_at = ?
 	WHERE effect_id = ?
 	  AND status = 'started'
@@ -418,6 +420,8 @@ const applyCompletionSQL = `UPDATE effects SET
 		evidence_ref = ?,
 		owner_instance_id = '',
 		lease_until = NULL,
+		settled_at = CASE WHEN ? IN ('delivered', 'failed', 'reconciled_succeeded',
+			'reconciled_failed', 'fenced') THEN CAST(? AS BIGINT) ELSE NULL END,
 		next_attempt_at = ?,
 		updated_at = ?
 	WHERE effect_id = ?
@@ -457,7 +461,7 @@ func completeSend(
 
 	res, err = tx.ExecContext(ctx, dialect.Rebind(applyCompletionSQL),
 		status, c.ErrorCode, c.Reason, c.ProviderRef, c.EvidenceRef,
-		nextAttemptAt, c.Now.UnixMilli(), c.EffectID, c.Attempt)
+		status, c.Now.UnixMilli(), nextAttemptAt, c.Now.UnixMilli(), c.EffectID, c.Attempt)
 	if err != nil {
 		return fmt.Errorf("effect: apply completion: %w", err)
 	}
@@ -477,6 +481,7 @@ const expireEffectSQL = `UPDATE effects SET
 		reason = 'send lease expired; the commit is unproven',
 		owner_instance_id = '',
 		lease_until = NULL,
+		settled_at = NULL,
 		updated_at = ?
 	WHERE effect_id = ?
 	  AND status = 'started'

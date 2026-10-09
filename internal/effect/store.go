@@ -76,7 +76,7 @@ const effectColumns = `effect_id, occurrence_id, delivery_ordinal, target_revisi
 		session_id, execution_id, worker_run_id, payload_id, payload_sha256,
 		target_kind, target_ref, status, error_code, reason,
 		owner_instance_id, lease_until, lease_version, provider_ref, evidence_ref,
-		created_at, updated_at`
+		created_at, updated_at, settled_at`
 
 const payloadColumns = `payload_id, occurrence_id, execution_id, worker_run_id,
 		content, content_bytes, content_sha256, created_at`
@@ -89,13 +89,14 @@ func scanEffect(row rowScanner) (*Effect, error) {
 	var (
 		e         Effect
 		leaseTill sql.NullInt64
+		settledAt sql.NullInt64
 	)
 	err := row.Scan(
 		&e.EffectID, &e.OccurrenceID, &e.DeliveryOrdinal, &e.TargetRevision, &e.Attempt,
 		&e.SessionID, &e.ExecutionID, &e.WorkerRunID, &e.PayloadID, &e.PayloadSHA256,
 		&e.TargetKind, &e.TargetRef, &e.Status, &e.ErrorCode, &e.Reason,
 		&e.OwnerInstanceID, &leaseTill, &e.LeaseVersion, &e.ProviderRef, &e.EvidenceRef,
-		&e.CreatedAtMs, &e.UpdatedAtMs,
+		&e.CreatedAtMs, &e.UpdatedAtMs, &settledAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrEffectNotFound
@@ -106,6 +107,10 @@ func scanEffect(row rowScanner) (*Effect, error) {
 	if leaseTill.Valid {
 		v := leaseTill.Int64
 		e.LeaseUntilMs = &v
+	}
+	if settledAt.Valid {
+		v := settledAt.Int64
+		e.SettledAtMs = &v
 	}
 	return &e, nil
 }
@@ -121,6 +126,9 @@ func scanPayload(row rowScanner) (*Payload, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("effect: scan payload: %w", err)
+	}
+	if p.ContentBytes == 0 {
+		return nil, ErrPayloadNotFound
 	}
 	return &p, nil
 }

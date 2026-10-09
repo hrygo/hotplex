@@ -11,8 +11,10 @@ import (
 
 	"github.com/hrygo/hotplex/internal/admin"
 	"github.com/hrygo/hotplex/internal/config"
+	"github.com/hrygo/hotplex/internal/dbutil"
 	"github.com/hrygo/hotplex/internal/docs"
 	"github.com/hrygo/hotplex/internal/gateway"
+	"github.com/hrygo/hotplex/internal/lifecycle"
 	"github.com/hrygo/hotplex/internal/messaging"
 	"github.com/hrygo/hotplex/internal/observability"
 	"github.com/hrygo/hotplex/internal/security"
@@ -38,7 +40,6 @@ func setupRoutes(
 
 	gatewayAPI := gateway.NewGatewayAPI(log, auth, sm, bridge, deps.ConfigStore, deps.EventStore, deps.EventStore, deps.WorkspaceStore)
 	if deps.AuditCollector != nil {
-		gatewayAPI.SetAuditCollector(deps.AuditCollector)
 		sm.SetAuditCollector(deps.AuditCollector)
 	}
 
@@ -56,6 +57,7 @@ func setupRoutes(
 	mux.Handle("POST /api/sessions", corsMw(http.HandlerFunc(gatewayAPI.CreateSession)))
 	mux.Handle("GET /api/sessions/{id}", corsMw(http.HandlerFunc(gatewayAPI.GetSession)))
 	mux.Handle("DELETE /api/sessions/{id}", corsMw(http.HandlerFunc(gatewayAPI.DeleteSession)))
+	mux.Handle("GET /api/sessions/{id}/cleanup", corsMw(http.HandlerFunc(gatewayAPI.GetSessionCleanupStatus)))
 	mux.Handle("POST /api/sessions/{id}/cd", corsMw(http.HandlerFunc(gatewayAPI.SwitchWorkDir)))
 	mux.Handle("GET /api/sessions/{id}/history", corsMw(http.HandlerFunc(gatewayAPI.GetHistory)))
 	mux.Handle("GET /api/sessions/{id}/events", corsMw(http.HandlerFunc(gatewayAPI.GetEvents)))
@@ -63,6 +65,7 @@ func setupRoutes(
 	mux.Handle("OPTIONS /api/sessions", corsMw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})))
 	mux.Handle("OPTIONS /api/sessions/", corsMw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})))
 	mux.Handle("OPTIONS /api/sessions/{id}", corsMw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})))
+	mux.Handle("OPTIONS /api/sessions/{id}/cleanup", corsMw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})))
 	mux.Handle("OPTIONS /api/sessions/{id}/history", corsMw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})))
 	mux.Handle("OPTIONS /api/sessions/{id}/events", corsMw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})))
 	mux.Handle("OPTIONS /api/workers", corsMw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})))
@@ -79,6 +82,27 @@ func setupRoutes(
 	var cronProvider admin.CronSchedulerProvider
 	if deps.CronScheduler != nil {
 		cronProvider = &cronAdminAdapter{scheduler: deps.CronScheduler, turnsStore: deps.EventStore, sessionMgr: sm}
+	}
+
+	var lifecycleMigrationProvider admin.LifecycleMigrationProvider
+	if deps.DB != nil {
+		migrationService := lifecycle.NewMigrationService(
+			deps.DB,
+			dbutil.ParseDialect(cfg.DB.Driver),
+			func() lifecycle.RetentionPolicy {
+				current := deps.ConfigStore.Load()
+				return lifecycle.RetentionPolicy{
+					PolicyRevision:         config.LifecyclePolicyRevision(current.Lifecycle),
+					ArchiveAfter:           current.Lifecycle.Conversation.ArchiveAfter,
+					ConversationRetention:  current.Lifecycle.Conversation.RetentionAfterLastInput,
+					ContentRetention:       current.Lifecycle.Content.Retention,
+					LegacyContentRetention: config.EffectiveEventsRetention(current),
+					BatchSize:              current.Lifecycle.GC.BatchSize,
+				}
+			},
+			nil,
+		)
+		lifecycleMigrationProvider = &lifecycleMigrationAdapter{service: migrationService}
 	}
 
 	adminAPI := admin.New(admin.Deps{
@@ -124,11 +148,12 @@ func setupRoutes(
 			}
 			return func() error { return coordinator.Commit(ticket) }, func() error { return coordinator.Abort(ticket) }, nil
 		},
-		DB:           deps.DB,
-		DBResolver:   deps.DBResolver,
-		KeyValidator: deps.Auth,
-		APIKeyStore:  deps.APIKeyStore,
-		WriteMu:      deps.WriteMu,
+		DB:                 deps.DB,
+		DBResolver:         deps.DBResolver,
+		KeyValidator:       deps.Auth,
+		APIKeyStore:        deps.APIKeyStore,
+		WriteMu:            deps.WriteMu,
+		LifecycleMigration: lifecycleMigrationProvider,
 	})
 
 	// Wire audit subsystem (issue #833) - activity endpoints + meta-audit emission
@@ -220,6 +245,8 @@ func setupRoutes(
 	adminMux.HandleFunc("GET /admin/logs", adminAPI.HandleLogs)
 	adminMux.HandleFunc("POST /admin/config/validate", adminAPI.HandleConfigValidate)
 	adminMux.HandleFunc("POST /admin/config/rollback", adminAPI.HandleConfigRollback)
+	adminMux.HandleFunc("POST /admin/lifecycle/migration/preview", adminAPI.HandleLifecycleMigrationPreview)
+	adminMux.HandleFunc("POST /admin/lifecycle/migration/apply", adminAPI.HandleLifecycleMigrationApply)
 	adminMux.HandleFunc("GET /admin/debug/sessions/{id}", adminAPI.HandleDebugSession)
 	adminMux.HandleFunc("POST /admin/restart", adminAPI.HandleRestart)
 

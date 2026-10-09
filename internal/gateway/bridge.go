@@ -171,6 +171,12 @@ type workerRunLifecycle struct {
 	terminalCommitted atomic.Bool
 	done              chan struct{}
 	conn              worker.SessionConn
+
+	turnTimeoutMu         sync.Mutex
+	turnTimeoutTimer      *time.Timer
+	turnTimeoutDeadline   time.Time
+	turnTimeoutGeneration uint64
+	turnTimeoutHandler    func(uint64)
 }
 
 func newWorkerRunLifecycle(conn worker.SessionConn) *workerRunLifecycle {
@@ -1494,25 +1500,61 @@ func (b *Bridge) deliverInputReplayForSession(ctx context.Context, sessionID str
 		}
 		replay = validated
 	}
-	if replay.Skill == nil {
-		if replay.Content == "" {
-			return nil
+	if replay.Skill == nil && replay.Content == "" {
+		return nil
+	}
+
+	runID := ""
+	if sessionID != "" {
+		restoredDeadline := false
+		if b.executionStore != nil {
+			record, err := b.executionStore.OpenBySession(ctx, sessionID)
+			if err == nil && record.TurnStartedAt != nil && record.TurnDeadlineAt != nil {
+				var ok bool
+				runID, ok = b.CurrentWorkerRunID(sessionID)
+				if !ok {
+					return errWorkerRunChanged
+				}
+				if err := b.RecordTurnDeadlineForRun(sessionID, runID, *record.TurnStartedAt, *record.TurnDeadlineAt); err != nil {
+					return fmt.Errorf("bridge: restore turn deadline: %w", err)
+				}
+				restoredDeadline = true
+			} else if err != nil && !errors.Is(err, execution.ErrNotFound) {
+				return fmt.Errorf("bridge: load turn deadline: %w", err)
+			}
 		}
-		return w.Input(ctx, replay.Content, nil)
+		if !restoredDeadline {
+			if b.turnTimeout > 0 {
+				var ok bool
+				runID, ok = b.CurrentWorkerRunID(sessionID)
+				if !ok {
+					return errWorkerRunChanged
+				}
+				if _, _, _, err := b.RecordTurnStartForRun(sessionID, runID); err != nil {
+					return fmt.Errorf("bridge: arm replay turn deadline: %w", err)
+				}
+			}
+		}
 	}
-	if invoker, ok := worker.AsNativeInvoker(w); ok {
-		return invoker.InvokeNativeCommand(ctx, *replay.Skill)
+
+	var err error
+	if replay.Skill == nil {
+		err = w.Input(ctx, replay.Content, nil)
+	} else if invoker, ok := worker.AsNativeInvoker(w); ok {
+		err = invoker.InvokeNativeCommand(ctx, *replay.Skill)
+	} else {
+		// The replacement Worker lacks any native command path — typically
+		// because worker_type changed between the crash and recovery. The
+		// invocation must NOT be replayed as an ordinary prompt: that would turn
+		// "execute the Skill" into "let the model guess the Skill".
+		b.log.Warn("bridge: native Skill replay rejected, replacement worker lacks native command invoker",
+			"worker_type", w.Type(), "skill", replay.Skill.Name)
+		err = fmt.Errorf("%w: worker %s cannot replay native Skill %q as text", worker.ErrSkillNotSupported, w.Type(), replay.Skill.Name)
 	}
-	// The replacement Worker lacks any native command path — typically
-	// because worker_type changed between the crash and recovery. The
-	// invocation must NOT be replayed as an ordinary prompt: that would turn
-	// "execute the Skill" into "let the model guess the Skill" (plan
-	// constraint #7; NativeCommandInvoker contract: "Workers that cannot
-	// execute a native command must not receive the invocation as an ordinary
-	// prompt"). Fail loudly instead of silently degrading the semantics.
-	b.log.Warn("bridge: native Skill replay rejected, replacement worker lacks native command invoker",
-		"worker_type", w.Type(), "skill", replay.Skill.Name)
-	return fmt.Errorf("%w: worker %s cannot replay native Skill %q as text", worker.ErrSkillNotSupported, w.Type(), replay.Skill.Name)
+	if err != nil && sessionID != "" && runID != "" {
+		b.ClearTurnStartForRun(sessionID, runID)
+	}
+	return err
 }
 
 // firstNonEmpty returns the first non-empty string from the given values.

@@ -31,6 +31,7 @@ type TurnWriteRequest struct {
 	DurationMs       int64
 	CostUSD          float64
 	CreatedAt        int64 // Unix ms
+	ExpiresAt        int64 // Unix ms; zero assigns the configured new-content deadline.
 }
 
 func nullableClientMessageID(id string) any {

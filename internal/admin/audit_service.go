@@ -186,7 +186,7 @@ func encodeCSV(rows []audit.UserActivity) ([]byte, error) {
 	var buf bytes.Buffer
 	w := csv.NewWriter(&buf)
 	if err := w.Write([]string{
-		"id", "ts", "user_id", "user_id_type", "platform", "session_id",
+		"chain_epoch", "id", "ts", "user_id", "user_id_type", "platform", "session_id",
 		"action", "resource_type", "resource_id", "outcome",
 		"ip", "user_agent", "self_hash",
 	}); err != nil {
@@ -194,6 +194,7 @@ func encodeCSV(rows []audit.UserActivity) ([]byte, error) {
 	}
 	for _, r := range rows {
 		if err := w.Write([]string{
+			sanitizeCSVCell(r.ChainEpoch),
 			fmt.Sprintf("%d", r.ID),
 			time.UnixMilli(r.Ts).UTC().Format(time.RFC3339Nano),
 			sanitizeCSVCell(r.UserID),
