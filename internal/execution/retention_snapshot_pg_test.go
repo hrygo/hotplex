@@ -195,7 +195,7 @@ func TestPGRetentionSnapshotSurvivesPolicyShortening(t *testing.T) {
 	t.Cleanup(func() { _ = effectDB.Close() })
 	effectStore := effect.NewPGStore(effectDB, slog.Default())
 
-	settleEffect := func(occurrenceID, executionID, content, revision string, payloadWindow, factsWindow time.Duration, settledAt time.Time) *effect.Effect {
+	settleEffect := func(t *testing.T, occurrenceID, executionID, content, revision string, payloadWindow, factsWindow time.Duration, settledAt time.Time, outcome effect.AttemptOutcome) *effect.Effect {
 		t.Helper()
 		effectStore.SetRetentionPolicy(payloadWindow, factsWindow, revision)
 		plan := effect.Plan{
@@ -221,13 +221,17 @@ func TestPGRetentionSnapshotSurvivesPolicyShortening(t *testing.T) {
 			Now:             planAt,
 		})
 		require.NoError(t, err)
+		providerRef := ""
+		if outcome == effect.AttemptAccepted {
+			providerRef = "receipt-" + occurrenceID
+		}
 		require.NoError(t, effectStore.CompleteSend(ctx, effect.Completion{
 			EffectID:     planned.EffectID,
 			Attempt:      claim.Attempt,
 			LeaseToken:   claim.LeaseToken,
 			LeaseVersion: claim.LeaseVersion,
-			Outcome:      effect.AttemptAccepted,
-			ProviderRef:  "receipt-" + occurrenceID,
+			Outcome:      outcome,
+			ProviderRef:  providerRef,
 			Now:          settledAt,
 		}))
 		return planned
@@ -235,8 +239,8 @@ func TestPGRetentionSnapshotSurvivesPolicyShortening(t *testing.T) {
 
 	oldPayloadWindow := 7 * 24 * time.Hour
 	oldEffect := settleEffect(
-		"pg-old-effect", oldAccept.ExecutionID, "old effect payload", "old-policy",
-		oldPayloadWindow, oldFacts, gcNow.Add(-2*24*time.Hour),
+		t, "pg-old-effect", oldAccept.ExecutionID, "old effect payload", "old-policy",
+		oldPayloadWindow, oldFacts, gcNow.Add(-2*24*time.Hour), effect.AttemptAccepted,
 	)
 	oldEffectPlan := effect.Plan{
 		OccurrenceID:    "pg-old-effect",
@@ -257,12 +261,12 @@ func TestPGRetentionSnapshotSurvivesPolicyShortening(t *testing.T) {
 	require.Equal(t, oldEffect.PayloadID, retriedEffect.PayloadID)
 
 	newEffect := settleEffect(
-		"pg-new-effect", newAccept.ExecutionID, "new effect payload", "new-policy",
-		24*time.Hour, 24*time.Hour, gcNow.Add(-2*24*time.Hour),
+		t, "pg-new-effect", newAccept.ExecutionID, "new effect payload", "new-policy",
+		24*time.Hour, 24*time.Hour, gcNow.Add(-2*24*time.Hour), effect.AttemptAccepted,
 	)
 	legacyEffect := settleEffect(
-		"pg-legacy-effect", legacy.ExecutionID, "legacy effect payload", "legacy-policy",
-		0, 0, gcNow.Add(-10*24*time.Hour),
+		t, "pg-legacy-effect", legacy.ExecutionID, "legacy effect payload", "legacy-policy",
+		0, 0, gcNow.Add(-10*24*time.Hour), effect.AttemptAccepted,
 	)
 	assertEffectRetentionSnapshot(t, db, oldEffect.EffectID, oldPayloadWindow.Milliseconds(), oldFacts.Milliseconds(), "old-policy")
 	assertEffectRetentionSnapshot(t, db, newEffect.EffectID, (24 * time.Hour).Milliseconds(), (24 * time.Hour).Milliseconds(), "new-policy")
@@ -294,6 +298,39 @@ func TestPGRetentionSnapshotSurvivesPolicyShortening(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, legacyAttempts, 1)
 	assertEffectRetentionSnapshot(t, db, oldEffect.EffectID, oldPayloadWindow.Milliseconds(), oldFacts.Milliseconds(), "old-policy")
+
+	for _, decision := range []effect.OperatorDecision{
+		effect.OperatorAbandon, effect.OperatorMarkDelivered, effect.OperatorRequeue,
+	} {
+		t.Run("operator_"+string(decision), func(t *testing.T) {
+			planned := settleEffect(
+				t, "pg-operator-"+string(decision), oldAccept.ExecutionID, "operator payload", "old-policy",
+				oldPayloadWindow, oldFacts, gcNow.Add(-time.Hour), effect.AttemptUnknown,
+			)
+			var settledAt sql.NullInt64
+			require.NoError(t, db.QueryRow(
+				`SELECT settled_at FROM effects WHERE effect_id = $1`, planned.EffectID,
+			).Scan(&settledAt))
+			require.False(t, settledAt.Valid, "unknown is not a settled delivery")
+			result, actionErr := effectStore.ApplyOperatorAction(ctx, effect.OperatorActionRequest{
+				EffectID: planned.EffectID, Decision: decision, ExpectedStatus: effect.StatusUnknown,
+				Reason: "explicit operator decision", Now: gcNow,
+			})
+			require.NoError(t, actionErr)
+			require.NoError(t, db.QueryRow(
+				`SELECT settled_at FROM effects WHERE effect_id = $1`, planned.EffectID,
+			).Scan(&settledAt))
+			if decision == effect.OperatorRequeue {
+				require.Equal(t, effect.StatusPlanned, result.Status)
+				require.False(t, settledAt.Valid, "requeue clears the settlement clock")
+			} else {
+				require.Equal(t, effect.StatusFailed, result.Status)
+				require.True(t, settledAt.Valid)
+				require.Equal(t, gcNow.UnixMilli(), settledAt.Int64)
+			}
+			assertEffectRetentionSnapshot(t, db, planned.EffectID, oldPayloadWindow.Milliseconds(), oldFacts.Milliseconds(), "old-policy")
+		})
+	}
 }
 
 func assertExecutionRetentionSnapshot(
