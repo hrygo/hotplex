@@ -19,13 +19,22 @@ const storeTimeout = 5 * time.Second
 
 // SQLStore persists execution ingress records in the gateway database.
 type SQLStore struct {
-	db      *sql.DB
-	dialect dbutil.Dialect
-	writeMu *sqlutil.WriteMu
-	log     *slog.Logger
+	db                *sql.DB
+	dialect           dbutil.Dialect
+	writeMu           *sqlutil.WriteMu
+	log               *slog.Logger
+	factsRetentionMS  int64
+	retentionRevision string
 }
 
 var _ Store = (*SQLStore)(nil)
+
+// SetRetentionPolicy configures snapshots for newly accepted inputs. Call it
+// before sharing the store with goroutines; existing records remain unchanged.
+func (s *SQLStore) SetRetentionPolicy(facts time.Duration, revision string) {
+	s.factsRetentionMS = max(0, facts.Milliseconds())
+	s.retentionRevision = revision
+}
 
 func NewSQLStore(_ context.Context, db *sql.DB, dialect dbutil.Dialect, writeMu *sqlutil.WriteMu, log *slog.Logger) (*SQLStore, error) {
 	if db == nil {
@@ -221,12 +230,13 @@ func (s *SQLStore) Accept(ctx context.Context, request AcceptRequest) (*Record, 
 			INSERT INTO execution_inputs
 				(execution_id, session_id, client_message_id, payload_hash, status, error_code,
 				 created_at, updated_at, owner_instance_id, worker_run_id, lease_until,
-				 runtime_status, runtime_error_code, fence_reason)
-			VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, `+s.dbNowMillisExpr()+` + ?, ?, '', '')
+				 runtime_status, runtime_error_code, fence_reason, facts_retention_ms, retention_policy_revision)
+			VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, `+s.dbNowMillisExpr()+` + ?, ?, '', '', NULLIF(CAST(? AS BIGINT), 0), ?)
 			ON CONFLICT(session_id, client_message_id) DO NOTHING`),
 			record.ExecutionID, record.SessionID, record.ClientMessageID, record.PayloadHash,
 			record.Status, record.CreatedAt, record.UpdatedAt,
-			record.OwnerInstanceID, record.WorkerRunID, int64(LeaseTTL)*1000, record.RuntimeStatus)
+			record.OwnerInstanceID, record.WorkerRunID, int64(LeaseTTL)*1000, record.RuntimeStatus,
+			s.factsRetentionMS, s.retentionRevision)
 		if err != nil {
 			if s.dialect.IsUniqueViolation(err) {
 				return fail(ErrSessionBusy)

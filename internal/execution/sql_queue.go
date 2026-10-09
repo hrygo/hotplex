@@ -211,10 +211,10 @@ func (s *SQLStore) AcceptQueued(
 			INSERT INTO execution_inputs
 				(execution_id, session_id, client_message_id, payload_hash, status, error_code,
 				 created_at, updated_at, owner_instance_id, worker_run_id, lease_until,
-				 runtime_status, runtime_error_code, fence_reason)
-			VALUES (?, ?, ?, ?, 'accepted', '', ?, ?, ?, ?, 0, 'queued', '', '')`),
+				 runtime_status, runtime_error_code, fence_reason, facts_retention_ms, retention_policy_revision)
+			VALUES (?, ?, ?, ?, 'accepted', '', ?, ?, ?, ?, 0, 'queued', '', '', NULLIF(CAST(? AS BIGINT), 0), ?)`),
 			executionID, request.SessionID, request.ClientMessageID, request.PayloadHash,
-			now, now, request.OwnerInstanceID, ""); err != nil {
+			now, now, request.OwnerInstanceID, "", s.factsRetentionMS, s.retentionRevision); err != nil {
 			if s.dialect.IsUniqueViolation(err) {
 				// Another transaction took (session_id, client_message_id)
 				// between the check above and this insert. Undo everything this

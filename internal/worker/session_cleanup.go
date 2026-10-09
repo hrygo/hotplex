@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"sync"
 )
 
@@ -11,6 +12,10 @@ import (
 type SessionCleanupFunc func(context.Context, string) error
 
 var (
+	// ErrSessionCleanupUnsupported means a native session exists but its
+	// worker has no deletion capability. It must not be reported as deleted.
+	ErrSessionCleanupUnsupported = errors.New("worker: session cleanup unsupported")
+
 	sessionCleanupMu sync.RWMutex
 	sessionCleaners  = make(map[WorkerType]SessionCleanupFunc)
 )
@@ -31,7 +36,7 @@ func RegisterSessionCleanup(t WorkerType, cleanup SessionCleanupFunc) {
 }
 
 // CleanupSession removes the worker-runtime session for an explicitly deleted
-// HotPlex session. Empty IDs and worker types without a cleaner are no-ops.
+// HotPlex session. Empty IDs have no remote deletion obligation.
 func CleanupSession(ctx context.Context, t WorkerType, workerSessionID string) error {
 	if workerSessionID == "" {
 		return nil
@@ -40,7 +45,7 @@ func CleanupSession(ctx context.Context, t WorkerType, workerSessionID string) e
 	cleanup := sessionCleaners[t]
 	sessionCleanupMu.RUnlock()
 	if cleanup == nil {
-		return nil
+		return ErrSessionCleanupUnsupported
 	}
 	return cleanup(ctx, workerSessionID)
 }

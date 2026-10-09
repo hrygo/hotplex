@@ -48,6 +48,10 @@ type CleanupTaskStore interface {
 // CleanupExecutor dispatches a task to the worker-type-specific cleaner.
 type CleanupExecutor func(context.Context, worker.WorkerType, string) error
 
+type unsupportedCleanupTaskStore interface {
+	FailUnsupportedCleanupTask(ctx context.Context, taskID, leaseToken string) error
+}
+
 const (
 	cleanupBatchSize      = 16
 	cleanupLeaseDuration  = 30 * time.Second
@@ -106,6 +110,14 @@ func (r *CleanupRunner) RunOnce(ctx context.Context) {
 		attemptCtx, cancel := context.WithTimeout(ctx, cleanupAttemptTimeout)
 		err := r.execute(attemptCtx, task.WorkerType, task.WorkerSessionID)
 		cancel()
+		if errors.Is(err, worker.ErrSessionCleanupUnsupported) {
+			if store, ok := r.store.(unsupportedCleanupTaskStore); ok {
+				if failureErr := store.FailUnsupportedCleanupTask(ctx, task.ID, task.LeaseToken); failureErr != nil {
+					r.log.Warn("session cleanup: record unsupported capability failed", "task_id", task.ID, "err", failureErr)
+				}
+				continue
+			}
+		}
 		if err == nil {
 			if completeErr := r.store.CompleteCleanupTask(ctx, task.ID, task.LeaseToken); completeErr != nil {
 				r.log.Warn("session cleanup: complete task failed", "task_id", task.ID, "session_id", task.SessionID, "err", completeErr)
@@ -185,7 +197,16 @@ func insertCleanupTask(ctx context.Context, execer interface {
 	if task == nil {
 		return nil
 	}
-	_, err := execer.ExecContext(ctx, `INSERT INTO session_cleanup_tasks (id, session_id, worker_type, worker_session_id, attempts, next_attempt_at, lease_until, lease_token, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?) ON CONFLICT(session_id) DO NOTHING`, task.ID, task.SessionID, task.WorkerType, task.WorkerSessionID, task.Attempts, task.NextAttemptAt, task.LastError, task.CreatedAt, task.UpdatedAt)
+	_, err := execer.ExecContext(ctx, `INSERT INTO session_cleanup_tasks
+		(id, session_id, worker_type, worker_session_id, attempts, next_attempt_at, lease_until, lease_token, last_error, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM session_purge_items WHERE session_id = ? AND kind = ? AND status IN (?, ?)
+		)
+		ON CONFLICT(session_id) DO NOTHING`,
+		task.ID, task.SessionID, task.WorkerType, task.WorkerSessionID, task.Attempts, task.NextAttemptAt,
+		task.LastError, task.CreatedAt, task.UpdatedAt, task.SessionID, PurgeItemWorkerSession,
+		string(PurgeItemComplete), string(PurgeItemUnsupported))
 	if err != nil {
 		return fmt.Errorf("session cleanup: enqueue: %w", err)
 	}
@@ -353,6 +374,56 @@ func markCleanupItemComplete(ctx context.Context, tx *sql.Tx, rebind func(string
 		return fmt.Errorf("session purge: mark worker item complete: %w", err)
 	}
 	return refreshPurgeJobStatus(ctx, tx, rebind, sessionID, now)
+}
+
+func failUnsupportedCleanupTask(ctx context.Context, tx *sql.Tx, rebind func(string) string, taskID, leaseToken string) error {
+	sessionID, err := cleanupTaskSessionID(ctx, tx, rebind, taskID, leaseToken)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	_, err = tx.ExecContext(ctx, rebind(`UPDATE session_purge_items
+		SET status = ?, lease_until = NULL, lease_token = NULL, completed_at = NULL,
+		    error_code = 'cleanup_unsupported', updated_at = ?
+		WHERE session_id = ? AND kind = ? AND status <> ?`),
+		string(PurgeItemUnsupported), now, sessionID, PurgeItemWorkerSession, string(PurgeItemComplete))
+	if err != nil {
+		return fmt.Errorf("session purge: mark worker capability unsupported: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, rebind(`DELETE FROM session_cleanup_tasks WHERE id = ? AND lease_token = ?`), taskID, leaseToken)
+	if err != nil {
+		return err
+	}
+	if err := cleanupLeaseResult(result); err != nil {
+		return err
+	}
+	return refreshPurgeJobStatus(ctx, tx, rebind, sessionID, now)
+}
+
+func (s *SQLiteStore) FailUnsupportedCleanupTask(ctx context.Context, taskID, leaseToken string) error {
+	return s.writeMu.WithLock(func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := failUnsupportedCleanupTask(ctx, tx, identityRebind, taskID, leaseToken); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+}
+
+func (s *pgStore) FailUnsupportedCleanupTask(ctx context.Context, taskID, leaseToken string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := failUnsupportedCleanupTask(ctx, tx, s.dialect.Rebind, taskID, leaseToken); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func markCleanupItemRetrying(ctx context.Context, tx *sql.Tx, rebind func(string) string, sessionID string, nextAttemptAt, now time.Time) error {

@@ -35,6 +35,7 @@ var (
 // LegacyContentRetention preserves the effective expiry used before per-record
 // deadlines were introduced.
 type RetentionPolicy struct {
+	PolicyRevision         string
 	ArchiveAfter           time.Duration
 	ConversationRetention  time.Duration
 	ContentRetention       time.Duration
@@ -468,7 +469,7 @@ func readContentCandidates(
 			return fmt.Errorf("lifecycle: scan legacy %s: %w", table, err)
 		}
 		newExpiryMS := migratedContentExpiry(createdAtMS, expiryMS, policy)
-		needsUpdate := expiryMS == 0 || expiryMS < createdAtMS+durationMillis(policy.ContentRetention)
+		needsUpdate := newExpiryMS > expiryMS
 		writeDigest(digest,
 			table,
 			strconv.FormatInt(id, 10),
@@ -746,24 +747,13 @@ func effectiveContentExpiry(alias string) string {
 }
 
 func durationArgs(policy RetentionPolicy) []any {
-	content := durationMillis(policy.ContentRetention)
+	content := durationMillis(max(policy.ContentRetention, policy.LegacyContentRetention))
 	legacy := durationMillis(policy.LegacyContentRetention)
 	return []any{content, content, legacy, content, legacy, content}
 }
 
 func migratedContentExpiry(createdAtMS, oldExpiryMS int64, policy RetentionPolicy) int64 {
-	target := createdAtMS + durationMillis(policy.ContentRetention)
-	if oldExpiryMS > 0 {
-		if oldExpiryMS > target {
-			return oldExpiryMS
-		}
-		return target
-	}
-	legacy := createdAtMS + durationMillis(policy.LegacyContentRetention)
-	if legacy > target {
-		return legacy
-	}
-	return target
+	return max(oldExpiryMS, createdAtMS+durationMillis(max(policy.ContentRetention, policy.LegacyContentRetention)))
 }
 
 func validateRetentionPolicy(policy RetentionPolicy) error {
@@ -794,6 +784,9 @@ func normalizeMigrationPolicy(policy RetentionPolicy) RetentionPolicy {
 }
 
 func retentionPolicyRevision(policy RetentionPolicy) string {
+	if policy.PolicyRevision != "" {
+		return policy.PolicyRevision
+	}
 	input := fmt.Sprintf(
 		"v2|archive=%d|conversation=%d|content=%d|legacy=%d|batch=%d",
 		policy.ArchiveAfter,

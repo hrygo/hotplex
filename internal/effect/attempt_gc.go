@@ -27,7 +27,8 @@ const deleteSettledAttemptsSQL = `DELETE FROM effect_attempts
 		  AND e.status IN ('delivered', 'failed', 'reconciled_succeeded',
 		                   'reconciled_failed', 'fenced')
 		  AND e.settled_at IS NOT NULL
-		  AND e.settled_at <= ?
+		  AND e.facts_retention_ms IS NOT NULL
+		  AND e.settled_at + e.facts_retention_ms <= ?
 		  AND e.lease_until IS NULL
 		  AND e.owner_instance_id = ''
 		  AND NOT EXISTS (

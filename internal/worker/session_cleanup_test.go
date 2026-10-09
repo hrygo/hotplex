@@ -19,5 +19,5 @@ func TestCleanupSession(t *testing.T) {
 	require.NoError(t, CleanupSession(context.Background(), testType, "worker-session-1"))
 	require.True(t, called)
 	require.NoError(t, CleanupSession(context.Background(), testType, ""))
-	require.NoError(t, CleanupSession(context.Background(), "unregistered-worker", "worker-session-1"))
+	require.ErrorIs(t, CleanupSession(context.Background(), "unregistered-worker", "worker-session-1"), ErrSessionCleanupUnsupported)
 }

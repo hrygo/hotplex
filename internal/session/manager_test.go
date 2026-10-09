@@ -228,7 +228,7 @@ func TestManager_RecordInputAccepted_AdvancesAndPersistsLifecycleDeadlines(t *te
 	require.True(t, got.HistoryExpiresAt.Equal(acceptedAt.Add(cfg.Lifecycle.Conversation.RetentionAfterLastInput)))
 }
 
-func TestManager_RecordInputAccepted_DoesNotRewriteLegacyOrDifferentPolicyRevision(t *testing.T) {
+func TestManager_RecordInputAccepted_PreservesAssignedPolicyAndRenewsV2(t *testing.T) {
 	t.Parallel()
 
 	store, cfg := helperDB(t)
@@ -268,6 +268,15 @@ func TestManager_RecordInputAccepted_DoesNotRewriteLegacyOrDifferentPolicyRevisi
 
 			after, err := store.Get(t.Context(), tc.id)
 			require.NoError(t, err)
+			require.Equal(t, before.LifecyclePolicyRevision, after.LifecyclePolicyRevision)
+			if tc.policy == config.LifecyclePolicyV2 {
+				acceptedAt := now.Add(72 * time.Hour)
+				require.Equal(t, ptr(acceptedAt), after.LastInputAt)
+				require.Equal(t, ptr(acceptedAt.Add(cfg.Lifecycle.Conversation.ArchiveAfter)), after.ArchiveAt)
+				require.Equal(t, ptr(acceptedAt.Add(cfg.Lifecycle.Conversation.RetentionAfterLastInput)), after.ConversationExpiresAt)
+				require.Equal(t, after.ConversationExpiresAt, after.HistoryExpiresAt)
+				return
+			}
 			require.Equal(t, before.LastInputAt, after.LastInputAt)
 			require.Equal(t, before.ArchiveAt, after.ArchiveAt)
 			require.Equal(t, before.ConversationExpiresAt, after.ConversationExpiresAt)

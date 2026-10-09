@@ -1,9 +1,6 @@
 package session
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -75,9 +72,7 @@ func newInitialLifecycleState(now time.Time, cfg config.LifecycleConfig) (initia
 }
 
 func lifecyclePolicyRevision(cfg config.LifecycleConfig) string {
-	encoded, _ := json.Marshal(cfg)
-	hash := sha256.Sum256(encoded)
-	return hex.EncodeToString(hash[:])
+	return config.LifecyclePolicyRevision(cfg)
 }
 
 func latestLifecycleTime(current *time.Time, candidate time.Time) time.Time {

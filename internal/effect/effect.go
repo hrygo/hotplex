@@ -223,12 +223,23 @@ func (t dbTx) QueryRowContext(ctx context.Context, query string, args ...any) Ro
 
 // Planner commits payload snapshots and planned effects atomically.
 type Planner struct {
-	dialect dbutil.Dialect
+	dialect            dbutil.Dialect
+	payloadRetentionMS int64
+	factsRetentionMS   int64
+	retentionRevision  string
 }
 
 // NewPlanner creates a Planner for the given SQL dialect.
 func NewPlanner(dialect dbutil.Dialect) *Planner {
 	return &Planner{dialect: dialect}
+}
+
+// SetRetentionPolicy configures snapshots for subsequent plans. Call it before
+// sharing the planner with goroutines. Nonpositive windows protect the rows.
+func (p *Planner) SetRetentionPolicy(payload, facts time.Duration, revision string) {
+	p.payloadRetentionMS = max(0, payload.Milliseconds())
+	p.factsRetentionMS = max(0, facts.Milliseconds())
+	p.retentionRevision = revision
 }
 
 const insertPayloadSQL = `INSERT INTO effect_payloads
@@ -244,8 +255,8 @@ const insertEffectSQL = `INSERT INTO effects
 	 status, error_code, reason,
 	 owner_instance_id, lease_until, lease_version,
 	 provider_ref, evidence_ref,
-	 created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	 created_at, updated_at, payload_retention_ms, facts_retention_ms, retention_policy_revision)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(CAST(? AS BIGINT), 0), NULLIF(CAST(? AS BIGINT), 0), ?)
 	ON CONFLICT(occurrence_id, delivery_ordinal, target_revision) DO NOTHING`
 
 // PlanWithPayload writes the content snapshot and the planned effect in the
@@ -342,7 +353,7 @@ func (p *Planner) PlanWithPayload(ctx context.Context, tx Tx, plan Plan, now tim
 		e.Status, e.ErrorCode, e.Reason,
 		e.OwnerInstanceID, e.LeaseUntilMs, e.LeaseVersion,
 		e.ProviderRef, e.EvidenceRef,
-		e.CreatedAtMs, e.UpdatedAtMs)
+		e.CreatedAtMs, e.UpdatedAtMs, p.payloadRetentionMS, p.factsRetentionMS, p.retentionRevision)
 	if err != nil {
 		return nil, false, fmt.Errorf("effect: insert effect: %w", err)
 	}
