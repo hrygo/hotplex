@@ -256,8 +256,8 @@ func (s *SQLStore) AcceptQueued(
 		// Refresh the depth mirror so an operator reading the budget row sees a
 		// truthful number. It is never consulted for the capacity decision, so a
 		// stale value here cannot refuse an enqueue.
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE execution_queue_budget SET used = ? WHERE budget_id = 1`,
+		if _, err := tx.ExecContext(ctx, s.rebind(
+			`UPDATE execution_queue_budget SET used = ? WHERE budget_id = 1`),
 			depth+1); err != nil {
 			return fail(fmt.Errorf("execution: refresh queue budget mirror: %w", err))
 		}
