@@ -33,3 +33,11 @@ description: "六项审查发现、复现证据和修复验证记录。"
 - 真实 PostgreSQL 回归新增在 `internal/execution/retention_snapshot_pg_test.go`，覆盖 Accept/AcceptQueued 的 90 天大整数快照、7 天投递正文、缩短后新旧记录区别、重复请求不改快照及 NULL legacy 保护。本机缺少专用测试 DSN，编译通过并明确跳过；实际执行由 PR 的 PostgreSQL CI 门禁验证。
 - R4 独立复审无新增 P0/P1/P2；R1/R3/R5/R6 复审新增的重试发现已修复并复核关闭。最终提交及远端 CI 结果回填 Issue #1038，以 PR 当前 HEAD 的检查为准。
 - 最终本地门禁（2026-10-09）：`make quality` 成功，lint 为 0 issues，全仓 `-race -count=1 -shuffle=on` 通过；最终 `make build`、`make docs-lint` 成功。未跳过 hooks。
+
+## PostgreSQL CI 补充发现
+
+- 基准：修复提交 `15986c5591dd4610de36c0bfca5cf3301daed392`。
+- Test：新增真实 PostgreSQL 回归在首次 `AcceptQueued` 时失败，错误为 `refresh queue budget mirror: syntax error at or near "WHERE"`；[失败 CI](https://github.com/hrygo/hotplex/actions/runs/37866767486/job/113615275975)。
+- Source：队列 budget mirror 更新的 `?` 占位符未经过既有 `s.rebind`，SQLite 可执行，PostgreSQL 拒绝并回滚整个排队事务。
+- 先登记于 [Issue #1038](https://github.com/hrygo/hotplex/issues/1038#issuecomment-6072064596)，再补齐该更新的方言转换；预算锁、事务与容量决策语义保留。既有新增 PostgreSQL 回归不变，以其在新 HEAD 的成功执行为验收。
+- 增量提交及本地、远端验证结果回填 Issue #1038；未修改生产运行态或数据。
