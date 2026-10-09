@@ -55,7 +55,7 @@ func TestPGRetentionSnapshotSurvivesPolicyShortening(t *testing.T) {
 		settleAccepted(record, ownerID, runID)
 		return request, record
 	}
-	enqueue := func(messageID, ownerID, runID string) (QueuedRequest, *Record) {
+	enqueue := func(t *testing.T, messageID, ownerID, runID string) (QueuedRequest, *Record) {
 		t.Helper()
 		request := QueuedRequest{
 			SessionID:       "session-pg",
@@ -71,6 +71,9 @@ func TestPGRetentionSnapshotSurvivesPolicyShortening(t *testing.T) {
 	}
 	claimAndSettle := func(record *Record, ownerID, runID string) {
 		t.Helper()
+		depth, err := store.QueueDepthBySession(ctx, record.SessionID)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, depth)
 		claimed, _, err := store.ClaimQueued(ctx, ClaimQueuedRequest{
 			SessionID:           record.SessionID,
 			OwnerInstanceID:     ownerID,
@@ -79,12 +82,15 @@ func TestPGRetentionSnapshotSurvivesPolicyShortening(t *testing.T) {
 		})
 		require.NoError(t, err)
 		require.Equal(t, record.ExecutionID, claimed.ExecutionID)
+		depth, err = store.QueueDepthBySession(ctx, record.SessionID)
+		require.NoError(t, err)
+		require.Zero(t, depth)
 		settleAccepted(claimed, ownerID, runID)
 	}
 
 	store.SetRetentionPolicy(oldFacts, "old-policy")
 	oldAcceptRequest, oldAccept := accept("pg-old-accept", "owner-old-accept", "run-old-accept")
-	oldQueuedRequest, oldQueued := enqueue("pg-old-queued", "owner-old-queued", "run-old-queued")
+	oldQueuedRequest, oldQueued := enqueue(t, "pg-old-queued", "owner-old-queued", "run-old-queued")
 
 	store.SetRetentionPolicy(newFacts, "new-policy")
 	duplicate, wasDuplicate, err := store.Accept(ctx, oldAcceptRequest)
@@ -101,7 +107,7 @@ func TestPGRetentionSnapshotSurvivesPolicyShortening(t *testing.T) {
 
 	claimAndSettle(oldQueued, "owner-old-queued", "run-old-queued")
 	_, newAccept := accept("pg-new-accept", "owner-new-accept", "run-new-accept")
-	_, newQueued := enqueue("pg-new-queued", "owner-new-queued", "run-new-queued")
+	_, newQueued := enqueue(t, "pg-new-queued", "owner-new-queued", "run-new-queued")
 	claimAndSettle(newQueued, "owner-new-queued", "run-new-queued")
 
 	store.SetRetentionPolicy(0, "legacy-policy")
@@ -137,6 +143,47 @@ func TestPGRetentionSnapshotSurvivesPolicyShortening(t *testing.T) {
 	require.Equal(t, oldQueued.ExecutionID, duplicateQueued.ExecutionID)
 	assertExecutionRetentionSnapshot(t, db, oldAccept.ExecutionID, oldFacts.Milliseconds(), "old-policy")
 	assertExecutionRetentionSnapshot(t, db, oldQueued.ExecutionID, oldFacts.Milliseconds(), "old-policy")
+
+	// Settlement shares the queue-row removal with cancel, clear and expiry;
+	// exercise those PostgreSQL paths and verify the committed queue depth.
+	store.SetRetentionPolicy(newFacts, "new-policy")
+	for _, operation := range []string{"cancel", "clear", "expire"} {
+		t.Run("queue_"+operation, func(t *testing.T) {
+			_, queued := enqueue(t, "pg-"+operation, "owner-"+operation, "")
+			depth, err := store.QueueDepthBySession(ctx, queued.SessionID)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, depth)
+			reason := QueueReasonCancelled
+			switch operation {
+			case "cancel":
+				_, err = store.CancelQueued(ctx, queued.ExecutionID, reason)
+				require.NoError(t, err)
+			case "clear":
+				cleared, clearErr := store.ClearQueue(ctx, queued.SessionID, reason)
+				require.NoError(t, clearErr)
+				require.EqualValues(t, 1, cleared)
+			case "expire":
+				_, err = db.ExecContext(ctx,
+					`UPDATE execution_queue SET expires_at = $1 WHERE execution_id = $2`,
+					gcNow.Add(-time.Second).UnixMilli(), queued.ExecutionID)
+				require.NoError(t, err)
+				expired, expireErr := store.ExpireQueued(ctx, gcNow, 10)
+				require.NoError(t, expireErr)
+				require.Len(t, expired, 1)
+				require.Equal(t, queued.ExecutionID, expired[0].ExecutionID)
+				reason = QueueReasonExpired
+			}
+			depth, err = store.QueueDepthBySession(ctx, queued.SessionID)
+			require.NoError(t, err)
+			require.Zero(t, depth)
+			settled, err := store.getByID(ctx, queued.ExecutionID)
+			require.NoError(t, err)
+			require.Equal(t, StatusFailed, settled.Status)
+			require.Equal(t, RuntimeFailed, settled.RuntimeStatus)
+			require.Equal(t, reason, settled.ErrorCode)
+			assertExecutionRetentionSnapshot(t, db, queued.ExecutionID, newFacts.Milliseconds(), "new-policy")
+		})
+	}
 
 	dsn := os.Getenv("HOTPLEX_TEST_PG_DSN")
 	require.NotEmpty(t, dsn, "openPGStore should skip when the dedicated test DSN is absent")

@@ -41,3 +41,4 @@ description: "六项审查发现、复现证据和修复验证记录。"
 - Source：队列 budget mirror 更新的 `?` 占位符未经过既有 `s.rebind`，SQLite 可执行，PostgreSQL 拒绝并回滚整个排队事务。
 - 先登记于 [Issue #1038](https://github.com/hrygo/hotplex/issues/1038#issuecomment-6072064596)，再补齐该更新的方言转换；预算锁、事务与容量决策语义保留。既有新增 PostgreSQL 回归不变，以其在新 HEAD 的成功执行为验收。
 - 增量提交及本地、远端验证结果回填 Issue #1038；未修改生产运行态或数据。
+- 第二轮 CI（`8cfa8a763c59bbfa9a92183650d58146b1a77cf3`）已完成入队，随后在 `ClaimQueued` 删除队列行时发现同类占位符遗漏；[失败 CI](https://github.com/hrygo/hotplex/actions/runs/37867885313/job/113618965463)。全量核对 execution/effect 的直接参数化 SQL 后，还定位到取消/清空/过期共用的删除语句及会话队列深度查询。[登记证据](https://github.com/hrygo/hotplex/issues/1038#issuecomment-6072206139)后一次补齐三条语句，并扩展真实 PostgreSQL 回归，覆盖 claim 前后深度、cancel/clear/expire 的终态、队列移除与保留快照。
